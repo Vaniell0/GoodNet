@@ -9,6 +9,10 @@
 !/sdk/
 !/plugins/
 
+!/src/
+!/core/
+!/include/
+
 !.gitignore
 !README.md
 

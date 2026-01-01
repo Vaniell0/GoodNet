@@ -20,10 +20,8 @@ endif()
 # Исполняемый файл
 add_executable(goodnet
     src/main.cpp
-    src/core.cpp
-    src/home_services.cpp
-    src/plugin_manager.cpp
-    src/connect_manager.cpp
+
+    src/logger.cpp
 )
 
 # Корневой каталог для включений
@@ -39,8 +37,7 @@ target_link_libraries(goodnet PRIVATE
     Boost::system
     Boost::filesystem
     fmt::fmt
-    sodium
-    dl
+    sodium dl
 )
 
 # Создаем директории для плагинов
