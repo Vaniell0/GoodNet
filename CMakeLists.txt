@@ -22,6 +22,7 @@ add_executable(goodnet
     src/main.cpp
 
     src/logger.cpp
+    src/config.cpp
 )
 
 # Корневой каталог для включений
