@@ -1,34 +1,27 @@
 cmake_minimum_required(VERSION 3.22.1)
-
-if (NOT PLUGIN_BUILD)
-    return()
-endif()
-
-project(TcpConnector)
-
+project(GoodNetConnectors)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Ищем Boost
 cmake_policy(SET CMP0167 NEW)
-find_package(Boost REQUIRED COMPONENTS system)
+if(NOT TARGET Boost::system)
+    find_package(Boost REQUIRED COMPONENTS system)
+endif()
+if(NOT TARGET fmt::fmt)
+    find_package(fmt REQUIRED)
+endif()
 
-# Создаем shared library для плагина
+set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/libs")
+file(MAKE_DIRECTORY "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}")
+
 add_library(tcp_connector SHARED tcp.cpp)
+set_target_properties(tcp_connector PROPERTIES OUTPUT_NAME "tcp" PREFIX "lib")
 
-# Настройки для плагина
-set_target_properties(tcp_connector PROPERTIES
-    OUTPUT_NAME "tcp"
-    PREFIX "lib"
-    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/../libs"
+# Правильные пути к SDK относительно папки plugins/connectors
+target_include_directories(tcp_connector PRIVATE 
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../sdk" 
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../sdk/cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../include"
 )
 
-# Включаем директории SDK
-target_include_directories(tcp_connector PRIVATE
-    ${CMAKE_SOURCE_DIR}/../../sdk
-)
-
-# Ссылки
-target_link_libraries(tcp_connector PRIVATE 
-    Boost::system
-)
+target_link_libraries(tcp_connector PRIVATE Boost::system fmt::fmt)

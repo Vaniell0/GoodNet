@@ -5,9 +5,12 @@
 
 /* МАКРОС ДЛЯ ОБРАБОТЧИКОВ */
 #define HANDLER_PLUGIN(ClassName) \
-extern "C"  int handler_init(host_api_t* api, handler_t** handler) { \
+extern "C" int handler_init(host_api_t* api, handler_t** handler) { \
     static ClassName instance; \
     if (api && api->plugin_type == PLUGIN_TYPE_HANDLER) { \
+        if (api->api_version != GNET_API_VERSION) { \
+            return -1; \
+        } \
         instance.init(api); \
         *handler = instance.to_c_handler(); \
         return 0; \
@@ -20,6 +23,9 @@ extern "C"  int handler_init(host_api_t* api, handler_t** handler) { \
 extern "C" int connector_init(host_api_t* api, connector_ops_t** ops) { \
     static ClassName instance; \
     if (api && api->plugin_type == PLUGIN_TYPE_CONNECTOR) { \
+        if (api->api_version != GNET_API_VERSION) { \
+            return -1; \
+        } \
         instance.init(api); \
         *ops = instance.to_c_ops(); \
         return 0; \

@@ -1,22 +1,25 @@
 cmake_minimum_required(VERSION 3.22.1)
-
-if (NOT PLUGIN_BUILD)
-    return()
-endif()
-
-project(LoggerHandler)
-
+project(GoodNetHandlers)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-add_library(logger_handler SHARED logger.cpp)
+find_package(fmt REQUIRED)
+find_package(spdlog REQUIRED)
 
-set_target_properties(logger_handler PROPERTIES
-    OUTPUT_NAME "logger"
-    PREFIX "lib"
-    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/../libs"
+set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/libs")
+
+# Добавляем логгер из основного проекта
+add_library(logger_plugin SHARED
+    logger.cpp 
+    ../../src/logger.cpp
 )
 
-target_include_directories(logger_handler PRIVATE
-    ${CMAKE_SOURCE_DIR}/../../sdk
+set_target_properties(logger_plugin PROPERTIES OUTPUT_NAME "logger" PREFIX "lib")
+
+target_include_directories(logger_plugin PRIVATE 
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../sdk" 
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../sdk/cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../include"
 )
+
+target_link_libraries(logger_plugin PRIVATE fmt::fmt spdlog::spdlog)

@@ -1,31 +1,6 @@
 #include "config.hpp"
 #include "logger.hpp"
-#include <iostream>
-#include <vector>
-#include <map>
-
-void test_function() {
-    SCOPED_TRACE();  // Автоматически логирует вход/выход
-    
-    int x = 42;
-    std::string name = "GoodNet";
-    std::vector<int> vec = {1, 2, 3, 4, 5};
-    std::map<std::string, int> config = {{"port", 8080}, {"timeout", 30}};
-    
-    // Логирование значений переменных
-    TRACE_VALUE(x);
-    DEBUG_VALUE(name);
-    INFO_VALUE(x + 10);
-    
-    // Подробное логирование
-    TRACE_VALUE_DETAILED(x);
-    
-    // Логирование указателей
-    int* ptr = &x;
-    TRACE_POINTER(ptr);
-    
-    LOG_DEBUG("Debug build specific logging");
-}
+#include "pluginManager.hpp"
 
 int main(int argc, char* argv[]) {
     try {        
@@ -42,15 +17,22 @@ int main(int argc, char* argv[]) {
         LOG_INFO("Listen address: {}", config.get_or<std::string>("core.listen_address", "0.0.0.0"));
         LOG_INFO("Listen port: {}", config.get_or<int>("core.listen_port", 25565));
         
-        // Демонстрация разных уровней логирования
-        LOG_TRACE("This is trace message");
-        LOG_DEBUG("This is debug message");
-        LOG_INFO("This is info message");
-        LOG_WARN("This is warning message");
-        LOG_ERROR("This is error message");
+        host_api_t api {
+            .api_version = 1,
+            .send = nullptr,
+            .create_connection = nullptr,
+            .close_connection = nullptr,
+            .update_connection_state = nullptr
+        };
+
+        LOG_INFO("Created host API with version: {}", api.api_version);
         
-        test_function();
+        gn::PluginManager pm(&api, config.get_or<std::string>("plugins.base_dir", "./plugins"));
         
+        pm.load_all_plugins();
+        
+        pm.list_plugins();
+
         Logger::shutdown();
         return 0;
 

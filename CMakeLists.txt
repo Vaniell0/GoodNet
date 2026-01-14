@@ -3,22 +3,25 @@ project(GoodNet)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CXX_EXTENSIONS OFF)
+
+# Сначала определяем опции
+option(BUILD_PLUGINS "Build plugins with the project" ON)
+option(USE_UPX "Compress binary with UPX" OFF)
+
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
 # Настройки оптимизации
 if(CMAKE_BUILD_TYPE STREQUAL "Release")
-    # Агрессивная оптимизация размера
-    add_compile_options(-Os -flto -ffunction-sections -fdata-sections)
+    add_compile_options(-O3 -flto -ffunction-sections -fdata-sections -march=native)
     add_link_options(-Wl,--gc-sections -flto -s)
-    
-    # Отключение отладочной информации в логах
     add_compile_definitions(NDEBUG)
+elseif(CMAKE_BUILD_TYPE STREQUAL "MinSizeRel")
+    add_compile_options(-Os -ffunction-sections -fdata-sections -fomit-frame-pointer)
+    add_link_options(-Wl,--gc-sections -s -Wl,--strip-all)
+    add_compile_definitions(NDEBUG SIZE_OPTIMIZED)
 endif()
 
-# Опция для включения сборки плагинов
-option(BUILD_PLUGINS "Build plugins" OFF)
-
-# Поиск необходимых библиотек
+# Поиск библиотек
 cmake_policy(SET CMP0167 NEW)
 find_package(Boost REQUIRED COMPONENTS system filesystem)
 find_package(fmt REQUIRED)
@@ -28,6 +31,12 @@ if (PKG_CONFIG_FOUND)
     pkg_check_modules(sodium_PKG QUIET libsodium)
 endif()
 
+# Подключаем плагины, ТОЛЬКО если включена опция
+if(BUILD_PLUGINS)
+    add_subdirectory(plugins/handlers)
+    add_subdirectory(plugins/connectors)
+endif()
+
 # Исполняемый файл
 add_executable(goodnet
     src/main.cpp
@@ -35,50 +44,41 @@ add_executable(goodnet
     src/config.cpp
     src/logger.cpp
     src/signals.cpp
+    
+    core/pluginManager.cpp
 )
 
-# Корневой каталог для включений
-target_include_directories(goodnet PRIVATE
-    ${CMAKE_SOURCE_DIR}/include
-    ${CMAKE_SOURCE_DIR}/core
-    ${CMAKE_SOURCE_DIR}/sdk
+target_include_directories(goodnet PRIVATE 
+    ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/core ${CMAKE_SOURCE_DIR}/sdk
 )
 
-set(EXECUTABLE_OUTPUT_PATH "${CMAKE_BINARY_DIR}/bin")
-
-# Ссылки на библиотеки
 target_link_libraries(goodnet PRIVATE
-    Boost::filesystem
-    spdlog::spdlog
-    Boost::system
-    fmt::fmt
-    sodium dl
+    Boost::filesystem Boost::system spdlog::spdlog fmt::fmt sodium dl
 )
 
-# Опции для полного отключения логов в релизе
-option(DISABLE_TRACE_LOGS "Disable TRACE logs" OFF)
-option(DISABLE_DEBUG_LOGS "Disable DEBUG logs" OFF)
-
-# Создаем директории для плагинов
-file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/plugins/handlers)
-file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/plugins/connectors)
-
-# Определяем путь к плагинам для тестирования
-target_compile_definitions(goodnet PRIVATE
-    PLUGINS_DIR="${CMAKE_BINARY_DIR}/plugins"
-)
-
-# Опциональная сборка плагинов
-if (BUILD_PLUGINS)
-    message(STATUS "Building plugins...")
-    
-    # Плагин-обработчик логов
-    add_subdirectory(plugins/handlers)
-    
-    # Плагин-коннектор (tcp)
-    add_subdirectory(plugins/connectors)
+# UPX
+if(USE_UPX)
+    find_program(UPX_PROGRAM upx)
+    if(UPX_PROGRAM)
+        add_custom_command(TARGET goodnet POST_BUILD
+            COMMAND ${UPX_PROGRAM} --best --lzma $<TARGET_FILE:goodnet>
+            COMMENT "Compressing with UPX"
+        )
+    endif()
 endif()
 
-# Установка
+# Создание ссылок для разработки
+# Этот шаг нужен, чтобы при локальной разработке плагины были видны в build/plugins
+set(PLUGINS_LINK_DIR "${CMAKE_BINARY_DIR}/plugins")
+add_custom_target(setup_plugin_links ALL
+    COMMAND ${CMAKE_COMMAND} -E rm -rf "${PLUGINS_LINK_DIR}"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${PLUGINS_LINK_DIR}"
+    COMMAND ${CMAKE_COMMAND} -E create_symlink "${CMAKE_SOURCE_DIR}/plugins/handlers/libs" "${PLUGINS_LINK_DIR}/handlers"
+    COMMAND ${CMAKE_COMMAND} -E create_symlink "${CMAKE_SOURCE_DIR}/plugins/connectors/libs" "${PLUGINS_LINK_DIR}/connectors"
+    COMMENT "Linking plugin libs to build directory"
+)
+add_dependencies(goodnet setup_plugin_links)
+
+# Установка (для Nix build)
 install(TARGETS goodnet DESTINATION bin)
 install(DIRECTORY include/sdk DESTINATION include/goodnet)
