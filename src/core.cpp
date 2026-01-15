@@ -1,115 +1,76 @@
 #include "core.hpp"
 #include "logger.hpp"
-
-#include "stats.hpp"
 #include "pluginManager.hpp"
 #include "connectManager.hpp"
 #include "homeServices.hpp"
 
+#include <boost/asio.hpp>
+
 namespace gn {
 
-Core::Core(const Config& config)
-    : listen_address_(config.get_or<std::string>("core.listen_address", "0.0.0.0")),
-      listen_port_(static_cast<uint16_t>(config.get_or<int>("core.listen_port", 25565))),
-      io_thread_count_(config.get_or<int>("core.io_threads", 4)),
-      io_context_(io_thread_count_),
-      work_guard_(boost::asio::make_work_guard(io_context_)),
-      host_api_(std::make_unique<host_api_t>()) {
+Core::Core(Config& config)
+    : config_(config),
+      io_context_(config.get_or<int>("core.io_threads", 4)),
+      work_guard_(boost::asio::make_work_guard(io_context_)) {
     
-    if (instance_ != nullptr) {
-        throw std::runtime_error("Core instance already exists");
-    }
-
     LOG_INFO("Core initializing...");
-    LOG_INFO("Listen address: {}:{}", listen_address_, listen_port_);
-    LOG_INFO("IO threads: {}", io_thread_count_);
     
     try {
-        // 1. Инициализация Host API
-        init_host_api();
+        // 1. Инициализация глобальных сигналов
+        packet_signal = std::make_shared<PacketSignal>(io_context_);
+        conn_state_signal = std::make_shared<ConnStateSignal>(io_context_);
         
-        // 2. Инициализация сигналов
-        packet_signal_ = std::make_unique<PacketSignal>(io_context_);
-        conn_state_signal_ = std::make_unique<ConnStateSignal>(io_context_);
+        // 2. Инициализация Host API
+        host_api_ = std::make_unique<host_api_t>();
+        initialize_host_api();
         
-        // 3. Инициализация менеджера плагинов
-        auto plugins_dir = config.get_or<std::string>("plugins.base_dir", "./logs");
+        // 3. Инициализация PluginManager
+        auto plugins_dir = config.get_or<std::string>("plugins.base_dir", "./plugins");
         plugin_manager_ = std::make_unique<PluginManager>(host_api_.get(), plugins_dir);
         
-        // 4. Установка колбэков для менеджера плагинов
-        plugin_manager_->set_handler_loaded_callback([this](handler_t* handler) {
-            LOG_INFO("Handler loaded callback: {}", handler ? "valid" : "null");
-        });
+        // 4. Инициализация ConnectManager
+        connect_manager_ = std::make_unique<ConnectManager>(io_context_);
         
-        plugin_manager_->set_connector_loaded_callback([this](connector_ops_t* ops) {
-            LOG_INFO("Connector loaded callback: {}", ops ? "valid" : "null");
-        });
+        // 5. Инициализация HomeServices
+        home_services_ = std::make_unique<HomeServices>(io_context_, plugin_manager_);
         
-        plugin_manager_->set_error_callback([this](const std::string& plugin_name, 
-                                                  const std::string& error) {
-            LOG_ERROR("Plugin error: {} - {}", plugin_name, error);
-        });
-        
-        // 5. Подписка на сигналы
-        packet_signal_->connect([this](const header_t* header,
-                                      const endpoint_t* endpoint,
-                                      std::span<const char> payload) {
-            this->on_packet_received(header, endpoint, payload);
-        });
-        
-        conn_state_signal_->connect([this](const char* uri, conn_state_t state) {
-            this->on_connection_state_changed(uri, state);
-        });
-        
-        // 6. Загрузка плагинов если включено
-        if (config.get_or<bool>("plugins.auto_load", true)) {
-            LOG_INFO("Auto-loading plugins...");
-            plugin_manager_->load_all_plugins();
-        }
         LOG_INFO("Core initialized successfully");
         
     } catch (const std::exception& e) {
         LOG_CRITICAL("Core initialization failed: {}", e.what());
-        cleanup();
         throw;
     }
 }
 
 Core::~Core() {
     LOG_INFO("Core shutting down...");
+    stop();
     
-    stop(); // Останавливаем если работает
-    
-    // Уничтожаем компоненты в правильном порядке
+    // Уничтожаем в правильном порядке
+    home_services_.reset();
+    connect_manager_.reset();
     plugin_manager_.reset();
-    conn_state_signal_.reset();
-    packet_signal_.reset();
+    packet_signal.reset();
+    conn_state_signal.reset();
     host_api_.reset();
+    work_guard_.reset();
     
-    // Останавливаем потоки
-    if (!io_threads_.empty()) {
-        work_guard_.reset();
-        io_context_.stop();
-        
-        for (auto& thread : io_threads_) {
-            if (thread.joinable()) {
-                thread.join();
-            }
-        }
-        io_threads_.clear();
-    }
-    
-    instance_ = nullptr;
     LOG_INFO("Core shutdown complete");
 }
 
-bool Core::start() {
-    if (!Stats::is_initialized) {
-        LOG_ERROR("Cannot start: Core not initialized");
-        return false;
-    }
+void Core::initialize_host_api() {
+    host_api_->api_version = GNET_API_VERSION;
+    host_api_->send = &c_api_send;
+    host_api_->create_connection = &c_api_create_connection;
+    host_api_->close_connection = &c_api_close_connection;
+    host_api_->update_connection_state = &c_api_update_connection_state;
+    host_api_->plugin_type = PLUGIN_TYPE_UNKNOWN;
     
-    if (Stats::is_running) {
+    LOG_INFO("Host API initialized with version: {}", host_api_->api_version);
+}
+
+bool Core::start() {
+    if (is_running_) {
         LOG_WARN("Core already running");
         return true;
     }
@@ -117,51 +78,64 @@ bool Core::start() {
     try {
         LOG_INFO("Starting Core...");
         
-        // Запускаем потоки IO
+        // 1. Запускаем IO потоки
         initialize_io_threads();
         
-        // Запускаем компоненты
+        // 2. Загружаем плагины
+        if (config_.get_or<bool>("plugins.auto_load", true)) {
+            LOG_INFO("Auto-loading plugins...");
+            plugin_manager_->load_all_plugins();
+        }
+        
+        // 3. Запускаем HomeServices
+        auto listen_address = config_.get_or<std::string>("core.listen_address", "0.0.0.0");
+        auto listen_port = static_cast<uint16_t>(config_.get_or<int>("core.listen_port", 25565));
+        
+        home_services_->start(listen_address, listen_port);
+        
+        // 4. Инициализируем остальные компоненты
         initialize_components();
         
-        Stats::is_running = true;
+        is_running_ = true;
         LOG_INFO("Core started successfully");
         return true;
         
     } catch (const std::exception& e) {
         LOG_CRITICAL("Failed to start Core: {}", e.what());
-        Stats::is_running = false;
         return false;
     }
 }
 
 void Core::stop() {
-    if (!Stats::is_running) {
+    if (!is_running_) {
         return;
     }
     
     LOG_INFO("Stopping Core...");
-    Stats::is_running = false;
     
-    // Останавливаем компоненты
+    // Останавливаем в обратном порядке
+    if (home_services_) {
+        home_services_->stop();
+    }
+    
     cleanup();
     
+    is_running_ = false;
     LOG_INFO("Core stopped");
 }
 
 void Core::initialize_components() {
-    // TODO: Инициализация ConnectManager и HomeServices
-    LOG_INFO("Components initialized");
+    LOG_INFO("Initializing Core components...");
+    // TODO: Инициализация дополнительных компонентов
 }
 
 void Core::initialize_io_threads() {
-    if (!io_threads_.empty()) {
-        LOG_WARN("IO threads already initialized");
-        return;
-    }
+    LOG_INFO("Starting IO threads...");
     
-    LOG_INFO("Starting {} IO threads...", io_thread_count_);
+    unsigned int thread_count = config_.get_or<int>("core.io_threads", 4);
+    thread_count = std::max(1u, thread_count);
     
-    for (unsigned int i = 0; i < io_thread_count_; ++i) {
+    for (unsigned int i = 0; i < thread_count; ++i) {
         io_threads_.emplace_back([this, i]() {
             try {
                 LOG_DEBUG("IO thread {} started", i);
@@ -173,7 +147,7 @@ void Core::initialize_io_threads() {
         });
     }
     
-    LOG_INFO("IO threads started");
+    LOG_INFO("{} IO threads started", thread_count);
 }
 
 void Core::cleanup() {
@@ -191,26 +165,83 @@ void Core::cleanup() {
     LOG_INFO("Core cleanup complete");
 }
 
-void Core::on_packet_received(const header_t* header,
-                             const endpoint_t* endpoint,
-                             std::span<const char> payload) {
-    Stats::packets_received++;
+// Реализации callback-ов
+void Core::send_impl(const char* uri, uint32_t type, const void* data, size_t size) {
+    LOG_DEBUG("send_impl: uri={}, type={}, size={}", 
+              uri ? uri : "null", type, size);
     
-    // Проверка магического числа
-    if (header->magic != GNET_MAGIC) {
-        LOG_ERROR("Invalid packet magic: 0x{:08X}", header->magic);
-        return;
-    }
-    
-    // TODO: Обработка через плагины-обработчики
-    LOG_DEBUG("Packet received: type={}, size={}", 
-                 header->payload_type, payload.size());
+    // TODO: Реализовать отправку через ConnectManager
 }
 
-void Core::on_connection_state_changed(const char* uri, conn_state_t state) {
-    LOG_INFO("Connection state changed: {} -> {}", 
-                uri ? uri : "unknown", 
-                static_cast<int>(state));
+handle_t Core::create_connection_impl(const char* uri) {
+    if (!uri) {
+        LOG_ERROR("create_connection_impl: URI is null");
+        return 0;
+    }
+    
+    LOG_INFO("create_connection_impl: uri={}", uri);
+    
+    // Проверяем схему URI
+    std::string uri_str(uri);
+    if (uri_str.find("tcp://") == 0) {
+        // Для TCP соединений используем HomeServices
+        return 0; // TODO: Реализовать
+    } else {
+        // Ищем коннектор по схеме
+        auto connector = plugin_manager_->find_connector_by_scheme(
+            uri_str.substr(0, uri_str.find(':'))
+        );
+        
+        if (connector.has_value() && connector.value()) {
+            // Создаем соединение через плагин
+            auto connection_ops = connector.value()->connect(
+                connector.value()->connector_ctx, uri
+            );
+            
+            if (connection_ops) {
+                // Регистрируем в ConnectManager
+                auto handle = connect_manager_->create_connection(uri_str);
+                return handle;
+            }
+        }
+    }
+    
+    return 0;
+}
+
+void Core::close_connection_impl(handle_t handle) {
+    LOG_INFO("close_connection_impl: handle={}", handle);
+    
+    if (connect_manager_) {
+        connect_manager_->close_connection(handle);
+    }
+}
+
+void Core::update_connection_state_impl(const char* uri, conn_state_t state) {
+    LOG_INFO("update_connection_state_impl: uri={}, state={}", 
+             uri ? uri : "null", static_cast<int>(state));
+}
+
+// C API static методы
+void Core::c_api_send(const char* uri, uint32_t type, const void* data, size_t size) {
+    // TODO: Нужен доступ к экземпляру Core
+    LOG_DEBUG("c_api_send called");
+}
+
+handle_t Core::c_api_create_connection(const char* uri) {
+    // TODO: Нужен доступ к экземпляру Core
+    LOG_DEBUG("c_api_create_connection called");
+    return 0;
+}
+
+void Core::c_api_close_connection(handle_t handle) {
+    // TODO: Нужен доступ к экземпляру Core
+    LOG_DEBUG("c_api_close_connection called");
+}
+
+void Core::c_api_update_connection_state(const char* uri, conn_state_t state) {
+    // TODO: Нужен доступ к экземпляру Core
+    LOG_DEBUG("c_api_update_connection_state called");
 }
 
 } // namespace gn

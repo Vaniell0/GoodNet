@@ -17,7 +17,6 @@ struct Stats {
     static inline std::vector<std::string> loaded_connectors;
 
     static inline std::atomic<size_t> plugin_count = 0;
-    static inline std::atomic<size_t> plugin_errors = 0;
     static inline std::atomic<size_t> packets_sent = 0;
     static inline std::atomic<size_t> connection_count = 0;
     static inline std::atomic<size_t> packets_received = 0;

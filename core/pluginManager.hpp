@@ -11,19 +11,13 @@
 #include <algorithm>
 #include "../sdk/connector.h"
 #include "../sdk/handler.h"
+#include <boost/asio.hpp>
 
 namespace fs = std::filesystem;
 
 namespace gn {
 
 class PluginManager {
-public:
-    // Колбэки для уведомления о загруженных плагинах
-    using HandlerLoadedCallback = std::function<void(handler_t*)>;
-    using ConnectorLoadedCallback = std::function<void(connector_ops_t*)>;
-    using PluginErrorCallback = std::function<void(const std::string& plugin_name, 
-                                                  const std::string& error)>;
-
 private:
     struct HandlerInfo {
         void* dl_handle = nullptr;
@@ -56,10 +50,6 @@ private:
     // Индексы для быстрого поиска
     std::map<std::string, std::shared_ptr<HandlerInfo>> name_to_handler_;
     
-    HandlerLoadedCallback handler_loaded_callback_;
-    ConnectorLoadedCallback connector_loaded_callback_;
-    PluginErrorCallback error_callback_;
-    
     template<typename Func>
     void safe_execute(std::string_view plugin_name, Func&& func) noexcept;
     
@@ -68,6 +58,9 @@ private:
     
     void register_handler(std::shared_ptr<HandlerInfo> handler_info);
     void register_connector(std::shared_ptr<ConnectorInfo> connector_info);
+    
+    // Подписка обработчиков на сигналы
+    void subscribe_handler_to_signals(std::shared_ptr<HandlerInfo> handler_info);
     
     // Вспомогательные методы для сканирования директорий
     std::vector<fs::path> scan_plugin_directory(const fs::path& dir, 
@@ -81,17 +74,12 @@ public:
     PluginManager(const PluginManager&) = delete;
     PluginManager& operator=(const PluginManager&) = delete;
     
-    // Установка колбэков
-    void set_handler_loaded_callback(HandlerLoadedCallback callback);
-    void set_connector_loaded_callback(ConnectorLoadedCallback callback);
-    void set_error_callback(PluginErrorCallback callback);
-    
     // Загрузка плагинов
     bool load_plugin(const fs::path& path);
     bool load_plugin_by_name(const std::string& name);
     
     // Загрузка из директорий
-    void load_all_plugins();  // Основной метод для загрузки всех плагинов
+    void load_all_plugins();
     size_t load_plugins_from_directory(const fs::path& dir_path);
     size_t load_handlers_from_directory(const fs::path& dir_path);
     size_t load_connectors_from_directory(const fs::path& dir_path);

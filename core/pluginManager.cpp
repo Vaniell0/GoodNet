@@ -9,6 +9,7 @@
 #include "pluginManager.hpp"
 #include "stats.hpp"
 #include "logger.hpp"
+#include "signals.hpp"
 
 namespace gn {
 #define EXPECTED_API_VERSION 1
@@ -22,9 +23,9 @@ PluginManager::HandlerInfo::~HandlerInfo() {
             try {
                 handler->shutdown(handler->user_data);
             } catch (const std::exception& e) {
-                LOG_ERROR("Handler '{}' shutdown failed: {}", name, e.what());
+                LOG_ERROR("Plugin '{}' error: {}", name, fmt::format("shutdown failed: {}", e.what()));
             } catch (...) {
-                LOG_ERROR("Handler '{}' shutdown failed with unknown exception", name);
+                LOG_ERROR("Plugin '{}' error: {}", name, "shutdown failed with unknown exception");
             }
         }
         dlclose(dl_handle);
@@ -39,9 +40,9 @@ PluginManager::ConnectorInfo::~ConnectorInfo() {
             try {
                 ops->shutdown(ops->connector_ctx);
             } catch (const std::exception& e) {
-                LOG_ERROR("Connector '{}' shutdown failed: {}", name, e.what());
+                LOG_ERROR("Plugin '{}' error: {}", name, fmt::format("shutdown failed: {}", e.what()));
             } catch (...) {
-                LOG_ERROR("Connector '{}' shutdown failed with unknown exception", name);
+                LOG_ERROR("Plugin '{}' error: {}", name, "shutdown failed with unknown exception");
             }
         }
         dlclose(dl_handle);
@@ -84,18 +85,155 @@ void PluginManager::safe_execute(std::string_view plugin_name, Func&& func) noex
     try {
         std::invoke(std::forward<Func>(func));
     } catch (const std::exception& e) {
-        LOG_ERROR("Plugin '{}' exception: {}", plugin_name, e.what());
-        Stats::plugin_errors++;
-        if (error_callback_) {
-            error_callback_(std::string(plugin_name), e.what());
-        }
+        LOG_ERROR("Plugin '{}' error: {}", std::string(plugin_name), e.what());
     } catch (...) {
-        LOG_ERROR("Plugin '{}' unknown exception", plugin_name);
-        Stats::plugin_errors++;
-        if (error_callback_) {
-            error_callback_(std::string(plugin_name), "Unknown exception");
-        }
+        LOG_ERROR("Plugin '{}' error: {}", std::string(plugin_name), "Unknown exception");
     }
+}
+
+// ========== Подписка на сигналы ==========
+
+void PluginManager::subscribe_handler_to_signals(std::shared_ptr<HandlerInfo> handler_info) {
+    if (!handler_info->handler) {
+        return;
+    }
+    
+    // Подписываем на сигнал пакетов
+    if (handler_info->handler->handle_message) {
+        packet_signal->connect([handler_info](
+            const header_t* header,
+            const endpoint_t* endpoint,
+            std::span<const char> payload) {
+            
+            if (handler_info->enabled && handler_info->handler->handle_message) {
+                try {
+                    handler_info->handler->handle_message(
+                        handler_info->handler->user_data,
+                        header,
+                        endpoint,
+                        payload.data(),
+                        payload.size()
+                    );
+                } catch (const std::exception& e) {
+                    LOG_ERROR("Plugin '{}' error: {}", handler_info->name, e.what());
+                }
+            }
+        });
+    }
+    
+    // Подписываем на сигнал состояния соединений
+    if (handler_info->handler->handle_conn_state) {
+        conn_state_signal->connect([handler_info](
+            const char* uri,
+            conn_state_t state) {
+            
+            if (handler_info->enabled && handler_info->handler->handle_conn_state) {
+                try {
+                    handler_info->handler->handle_conn_state(
+                        handler_info->handler->user_data,
+                        uri,
+                        state
+                    );
+                } catch (const std::exception& e) {
+                    LOG_ERROR("Plugin '{}' error: {}", handler_info->name, e.what());
+                }
+            }
+        });
+    }
+}
+
+// ========== Регистрация обработчика ==========
+
+void PluginManager::register_handler(std::shared_ptr<HandlerInfo> handler_info) {
+    LOG_TRACE_ENTER_ARGS("name: {}", handler_info->name);
+    
+    if (!handler_info->handler) {
+        LOG_ERROR("Cannot register null handler");
+        LOG_TRACE_EXIT();
+        return;
+    }
+    
+    // Проверяем уникальность имени
+    if (name_to_handler_.find(handler_info->name) != name_to_handler_.end()) {
+        LOG_ERROR("Duplicate handler name: {}", handler_info->name);
+        LOG_TRACE_EXIT();
+        return;
+    }
+    
+    // Добавляем в список всех обработчиков
+    handlers_.push_back(handler_info);
+    name_to_handler_[handler_info->name] = handler_info;
+    Stats::total_handlers++;
+    Stats::enabled_handlers++;
+    Stats::loaded_handlers.push_back(handler_info->name);
+    
+    // Подписываем на сигналы
+    subscribe_handler_to_signals(handler_info);
+    
+    LOG_INFO("Registered handler: {}", handler_info->name);
+    
+    LOG_TRACE_EXIT();
+}
+
+// ========== Регистрация коннектора ==========
+
+void PluginManager::register_connector(std::shared_ptr<ConnectorInfo> connector_info) {
+    LOG_TRACE_ENTER_ARGS("name: {}", connector_info->name);
+    
+    if (!connector_info->ops) {
+        LOG_ERROR("Cannot register null connector");
+        LOG_TRACE_EXIT();
+        return;
+    }
+    
+    // Получаем схему протокола
+    char scheme_buffer[64] = {0};
+    if (connector_info->ops->get_scheme) {
+        connector_info->ops->get_scheme(
+            connector_info->ops->connector_ctx,
+            scheme_buffer,
+            sizeof(scheme_buffer)
+        );
+    }
+    
+    std::string scheme(scheme_buffer);
+    if (scheme.empty()) {
+        LOG_ERROR("Connector has empty scheme");
+        LOG_TRACE_EXIT();
+        return;
+    }
+    
+    // Проверяем уникальность схемы
+    if (scheme_to_connector_.find(scheme) != scheme_to_connector_.end()) {
+        LOG_ERROR("Duplicate connector scheme: {}", scheme);
+        LOG_TRACE_EXIT();
+        return;
+    }
+    
+    connector_info->scheme = scheme;
+    scheme_to_connector_[scheme] = connector_info;
+    
+    // Получаем имя
+    char name_buffer[128] = {0};
+    if (connector_info->ops->get_name) {
+        connector_info->ops->get_name(
+            connector_info->ops->connector_ctx,
+            name_buffer,
+            sizeof(name_buffer)
+        );
+    }
+    
+    connector_info->name = name_buffer[0] ? name_buffer : "Unnamed Connector";
+    
+    // Добавляем в список всех коннекторов
+    connectors_.push_back(connector_info);
+    Stats::total_connectors++;
+    Stats::enabled_connectors++;
+    Stats::loaded_connectors.push_back(fmt::format("{} ({})", connector_info->name, scheme));
+
+    LOG_INFO("Registered connector: {} (scheme: {})", connector_info->name, scheme);
+    
+    LOG_TRACE_EXIT();
 }
 
 // ========== Загрузка обработчика ==========
@@ -274,109 +412,6 @@ bool PluginManager::load_connector(const fs::path& path) {
     LOG_INFO("Connector loaded in {} ms: {}", duration.count(), path.string());
     LOG_TRACE_EXIT_VALUE(true);
     return true;
-}
-
-// ========== Регистрация обработчика ==========
-
-void PluginManager::register_handler(std::shared_ptr<HandlerInfo> handler_info) {
-    LOG_TRACE_ENTER_ARGS("name: {}", handler_info->name);
-    
-    if (!handler_info->handler) {
-        LOG_ERROR("Cannot register null handler");
-        LOG_TRACE_EXIT();
-        return;
-    }
-    
-    // Проверяем уникальность имени
-    if (name_to_handler_.find(handler_info->name) != name_to_handler_.end()) {
-        LOG_ERROR("Duplicate handler name: {}", handler_info->name);
-        LOG_TRACE_EXIT();
-        return;
-    }
-    
-    auto* handler = handler_info->handler;
-    
-    // Добавляем в список всех обработчиков
-    handlers_.push_back(handler_info);
-    name_to_handler_[handler_info->name] = handler_info;
-    Stats::total_handlers++;
-    Stats::enabled_handlers++;
-    Stats::loaded_handlers.push_back(handler_info->name);
-    
-    LOG_INFO("Registered handler: {}", handler_info->name);
-
-    // Уведомляем через колбэк
-    if (handler_loaded_callback_) {
-        handler_loaded_callback_(handler);
-    }
-    
-    LOG_TRACE_EXIT();
-}
-
-// ========== Регистрация коннектора ==========
-
-void PluginManager::register_connector(std::shared_ptr<ConnectorInfo> connector_info) {
-    LOG_TRACE_ENTER_ARGS("name: {}", connector_info->name);
-    
-    if (!connector_info->ops) {
-        LOG_ERROR("Cannot register null connector");
-        LOG_TRACE_EXIT();
-        return;
-    }
-    
-    // Получаем схему протокола
-    char scheme_buffer[64] = {0};
-    if (connector_info->ops->get_scheme) {
-        connector_info->ops->get_scheme(
-            connector_info->ops->connector_ctx,
-            scheme_buffer,
-            sizeof(scheme_buffer)
-        );
-    }
-    
-    std::string scheme(scheme_buffer);
-    if (scheme.empty()) {
-        LOG_ERROR("Connector has empty scheme");
-        LOG_TRACE_EXIT();
-        return;
-    }
-    
-    // Проверяем уникальность схемы
-    if (scheme_to_connector_.find(scheme) != scheme_to_connector_.end()) {
-        LOG_ERROR("Duplicate connector scheme: {}", scheme);
-        LOG_TRACE_EXIT();
-        return;
-    }
-    
-    connector_info->scheme = scheme;
-    scheme_to_connector_[scheme] = connector_info;
-    
-    // Получаем имя
-    char name_buffer[128] = {0};
-    if (connector_info->ops->get_name) {
-        connector_info->ops->get_name(
-            connector_info->ops->connector_ctx,
-            name_buffer,
-            sizeof(name_buffer)
-        );
-    }
-    
-    connector_info->name = name_buffer[0] ? name_buffer : "Unnamed Connector";
-    
-    // Добавляем в список всех коннекторов
-    connectors_.push_back(connector_info);
-    Stats::total_connectors++;
-    Stats::enabled_connectors++;
-    Stats::loaded_connectors.push_back(fmt::format("{} ({})", connector_info->name, scheme));
-
-    LOG_INFO("Registered connector: {} (scheme: {})", connector_info->name, scheme);
-
-    // Уведомляем через колбэк
-    if (connector_loaded_callback_) {
-        connector_loaded_callback_(connector_info->ops);
-    }
-    
-    LOG_TRACE_EXIT();
 }
 
 // ========== Основная загрузка плагина ==========
@@ -1035,26 +1070,6 @@ void PluginManager::set_plugins_base_dir(const fs::path& dir) {
     plugins_base_dir_ = dir;
     LOG_INFO("Plugins base directory changed to: {}", plugins_base_dir_.string());
     
-    LOG_TRACE_EXIT();
-}
-
-// ========== Установка колбэков ==========
-
-void PluginManager::set_handler_loaded_callback(HandlerLoadedCallback callback) {
-    LOG_TRACE_ENTER();
-    handler_loaded_callback_ = std::move(callback);
-    LOG_TRACE_EXIT();
-}
-
-void PluginManager::set_connector_loaded_callback(ConnectorLoadedCallback callback) {
-    LOG_TRACE_ENTER();
-    connector_loaded_callback_ = std::move(callback);
-    LOG_TRACE_EXIT();
-}
-
-void PluginManager::set_error_callback(PluginErrorCallback callback) {
-    LOG_TRACE_ENTER();
-    error_callback_ = std::move(callback);
     LOG_TRACE_EXIT();
 }
 

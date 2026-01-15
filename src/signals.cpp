@@ -48,4 +48,7 @@ size_t Signal<Args...>::size() const {
 template class Signal<const header_t*, const endpoint_t*, std::span<const char>>;
 template class Signal<const char*, conn_state_t>;
 
+std::shared_ptr<PacketSignal> packet_signal = nullptr;
+std::shared_ptr<ConnStateSignal> conn_state_signal = nullptr;
+
 } // namespace gn

@@ -40,20 +40,29 @@ endif()
 # Исполняемый файл
 add_executable(goodnet
     src/main.cpp
+    src/core.cpp
     
     src/config.cpp
     src/logger.cpp
     src/signals.cpp
     
+    core/homeServices.cpp
     core/pluginManager.cpp
+    core/connectManager.cpp
 )
 
 target_include_directories(goodnet PRIVATE 
-    ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/core ${CMAKE_SOURCE_DIR}/sdk
+    ${CMAKE_SOURCE_DIR}/include
+    ${CMAKE_SOURCE_DIR}/core
+    ${CMAKE_SOURCE_DIR}/sdk
 )
 
 target_link_libraries(goodnet PRIVATE
-    Boost::filesystem Boost::system spdlog::spdlog fmt::fmt sodium dl
+    Boost::filesystem
+    spdlog::spdlog
+    Boost::system
+    sodium dl
+    fmt::fmt
 )
 
 # UPX
