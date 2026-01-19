@@ -3,6 +3,7 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include <boost/asio.hpp>
 #include "../sdk/types.h"
 
 namespace gn {

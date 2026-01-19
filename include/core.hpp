@@ -27,14 +27,11 @@ public:
     bool is_running() const { return is_running_; }
 
     // Получение компонентов
+    HomeServices& get_heme_services() { return *home_services_; }
     PluginManager& get_plugin_manager() { return *plugin_manager_; }
     ConnectManager& get_connect_manager() { return *connect_manager_; }
     boost::asio::io_context& get_io_context() { return io_context_; }
     host_api_t* get_host_api() { return host_api_.get(); }
-    
-    // Получение сигналов
-    const PacketSignal& get_packet_signal() { return *packet_signal_; }
-    const ConnStateSignal& get_conn_state_signal() { return *conn_state_signal_; }
 
 private:
     void initialize_host_api();

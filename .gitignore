@@ -5,6 +5,7 @@
 !CMakeLists.txt
 
 !docs/
+!nix/
 
 !sdk/
 !core/

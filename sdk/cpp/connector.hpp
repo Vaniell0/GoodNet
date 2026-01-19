@@ -188,4 +188,4 @@ protected:
     }
 };
 
-}  /* namespace gn */
+} // namespace gn

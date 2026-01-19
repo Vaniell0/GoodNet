@@ -292,7 +292,7 @@ bool PluginManager::load_handler(const fs::path& path) {
     handler_t* handler = nullptr;
     int result = init_func(host_api_, &handler);
     
-    LOG_INFO("handler_init returned: {}, handler ptr: {}", result, fmt::ptr(handler));
+    LOG_DEBUG("handler_init returned: {}, handler ptr: {}", result, fmt::ptr(handler));
     
     if (result != 0 || !handler) {
         LOG_WARN("Handler initialization failed");
@@ -316,7 +316,7 @@ bool PluginManager::load_handler(const fs::path& path) {
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
     Stats::load_times.push_back(duration.count());
     
-    LOG_INFO("Handler loaded in {} ms: {}", duration.count(), path.string());
+    LOG_DEBUG("Handler loaded in {} ms: {}", duration.count(), path.string());
     LOG_TRACE_EXIT_VALUE(true);
     return true;
 }
@@ -377,7 +377,7 @@ bool PluginManager::load_connector(const fs::path& path) {
     connector_ops_t* ops = nullptr;
     int result = init_func(host_api_, &ops);
     
-    LOG_INFO("connector_init returned: {}, ops ptr: {}", result, fmt::ptr(ops));
+    LOG_DEBUG("connector_init returned: {}, ops ptr: {}", result, fmt::ptr(ops));
     
     if (result != 0 || !ops) {
         LOG_WARN("Connector initialization failed");
@@ -409,7 +409,7 @@ bool PluginManager::load_connector(const fs::path& path) {
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
     Stats::load_times.push_back(duration.count());
     
-    LOG_INFO("Connector loaded in {} ms: {}", duration.count(), path.string());
+    LOG_DEBUG("Connector loaded in {} ms: {}", duration.count(), path.string());
     LOG_TRACE_EXIT_VALUE(true);
     return true;
 }

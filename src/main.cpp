@@ -3,6 +3,7 @@
 #include "core.hpp"
 #include <csignal>
 #include <atomic>
+#include <iostream>
 
 namespace {
     std::atomic<bool> g_running{true};
@@ -33,11 +34,6 @@ int main(int argc, char* argv[]) {
             config.get_or<int>("logging.max_files", 5)
         );
         
-        LOG_INFO("\n┌──────────────────────────────────────────────┐\n"
-                   "│              GoodNet v0.1.0                  │\n"
-                   "│       Advanced Network Framework             │\n"
-                   "└──────────────────────────────────────────────┘");
-        
         LOG_INFO("Listen address: {}", config.get_or<std::string>("core.listen_address", "0.0.0.0"));
         LOG_INFO("Listen port: {}", config.get_or<int>("core.listen_port", 25565));
         LOG_INFO("IO threads: {}", config.get_or<int>("core.io_threads", 4));
@@ -60,7 +56,11 @@ int main(int argc, char* argv[]) {
         while (g_running && core->is_running()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
             
-            
+            std::string inp;
+            std::getline(std::cin, inp);
+            if (inp.starts_with("tcp://")) {
+                
+            } else { break; }
         }
         
         // 6. Корректное завершение

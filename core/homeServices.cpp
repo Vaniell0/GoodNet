@@ -3,7 +3,6 @@
 #include "../include/logger.hpp"
 #include "signals.hpp"
 
-#include <boost/asio.hpp>
 #include <sodium.h>
 
 namespace gn {

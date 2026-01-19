@@ -21,7 +21,7 @@ public:
         /* ИНИЦИАЛИЗАЦИЯ НУЛЯМИ */
         handler_.handle_message = nullptr;
         handler_.handle_conn_state = nullptr;
-        handler_.shutdown = nullptr;  // <-- Инициализируем
+        handler_.shutdown = nullptr;
         handler_.supported_types = nullptr;
         handler_.num_supported_types = 0;
         handler_.user_data = this;
@@ -94,4 +94,4 @@ protected:
     }
 };
 
-}  /* namespace gn */
+} // namespace gn

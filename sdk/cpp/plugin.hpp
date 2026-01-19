@@ -3,9 +3,15 @@
 #include "../sdk/handler.h"
 #include "../sdk/connector.h"
 
+#ifdef __GNUC__
+#  define PLUGIN_EXPORT __attribute__((visibility("default")))
+#else
+#  define PLUGIN_EXPORT
+#endif
+
 /* МАКРОС ДЛЯ ОБРАБОТЧИКОВ */
 #define HANDLER_PLUGIN(ClassName) \
-extern "C" int handler_init(host_api_t* api, handler_t** handler) { \
+extern "C" PLUGIN_EXPORT int handler_init(host_api_t* api, handler_t** handler) { \
     static ClassName instance; \
     if (api && api->plugin_type == PLUGIN_TYPE_HANDLER) { \
         if (api->api_version != GNET_API_VERSION) { \
@@ -20,7 +26,7 @@ extern "C" int handler_init(host_api_t* api, handler_t** handler) { \
 
 /* МАКРОС ДЛЯ КОННЕКТОРОВ */
 #define CONNECTOR_PLUGIN(ClassName) \
-extern "C" int connector_init(host_api_t* api, connector_ops_t** ops) { \
+extern "C" PLUGIN_EXPORT int connector_init(host_api_t* api, connector_ops_t** ops) { \
     static ClassName instance; \
     if (api && api->plugin_type == PLUGIN_TYPE_CONNECTOR) { \
         if (api->api_version != GNET_API_VERSION) { \

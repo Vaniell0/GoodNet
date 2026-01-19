@@ -1,6 +1,6 @@
-#include "handler.hpp"
-#include "plugin.hpp"
-#include "logger.hpp"
+#include <handler.hpp>
+#include <plugin.hpp>
+#include <logger.hpp>
 
 #include <fstream>
 #include <filesystem>
@@ -9,7 +9,7 @@
 
 namespace fs = std::filesystem;
 
-class MessageLoggerHandler : public gn::IHandler {
+class MessageLogger : public gn::IHandler {
 public:
     void on_init() override {
         // Создаем папку для сообщений при инициализации
@@ -67,4 +67,4 @@ public:
 };
 
 // Регистрация плагина через макрос
-HANDLER_PLUGIN(MessageLoggerHandler)
+HANDLER_PLUGIN(MessageLogger)
