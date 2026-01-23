@@ -1,11 +1,12 @@
 #pragma once
-
 #include "connector.h"
 
 #include <string>
 #include <memory>
 #include <functional>
 #include <cstring>
+#include <stdexcept>
+#include <algorithm>
 
 namespace gn {
 
@@ -34,12 +35,11 @@ public:
 
     virtual bool do_send(const void* data, size_t size) = 0;
     virtual void do_close() = 0;
-
     virtual bool is_connected() const = 0;
-    
     virtual endpoint_t get_remote_endpoint() const = 0;
-    
     virtual std::string get_uri_string() const = 0;
+    
+    virtual void shutdown() {}  // <-- Добавляем shutdown для соединения
     
     void notify_data(const void* data, size_t size) {
         if (callbacks_.on_data) {
@@ -85,8 +85,13 @@ public:
             IConnection* self = static_cast<IConnection*>(ctx);
             std::string uri = self->get_uri_string();
             
-            strncpy(buffer, uri.c_str(), size - 1);
-            buffer[size - 1] = '\0';
+            if (size > 0) {
+                const size_t copy_len = std::min(uri.size(), size - 1);
+                std::copy_n(uri.c_str(), copy_len, buffer);
+                buffer[copy_len] = '\0';
+            } else if (size > 0) {
+                buffer[0] = '\0';
+            }
         };
         
         ops_.set_callbacks = [](void* ctx, const connection_callbacks_t* cb) {
@@ -116,6 +121,9 @@ public:
     virtual ~IConnector() = default;
     
     void init(host_api_t* api) {
+        if (api && api->api_version != GNET_API_VERSION) {
+            throw std::runtime_error("API version mismatch");
+        }
         api_ = api;
         on_init();
     }
@@ -172,13 +180,7 @@ public:
     
     virtual std::string get_name() const = 0;
     
-protected:
-    void log(const char* message) {
-        if (api_ && api_->log) {
-            api_->log(message);
-        }
-    }
-    
+protected:    
     void send(const char* uri, uint32_t type, const void* data, size_t size) {
         if (api_ && api_->send) {
             api_->send(uri, type, data, size);
@@ -186,4 +188,4 @@ protected:
     }
 };
 
-}  /* namespace gn */
+} // namespace gn

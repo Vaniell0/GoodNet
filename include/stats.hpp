@@ -12,6 +12,7 @@ struct Stats {
     static inline size_t total_connectors = 0;
     static inline size_t enabled_connectors = 0;
     
+    static inline std::vector<int64_t> load_times;
     static inline std::vector<std::string> loaded_handlers;
     static inline std::vector<std::string> loaded_connectors;
 

@@ -2,6 +2,7 @@
 
 #include "handler.h"
 
+#include <stdexcept>
 #include <vector>
 #include <string>
 #include <functional>
@@ -20,6 +21,7 @@ public:
         /* ИНИЦИАЛИЗАЦИЯ НУЛЯМИ */
         handler_.handle_message = nullptr;
         handler_.handle_conn_state = nullptr;
+        handler_.shutdown = nullptr;
         handler_.supported_types = nullptr;
         handler_.num_supported_types = 0;
         handler_.user_data = this;
@@ -27,6 +29,10 @@ public:
     virtual ~IHandler() = default;
     
     void init(host_api_t* api) {
+        if (api && api->api_version != GNET_API_VERSION) {
+            // Можно выбросить исключение или как-то обработать
+            throw std::runtime_error("API version mismatch");
+        }
         api_ = api;
         on_init();
     }
@@ -53,6 +59,12 @@ public:
             IHandler* self = static_cast<IHandler*>(user_data);
             self->handle_connection_state(uri, state);
         };
+
+        // Устанавливаем функцию shutdown
+        handler_.shutdown = [](void* user_data) {
+            IHandler* self = static_cast<IHandler*>(user_data);
+            self->shutdown();
+        };
         
         return &handler_;
     }
@@ -70,14 +82,11 @@ public:
         const char* uri,
         conn_state_t state
     ) {}
+
+    // Добавляем виртуальную функцию shutdown
+    virtual void shutdown() {}
     
-protected:    
-    void log(const char* message) {
-        if (api_ && api_->log) {
-            api_->log(message);
-        }
-    }
-    
+protected:   
     void send(const char* uri, uint32_t type, const void* data, size_t size) {
         if (api_ && api_->send) {
             api_->send(uri, type, data, size);
@@ -85,4 +94,4 @@ protected:
     }
 };
 
-}  /* namespace gn */
+} // namespace gn

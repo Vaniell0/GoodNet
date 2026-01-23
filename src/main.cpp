@@ -1,36 +1,32 @@
 #include "config.hpp"
 #include "logger.hpp"
+#include "core.hpp"
+#include <csignal>
+#include <atomic>
 #include <iostream>
-#include <vector>
-#include <map>
 
-void test_function() {
-    SCOPED_TRACE();  // Автоматически логирует вход/выход
+namespace {
+    std::atomic<bool> g_running{true};
     
-    int x = 42;
-    std::string name = "GoodNet";
-    std::vector<int> vec = {1, 2, 3, 4, 5};
-    std::map<std::string, int> config = {{"port", 8080}, {"timeout", 30}};
-    
-    // Логирование значений переменных
-    TRACE_VALUE(x);
-    DEBUG_VALUE(name);
-    INFO_VALUE(x + 10);
-    
-    // Подробное логирование
-    TRACE_VALUE_DETAILED(x);
-    
-    // Логирование указателей
-    int* ptr = &x;
-    TRACE_POINTER(ptr);
-    
-    LOG_DEBUG("Debug build specific logging");
+    void signal_handler(int signal) {
+        const char* signal_name = "";
+        switch (signal) {
+            case SIGINT: signal_name = "SIGINT"; break;
+            case SIGTERM: signal_name = "SIGTERM"; break;
+            case SIGHUP: signal_name = "SIGHUP"; break;
+            default: signal_name = "UNKNOWN"; break;
+        }
+        LOG_INFO("Signal {} ({}) received, shutting down...", signal_name, signal);
+        g_running = false;
+    }
 }
 
 int main(int argc, char* argv[]) {
-    try {        
+    try {
+        // 1. Инициализация конфигурации
         Config config;
-
+        
+        // 2. Инициализация логгера
         Logger::initialize(
             config.get_or<std::string>("logging.level", "info"),
             config.get_or<std::string>("logging.file", "logs/goodnet.log"),
@@ -38,24 +34,49 @@ int main(int argc, char* argv[]) {
             config.get_or<int>("logging.max_files", 5)
         );
         
-        LOG_INFO("GoodNet starting...");
         LOG_INFO("Listen address: {}", config.get_or<std::string>("core.listen_address", "0.0.0.0"));
         LOG_INFO("Listen port: {}", config.get_or<int>("core.listen_port", 25565));
+        LOG_INFO("IO threads: {}", config.get_or<int>("core.io_threads", 4));
         
-        // Демонстрация разных уровней логирования
-        LOG_TRACE("This is trace message");
-        LOG_DEBUG("This is debug message");
-        LOG_INFO("This is info message");
-        LOG_WARN("This is warning message");
-        LOG_ERROR("This is error message");
+        // 3. Настройка обработки сигналов
+        std::signal(SIGINT, signal_handler);
+        std::signal(SIGTERM, signal_handler);
         
-        test_function();
+        // 4. Создание и запуск ядра
+        auto core = std::make_unique<gn::Core>(config);
+        
+        if (!core->start()) {
+            LOG_CRITICAL("Failed to start Core");
+            return 1;
+        }
+        
+        LOG_INFO("GoodNet started successfully. Press Ctrl+C to stop.");
+        
+        // 5. Главный цикл
+        while (g_running && core->is_running()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            
+            std::string inp;
+            std::getline(std::cin, inp);
+            if (inp.starts_with("tcp://")) {
+                
+            } else { break; }
+        }
+        
+        // 6. Корректное завершение
+        LOG_INFO("Shutting down GoodNet...");
+        core->stop();
         
         Logger::shutdown();
+        
+        LOG_INFO("GoodNet shutdown complete");
         return 0;
-
+        
     } catch (const std::exception& e) {
         LOG_CRITICAL("Fatal error: {}", e.what());
+        return 1;
+    } catch (...) {
+        LOG_CRITICAL("Fatal unknown error");
         return 1;
     }
 }

@@ -5,7 +5,6 @@
 extern "C" {
 #endif
 
-
 // Структура обработчика
 typedef struct {
     // Функции обработки (указатели)
@@ -14,6 +13,7 @@ typedef struct {
                           size_t payload_size);
     void (*handle_conn_state)(void* user_data, const char* uri,
                              conn_state_t state);
+    void (*shutdown)(void* user_data);  // <-- Добавили shutdown
     
     // Поддерживаемые типы сообщений
     uint32_t* supported_types;

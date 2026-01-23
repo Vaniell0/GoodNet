@@ -1,5 +1,4 @@
 #include "config.hpp"
-#include "logger.hpp"
 #include <string>
 #include <sstream>
 #include <fstream>

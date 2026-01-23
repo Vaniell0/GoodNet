@@ -7,15 +7,13 @@
 
 namespace gn {
 
-// Концепт для типобезопасных сигналов
 template<typename Func, typename... Args>
 concept SignalHandler = std::invocable<Func, Args...>;
 
-// Базовый класс для сигналов
 template<typename... Args>
 class Signal {
 private:
-    mutable std::mutex mutex_;  // <-- ДОБАВЬ mutable ЗДЕСЬ
+    mutable std::mutex mutex_;
     boost::asio::io_context& io_context_;
     boost::asio::strand<boost::asio::io_context::executor_type> strand_;
     std::vector<std::function<void(Args...)>> handlers_;
@@ -35,7 +33,6 @@ public:
     [[nodiscard]] size_t size() const;
 };
 
-// Реализация шаблонных методов
 template<typename... Args>
 template<typename Func>
 requires SignalHandler<Func, Args...>
@@ -44,7 +41,6 @@ void Signal<Args...>::connect(Func&& handler) {
     handlers_.emplace_back(std::forward<Func>(handler));
 }
 
-// Предопределенные типы сигналов
 using PacketSignal = Signal<
     const header_t*,
     const endpoint_t*,
@@ -55,5 +51,8 @@ using ConnStateSignal = Signal<
     const char*,
     conn_state_t
 >;
+
+extern std::shared_ptr<PacketSignal> packet_signal;
+extern std::shared_ptr<ConnStateSignal> conn_state_signal;
 
 } // namespace gn
