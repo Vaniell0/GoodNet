@@ -3,82 +3,105 @@ project(GoodNet)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CXX_EXTENSIONS OFF)
 
-# Настройки оптимизации
-if(CMAKE_BUILD_TYPE STREQUAL "Release")
-    # Агрессивная оптимизация размера
-    add_compile_options(-Os -flto -ffunction-sections -fdata-sections)
-    add_link_options(-Wl,--gc-sections -flto -s)
-    
-    # Отключение отладочной информации в логах
-    add_compile_definitions(NDEBUG)
-endif()
+# Опции сборки
+option(BUILD_AS_LIBRARY "Build as library for development" OFF)
+option(INSTALL_DEVELOPMENT "Install development files" OFF)
 
-# Опция для включения сборки плагинов
-option(BUILD_PLUGINS "Build plugins" OFF)
-
-# Поиск необходимых библиотек
+# --- Зависимости Core ---
 cmake_policy(SET CMP0167 NEW)
 find_package(Boost REQUIRED COMPONENTS system filesystem)
-find_package(fmt REQUIRED)
+find_package(nlohmann_json REQUIRED)
 find_package(spdlog REQUIRED)
-find_package(PkgConfig QUIET)
-if (PKG_CONFIG_FOUND)
-    pkg_check_modules(sodium_PKG QUIET libsodium)
-endif()
+find_package(fmt REQUIRED)
 
-# Исполняемый файл
+# Настройка путей вывода
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
+
+# --- 1. Собираем ядро (всегда) ---
 add_executable(goodnet
     src/main.cpp
-    
-    src/config.cpp
-    src/logger.cpp
-    src/signals.cpp
+    # src/core.cpp
+    # src/config.cpp
+    # src/logger.cpp
+    # src/signals.cpp
+
+    # core/homeServices.cpp
+    # core/pluginManager.cpp
+    # core/connectManager.cpp
 )
 
-# Корневой каталог для включений
-target_include_directories(goodnet PRIVATE
+target_include_directories(goodnet PRIVATE 
     ${CMAKE_SOURCE_DIR}/include
     ${CMAKE_SOURCE_DIR}/core
     ${CMAKE_SOURCE_DIR}/sdk
 )
 
-set(EXECUTABLE_OUTPUT_PATH "${CMAKE_BINARY_DIR}/bin")
-
-# Ссылки на библиотеки
 target_link_libraries(goodnet PRIVATE
+    nlohmann_json::nlohmann_json
     Boost::filesystem
     spdlog::spdlog
     Boost::system
-    fmt::fmt
     sodium dl
+    fmt::fmt
 )
 
-# Опции для полного отключения логов в релизе
-option(DISABLE_TRACE_LOGS "Disable TRACE logs" OFF)
-option(DISABLE_DEBUG_LOGS "Disable DEBUG logs" OFF)
+# --- 2. Если собираем как библиотеку ---
+if(BUILD_AS_LIBRARY)
+    add_library(goodnet_core STATIC
+        src/config.cpp
+        src/logger.cpp
+        # src/signals.cpp
 
-# Создаем директории для плагинов
-file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/plugins/handlers)
-file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/plugins/connectors)
+        # core/homeServices.cpp
+        # core/pluginManager.cpp
+        # core/connectManager.cpp
+    )
 
-# Определяем путь к плагинам для тестирования
-target_compile_definitions(goodnet PRIVATE
-    PLUGINS_DIR="${CMAKE_BINARY_DIR}/plugins"
-)
+    target_include_directories(goodnet_core PUBLIC
+        ${CMAKE_SOURCE_DIR}/include
+        ${CMAKE_SOURCE_DIR}/core
+        ${CMAKE_SOURCE_DIR}/sdk
+    )
 
-# Опциональная сборка плагинов
-if (BUILD_PLUGINS)
-    message(STATUS "Building plugins...")
-    
-    # Плагин-обработчик логов
-    add_subdirectory(plugins/handlers)
-    
-    # Плагин-коннектор (tcp)
-    add_subdirectory(plugins/connectors)
+    target_link_libraries(goodnet_core PUBLIC
+        nlohmann_json::nlohmann_json
+        Boost::filesystem
+        spdlog::spdlog
+        Boost::system
+        sodium dl
+        fmt::fmt
+    )
 endif()
 
-# Установка
-install(TARGETS goodnet DESTINATION bin)
-install(DIRECTORY include/sdk DESTINATION include/goodnet)
+# --- Установка (в зависимости от режима) ---
+if(INSTALL_DEVELOPMENT)
+    # Режим библиотеки: устанавливаем ВСЁ для разработки плагинов
+
+    # 1. Устанавливаем заголовки ядра
+    install(DIRECTORY include/ DESTINATION include)
+
+    # 2. Устанавливаем SDK для плагинов
+    install(DIRECTORY sdk/ DESTINATION sdk)
+
+    # 3. Устанавливаем заголовки core
+    install(DIRECTORY core/ DESTINATION core FILES_MATCHING PATTERN "*.hpp")
+
+    # 4. Устанавливаем заголовки из core как часть SDK (для совместимости)
+    install(DIRECTORY core/ DESTINATION include/goodnet/core FILES_MATCHING PATTERN "*.hpp")
+
+    if(BUILD_AS_LIBRARY)
+        # 5. Устанавливаем статическую библиотеку
+        install(TARGETS goodnet_core
+            ARCHIVE DESTINATION lib
+            INCLUDES DESTINATION include
+        )
+    endif()
+
+    message(STATUS "📦 Building GoodNet as LIBRARY for development")
+else()
+    # Режим приложения: только приложение
+    install(TARGETS goodnet DESTINATION bin)
+    message(STATUS "Building GoodNet as APPLICATION")
+endif()
