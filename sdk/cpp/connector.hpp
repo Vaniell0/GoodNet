@@ -172,13 +172,7 @@ public:
     
     virtual std::string get_name() const = 0;
     
-protected:
-    void log(const char* message) {
-        if (api_ && api_->log) {
-            api_->log(message);
-        }
-    }
-    
+protected:    
     void send(const char* uri, uint32_t type, const void* data, size_t size) {
         if (api_ && api_->send) {
             api_->send(uri, type, data, size);

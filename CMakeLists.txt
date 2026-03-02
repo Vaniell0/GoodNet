@@ -1,107 +1,130 @@
-cmake_minimum_required(VERSION 3.22.1)
+cmake_minimum_required(VERSION 3.22)
 project(GoodNet)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-# Опции сборки
-option(BUILD_AS_LIBRARY "Build as library for development" OFF)
-option(INSTALL_DEVELOPMENT "Install development files" OFF)
-
-# --- Зависимости Core ---
 cmake_policy(SET CMP0167 NEW)
-find_package(Boost REQUIRED COMPONENTS system filesystem)
+
+option(INSTALL_DEVELOPMENT "Install SDK headers and cmake config" OFF)
+
+# ─── Зависимости ─────────────────────────────────────────────────────────────
+
+find_package(Boost         REQUIRED COMPONENTS system filesystem)
 find_package(nlohmann_json REQUIRED)
-find_package(spdlog REQUIRED)
-find_package(fmt REQUIRED)
+find_package(spdlog        REQUIRED)
+find_package(fmt           REQUIRED)
 
-# Настройка путей вывода
-set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
-set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
+# ─── PCH (только в Debug) ─────────────────────────────────────────────────────
+# Ускоряет инкрементальные пересборки в nix develop + cmake --build build/debug
+# В Release не нужен: Nix кеширует деривацию целиком, перкомпиляция единичных
+# файлов не происходит.
+include(cmake/pch.cmake)
 
-# --- 1. Собираем ядро (всегда) ---
-add_executable(goodnet
-    src/main.cpp
-    # src/core.cpp
-    # src/config.cpp
-    # src/logger.cpp
-    # src/signals.cpp
+# ─── 1. SDK ───────────────────────────────────────────────────────────────────
 
-    # core/homeServices.cpp
-    # core/pluginManager.cpp
-    # core/connectManager.cpp
+add_library(goodnet_sdk INTERFACE)
+add_library(GoodNet::sdk ALIAS goodnet_sdk)
+set_target_properties(goodnet_sdk PROPERTIES EXPORT_NAME sdk)
+
+target_include_directories(goodnet_sdk INTERFACE
+    $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/sdk>
+    $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/sdk/cpp>
+    $<INSTALL_INTERFACE:include/goodnet/sdk>
+    $<INSTALL_INTERFACE:include/goodnet/sdk/cpp>
 )
 
-target_include_directories(goodnet PRIVATE 
-    ${CMAKE_SOURCE_DIR}/include
-    ${CMAKE_SOURCE_DIR}/core
-    ${CMAKE_SOURCE_DIR}/sdk
+# ─── 2. Core (SHARED) ────────────────────────────────────────────────────────
+#
+# SHARED обязателен — одна копия всех static переменных (Logger, once_flag).
+# Плагин через dlopen(RTLD_GLOBAL) видит тот же экземпляр Logger что и ядро.
+# STATIC → дублирование static в executable + в плагинах → double init → SIGSEGV.
+
+add_library(goodnet_core SHARED
+    src/config.cpp
+    src/logger.cpp
+    core/pluginManager_core.cpp
+    core/pluginManager_state.cpp
+    core/pluginManager_lookup.cpp
 )
 
-target_link_libraries(goodnet PRIVATE
-    nlohmann_json::nlohmann_json
-    Boost::filesystem
-    spdlog::spdlog
-    Boost::system
-    sodium dl
-    fmt::fmt
+add_library(GoodNet::core ALIAS goodnet_core)
+set_target_properties(goodnet_core PROPERTIES
+    EXPORT_NAME core
+    VERSION     0.1.0
+    SOVERSION   0
 )
 
-# --- 2. Если собираем как библиотеку ---
-if(BUILD_AS_LIBRARY)
-    add_library(goodnet_core STATIC
-        src/config.cpp
-        src/logger.cpp
-        # src/signals.cpp
+target_link_libraries(goodnet_core PUBLIC goodnet_sdk)
 
-        # core/homeServices.cpp
-        # core/pluginManager.cpp
-        # core/connectManager.cpp
-    )
+target_include_directories(goodnet_core
+    PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/include>
+        $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/core>
+        $<INSTALL_INTERFACE:include/goodnet>
+)
 
-    target_include_directories(goodnet_core PUBLIC
-        ${CMAKE_SOURCE_DIR}/include
-        ${CMAKE_SOURCE_DIR}/core
-        ${CMAKE_SOURCE_DIR}/sdk
-    )
+target_link_libraries(goodnet_core
+    # PUBLIC: spdlog и fmt используются в logger.hpp (публичный заголовок).
+    # Потребители (плагины) не линкуют их напрямую, но cmake экспортирует
+    # их как INTERFACE_LINK_LIBRARIES → find_dependency в GoodNetConfig.cmake.
+    PUBLIC  spdlog::spdlog fmt::fmt
 
-    target_link_libraries(goodnet_core PUBLIC
-        nlohmann_json::nlohmann_json
-        Boost::filesystem
-        spdlog::spdlog
-        Boost::system
-        sodium dl
-        fmt::fmt
-    )
-endif()
+    # PRIVATE: используются только в .cpp файлах ядра, не в публичных заголовках.
+    # НЕ попадают в GoodNetTargets.cmake INTERFACE_LINK_LIBRARIES.
+    # Плагинам не нужно их находить при find_package(GoodNet).
+    PRIVATE nlohmann_json::nlohmann_json Boost::system sodium
+)
+set_target_properties(goodnet_core PROPERTIES ENABLE_EXPORTS ON)
+target_compile_definitions(goodnet_core PUBLIC SPDLOG_COMPILED_LIB)
 
-# --- Установка (в зависимости от режима) ---
+# GOODNET_PROJECT_ROOT: CMake SOURCE_DIR → относительные пути в логах.
+# [src/config.cpp:42] вместо [/nix/store/...-source/src/config.cpp:42]
+# PRIVATE: compile-time константа, не нужна зависимым целям.
+target_compile_definitions(goodnet_core PRIVATE
+    GOODNET_PROJECT_ROOT="${CMAKE_SOURCE_DIR}/"
+)
+
+apply_pch(goodnet_core)
+
+# ─── 3. Executable ────────────────────────────────────────────────────────────
+
+add_executable(goodnet src/main.cpp)
+target_link_libraries(goodnet PRIVATE goodnet_core)
+target_compile_definitions(goodnet PRIVATE
+    GOODNET_PROJECT_ROOT="${CMAKE_SOURCE_DIR}/"
+)
+apply_pch(goodnet)
+
+# ─── 4. Установка ────────────────────────────────────────────────────────────
+
 if(INSTALL_DEVELOPMENT)
-    # Режим библиотеки: устанавливаем ВСЁ для разработки плагинов
+    install(DIRECTORY sdk/      DESTINATION include/goodnet/sdk)
+    install(DIRECTORY sdk/cpp/  DESTINATION include/goodnet/sdk/cpp)
+    install(DIRECTORY include/  DESTINATION include/goodnet)
+    install(DIRECTORY core/     DESTINATION include/goodnet/core
+            FILES_MATCHING PATTERN "*.hpp")
 
-    # 1. Устанавливаем заголовки ядра
-    install(DIRECTORY include/ DESTINATION include)
+    install(FILES cmake/pch.cmake      DESTINATION lib/cmake/GoodNet)
+    install(FILES plugins/helper.cmake DESTINATION lib/cmake/GoodNet)
 
-    # 2. Устанавливаем SDK для плагинов
-    install(DIRECTORY sdk/ DESTINATION sdk)
-
-    # 3. Устанавливаем заголовки core
-    install(DIRECTORY core/ DESTINATION core FILES_MATCHING PATTERN "*.hpp")
-
-    # 4. Устанавливаем заголовки из core как часть SDK (для совместимости)
-    install(DIRECTORY core/ DESTINATION include/goodnet/core FILES_MATCHING PATTERN "*.hpp")
-
-    if(BUILD_AS_LIBRARY)
-        # 5. Устанавливаем статическую библиотеку
-        install(TARGETS goodnet_core
+    install(TARGETS goodnet_core goodnet_sdk
+            EXPORT  GoodNetTargets
             ARCHIVE DESTINATION lib
-            INCLUDES DESTINATION include
-        )
-    endif()
+            LIBRARY DESTINATION lib
+            INCLUDES DESTINATION include/goodnet)
 
-    message(STATUS "📦 Building GoodNet as LIBRARY for development")
-else()
-    # Режим приложения: только приложение
-    install(TARGETS goodnet DESTINATION bin)
-    message(STATUS "Building GoodNet as APPLICATION")
+    install(EXPORT GoodNetTargets
+            FILE      GoodNetTargets.cmake
+            NAMESPACE GoodNet::
+            DESTINATION lib/cmake/GoodNet)
+
+    configure_file(cmake/GoodNetConfig.cmake.in
+                   "${CMAKE_BINARY_DIR}/GoodNetConfig.cmake" @ONLY)
+    install(FILES "${CMAKE_BINARY_DIR}/GoodNetConfig.cmake"
+            DESTINATION lib/cmake/GoodNet)
 endif()
+
+install(TARGETS goodnet      RUNTIME DESTINATION bin)
+install(TARGETS goodnet_core LIBRARY DESTINATION lib)

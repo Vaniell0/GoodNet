@@ -1,4 +1,3 @@
-// logger.hpp
 #pragma once
 
 #include <fmt/core.h>
@@ -7,82 +6,97 @@
 #include <spdlog/sinks/stdout_color_sinks.h>
 #include <memory>
 #include <string>
+#include <tuple>
+#include <filesystem>
 #include <string_view>
 #include <typeinfo>
+
+namespace LoggerDetail {
+    // Compile-time преобразование типов для безопасности на границах .so
+    template<typename T>
+    inline auto to_loggable(T&& arg) {
+        using Decayed = std::decay_t<T>;
+        if constexpr (std::is_same_v<Decayed, std::filesystem::path>) {
+            return arg.string(); 
+        } else if constexpr (std::is_same_v<Decayed, std::string>) {
+            return std::string_view(arg);
+        } else {
+            return std::forward<T>(arg);
+        }
+    }
+}
 
 class Logger {
 public:
     // Статические переменные для конфигурации (дефолты)
-    static std::string log_level;           // "trace", "debug", "info", "warn", "error", "critical", "off"
-    static std::string log_file;            // Путь к файлу логов
-    static size_t max_size;                 // Макс размер файла перед ротацией (байты)
-    static int max_files;                   // Кол-во хранимых ротаций
-    static std::string project_root;        // Корень проекта для относительных путей ("" = только basename)
-    static bool strip_extension;            // Убирать расширение файла (.cpp, .h и т.д.)
-    static int source_detail_mode;          // 0=авто (по уровню), 1=макс, 2=средний, 3=минимум
-    static std::string file_pattern;        // Паттерн для файлового лога
-    static std::string console_pattern;     // Паттерн для консоли
+    static std::string log_level;       // "trace", "debug", "info", "warn", "error", "critical", "off"
+    static std::string log_file;        // Путь к файлу логов
+    static size_t max_size;             // Макс размер файла перед ротацией (байты)
+    static int max_files;               // Кол-во хранимых ротаций
+    static std::string project_root;    // Корень проекта для относительных путей ("" = только basename)
+    static bool strip_extension;        // Убирать расширение файла (.cpp, .h и т.д.)
+    static int source_detail_mode;      // 0=авто (по уровню), 1=макс, 2=средний, 3=минимум
+    static std::string file_pattern;    // Паттерн для файлового лога
+    static std::string console_pattern; // Паттерн для консоли
+
+    static std::once_flag init_flag;
 
     static void shutdown();
 
-    // Методы логирования
-    template<typename... Args>
-    static void trace(std::string_view file, int line, fmt::format_string<Args...> fmt, Args&&... args) {
-        ensure_initialized();
-        if (logger_) {
-            logger_->log(spdlog::source_loc{file.data(), line, ""},
-                         spdlog::level::trace, fmt, std::forward<Args>(args)...);
+    static void log_raw(spdlog::source_loc loc, spdlog::level::level_enum lvl, std::string_view msg);
+
+    // Главный шаблон форматирования
+    template<spdlog::level::level_enum Lvl, typename... Args>
+    static void log_fmt(std::string_view file, int line, fmt::format_string<Args...> fmt_str, Args&&... args) {
+        if (!logger_) {
+            ensure_initialized();
+            if (!logger_) return;
+        }
+        
+        if (!logger_->should_log(Lvl)) return;
+
+        try {
+            // 1. Сначала трансформируем все аргументы и сохраняем их в кортеж.
+            // Это удерживает временные объекты (string из path и т.д.) живыми.
+            auto transformed_args = std::make_tuple(LoggerDetail::to_loggable(std::forward<Args>(args))...);
+            
+            // 2. Распаковываем кортеж в аргументы форматирования
+            auto loggable_args = std::apply([](auto&... unpacked) {
+                return fmt::make_format_args(unpacked...);
+            }, transformed_args);
+            
+            fmt::memory_buffer buf;
+            fmt::vformat_to(std::back_inserter(buf), fmt_str.get(), loggable_args);
+            
+            log_raw({file.data(), line, ""}, Lvl, std::string_view(buf.data(), buf.size()));
+        } catch (const std::exception& e) {
+            fmt::print(stderr, "\033[31m[Logger Error]\033[0m {} | {}:{}\n", e.what(), file, line);
         }
     }
 
-    template<typename... Args>
-    static void debug(std::string_view file, int line, fmt::format_string<Args...> fmt, Args&&... args) {
-        ensure_initialized();
-        if (logger_) {
-            logger_->log(spdlog::source_loc{file.data(), line, ""},
-                         spdlog::level::debug, fmt, std::forward<Args>(args)...);
-        }
-    }
-
-    template<typename... Args>
-    static void info(std::string_view file, int line, fmt::format_string<Args...> fmt, Args&&... args) {
-        ensure_initialized();
-        if (logger_) {
-            logger_->log(spdlog::source_loc{file.data(), line, ""},
-                         spdlog::level::info, fmt, std::forward<Args>(args)...);
-        }
-    }
-
-    template<typename... Args>
-    static void warn(std::string_view file, int line, fmt::format_string<Args...> fmt, Args&&... args) {
-        ensure_initialized();
-        if (logger_) {
-            logger_->log(spdlog::source_loc{file.data(), line, ""},
-                         spdlog::level::warn, fmt, std::forward<Args>(args)...);
-        }
-    }
-
-    template<typename... Args>
-    static void error(std::string_view file, int line, fmt::format_string<Args...> fmt, Args&&... args) {
-        ensure_initialized();
-        if (logger_) {
-            logger_->log(spdlog::source_loc{file.data(), line, ""},
-                         spdlog::level::err, fmt, std::forward<Args>(args)...);
-        }
-    }
-
-    template<typename... Args>
-    static void critical(std::string_view file, int line, fmt::format_string<Args...> fmt, Args&&... args) {
-        ensure_initialized();
-        if (logger_) {
-            logger_->log(spdlog::source_loc{file.data(), line, ""},
-                         spdlog::level::critical, fmt, std::forward<Args>(args)...);
-        }
-    }
+    // Методы для макросов
+    template<typename... Args> static inline void trace(std::string_view f, int l, fmt::format_string<Args...> s, Args&&... a) 
+    { log_fmt<spdlog::level::trace>(f, l, s, std::forward<Args>(a)...); }
+    
+    template<typename... Args> static inline void debug(std::string_view f, int l, fmt::format_string<Args...> s, Args&&... a) 
+    { log_fmt<spdlog::level::debug>(f, l, s, std::forward<Args>(a)...); }
+    
+    template<typename... Args> static inline void info(std::string_view f, int l, fmt::format_string<Args...> s, Args&&... a) 
+    { log_fmt<spdlog::level::info>(f, l, s, std::forward<Args>(a)...); }
+    
+    template<typename... Args> static inline void warn(std::string_view f, int l, fmt::format_string<Args...> s, Args&&... a) 
+    { log_fmt<spdlog::level::warn>(f, l, s, std::forward<Args>(a)...); }
+    
+    template<typename... Args> static inline void error(std::string_view f, int l, fmt::format_string<Args...> s, Args&&... a) 
+    { log_fmt<spdlog::level::err>(f, l, s, std::forward<Args>(a)...); }
 
     static std::shared_ptr<spdlog::logger> get() {
         ensure_initialized();
         return logger_;
+    }
+
+    static void set_external_logger(std::shared_ptr<spdlog::logger> ext) {
+        logger_ = std::move(ext);
     }
 
 private:
@@ -113,10 +127,10 @@ public:
     }
 
 private:
-    const char* function_name_;
+    std::string_view function_name_;
     std::string_view file_;
     int line_;
-    const char* level_;
+    std::string_view level_;
 };
 #endif
 

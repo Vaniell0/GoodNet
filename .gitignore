@@ -4,14 +4,16 @@
 !flake.nix
 !flake.lock
 !CMakeLists.txt
+!cmake/
 
 !docs/
 
-!nix
+!nix/
 !sdk/
 !plugins/
 
 !src/
+!core/
 !include/
 
 !.gitignore

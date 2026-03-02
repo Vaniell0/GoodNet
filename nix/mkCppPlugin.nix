@@ -1,28 +1,18 @@
 { pkgs, buildPlugin }:
 
-{ name
-, type
-, src
-, deps ? []
-, description ? ""
-, version ? "0.1.0"
-, cmakeFlags ? []
-, sign ? true
-, goodnetSdk
-}:
+{ name, type, src, deps ? [], description ? "", version, cmakeFlags ? [], goodnetSdk }:
 
 let
   rawBuild = pkgs.stdenv.mkDerivation {
     pname = "${name}-raw";
     inherit version src;
 
-    nativeBuildInputs = [ pkgs.cmake pkgs.ninja ];
+    nativeBuildInputs = with pkgs; [ cmake ninja pkg-config ];
     buildInputs = deps ++ [ goodnetSdk ];
 
     cmakeFlags = cmakeFlags ++ [
-      "-DGOODNET_SDK_PATH=${goodnetSdk}/sdk"
-      "-DGOODNET_INC_PATH=${goodnetSdk}/include"
-      "-GNinja"
+      "-DCMAKE_PREFIX_PATH=${goodnetSdk}"
+      "-DBUILD_SHARED_LIBS=ON"
     ];
 
     installPhase = ''
@@ -32,6 +22,6 @@ let
   };
 in
   buildPlugin {
-    inherit name type version description sign;
+    inherit name type version description;
     drv = rawBuild;
   }

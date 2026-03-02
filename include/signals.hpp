@@ -15,7 +15,7 @@ concept SignalHandler = std::invocable<Func, Args...>;
 template<typename... Args>
 class Signal {
 private:
-    mutable std::mutex mutex_;  // <-- ДОБАВЬ mutable ЗДЕСЬ
+    mutable std::mutex mutex_;
     boost::asio::io_context& io_context_;
     boost::asio::strand<boost::asio::io_context::executor_type> strand_;
     std::vector<std::function<void(Args...)>> handlers_;

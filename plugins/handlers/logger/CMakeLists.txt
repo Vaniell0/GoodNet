@@ -1,14 +1,13 @@
-cmake_minimum_required(VERSION 3.22.1)
-project(logger LANGUAGES CXX)
+cmake_minimum_required(VERSION 3.22)
+set(CMAKE_CXX_STANDARD 23)
+project(goodnet-logger)
 
-# Подключаем helper.cmake из SDK
-include(${GOODNET_SDK_PATH}/helper.cmake)
+find_package(GoodNet REQUIRED)
 
-add_plugin(logger
-    logger.cpp
-)
+add_plugin(logger logger.cpp)
 
-find_package(spdlog REQUIRED)
-target_link_libraries(logger PRIVATE
-    spdlog::spdlog
+# Линкуем зависимости
+target_link_libraries(logger
+  PRIVATE
+    GoodNet::core
 )

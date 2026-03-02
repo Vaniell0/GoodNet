@@ -1,0 +1,94 @@
+#pragma once
+
+#include <string>
+#include <string_view>
+#include <memory>
+#include <unordered_map>
+#include <shared_mutex>
+#include <filesystem>
+#include <expected>
+#include <optional>
+#include <vector>
+
+#include "../sdk/handler.h"
+#include "../sdk/connector.h"
+
+namespace gn {
+
+namespace fs = std::filesystem;
+
+class PluginManager {
+public:
+    struct HandlerInfo {
+        void*       dl_handle = nullptr;
+        handler_t*  handler   = nullptr;
+        fs::path    path;
+        std::string name;
+        bool        enabled   = true;
+
+        HandlerInfo() = default;
+        ~HandlerInfo();  // Реализация в pluginManager_core.cpp
+
+        HandlerInfo(const HandlerInfo&)            = delete;
+        HandlerInfo& operator=(const HandlerInfo&) = delete;
+        HandlerInfo(HandlerInfo&&) noexcept        = default;
+    };
+
+    struct ConnectorInfo {
+        void*            dl_handle = nullptr;
+        connector_ops_t* ops       = nullptr;
+        fs::path         path;
+        std::string      name;    // Заполняется через ops->get_name()
+        std::string      scheme;  // Заполняется через ops->get_scheme()
+        bool             enabled  = true;
+
+        ConnectorInfo() = default;
+        ~ConnectorInfo();
+
+        ConnectorInfo(const ConnectorInfo&)            = delete;
+        ConnectorInfo& operator=(const ConnectorInfo&) = delete;
+        ConnectorInfo(ConnectorInfo&&) noexcept        = default;
+    };
+
+private:
+    host_api_t* host_api_;
+    fs::path    plugins_base_dir_;
+    mutable std::shared_mutex rw_mutex_;
+
+    struct StringHash {
+        using is_transparent = void;
+        size_t operator()(std::string_view sv) const noexcept {
+            return std::hash<std::string_view>{}(sv);
+        }
+    };
+
+    std::unordered_map<std::string, std::unique_ptr<HandlerInfo>,
+                       StringHash, std::equal_to<>> handlers_;
+    std::unordered_map<std::string, std::unique_ptr<ConnectorInfo>,
+                       StringHash, std::equal_to<>> connectors_;
+
+public:
+    explicit PluginManager(host_api_t* api, fs::path plugins_base_dir = "");
+    ~PluginManager();
+
+    // Загрузка
+    std::expected<void, std::string> load_plugin(const fs::path& path);
+    void load_all_plugins();
+
+    // Поиск (shared_lock, zero-copy)
+    std::optional<handler_t*>       find_handler_by_name    (std::string_view name)   const;
+    std::optional<connector_ops_t*> find_connector_by_scheme(std::string_view scheme) const;
+
+    // Статистика
+    size_t get_enabled_handler_count()   const;
+    size_t get_enabled_connector_count() const;
+    void   list_plugins()                const;
+
+    // Управление состоянием (unique_lock)
+    bool unload_handler (std::string_view name);
+    bool enable_handler (std::string_view name);
+    bool disable_handler(std::string_view name);
+    void unload_all();
+};
+
+} // namespace gn
