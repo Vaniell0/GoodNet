@@ -89,6 +89,9 @@ public:
     bool enable_handler (std::string_view name);
     bool disable_handler(std::string_view name);
     void unload_all();
+
+    // Получение списка всех активных обработчиков для роутинга
+    std::vector<handler_t*> get_active_handlers() const;
 };
 
 } // namespace gn

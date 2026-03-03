@@ -2,58 +2,62 @@
 #include <span>
 #include <vector>
 #include <concepts>
-#include <mutex>
+#include <functional>
+#include <boost/asio.hpp>
 #include "../sdk/types.h"
 
 namespace gn {
 
-// Концепт для типобезопасных сигналов
+// Используем shared_ptr для безопасности данных
+using PacketData = std::shared_ptr<std::vector<char>>;
+
 template<typename Func, typename... Args>
 concept SignalHandler = std::invocable<Func, Args...>;
 
-// Базовый класс для сигналов
 template<typename... Args>
 class Signal {
 private:
     mutable std::mutex mutex_;
-    boost::asio::io_context& io_context_;
     boost::asio::strand<boost::asio::io_context::executor_type> strand_;
     std::vector<std::function<void(Args...)>> handlers_;
 
 public:
-    explicit Signal(boost::asio::io_context& io_context);
+    explicit Signal(boost::asio::io_context& ioc)
+        : strand_(boost::asio::make_strand(ioc.get_executor())) {}
     
-    // Подписка на сигнал
     template<typename Func>
     requires SignalHandler<Func, Args...>
-    void connect(Func&& handler);
+    void connect(Func&& h) {
+        std::lock_guard lock(mutex_);
+        handlers_.emplace_back(std::forward<Func>(h));
+    }
     
-    // Асинхронная эмиссия сигнала
-    void emit(Args... args);
+    void emit(Args... args) {
+        std::vector<std::function<void(Args...)>> targets;
+        {
+            std::lock_guard lock(mutex_);
+            targets = handlers_;
+        }
+
+        for (auto& h : targets) {
+            // Захватываем shared_ptr по значению в лямбду, увеличивая ref_count
+            boost::asio::post(strand_, [h, args...]() mutable {
+                try { h(args...); } catch (...) {}
+            });
+        }
+    }
     
-    void disconnect_all();
-    [[nodiscard]] size_t size() const;
+    void clear() {
+        std::lock_guard lock(mutex_);
+        handlers_.clear();
+    }
 };
 
-// Реализация шаблонных методов
-template<typename... Args>
-template<typename Func>
-requires SignalHandler<Func, Args...>
-void Signal<Args...>::connect(Func&& handler) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    handlers_.emplace_back(std::forward<Func>(handler));
-}
-
-// Предопределенные типы сигналов
+// Финальные типы сигналов с shared_ptr
 using PacketSignal = Signal<
-    const header_t*,
-    const endpoint_t*,
-    std::span<const char>
+    std::shared_ptr<header_t>, 
+    const endpoint_t*, 
+    PacketData
 >;
 
-using ConnStateSignal = Signal<
-    const char*,
-    conn_state_t
->;
-
-} // namespace gn
+}

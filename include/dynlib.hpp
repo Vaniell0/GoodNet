@@ -34,21 +34,16 @@ namespace fs = std::filesystem;
 //
 // RAII-обёртка над платформенным загрузчиком разделяемых библиотек.
 //
-//   Linux / macOS : dlopen(RTLD_NOW | RTLD_GLOBAL)  dlsym  dlclose
+//   Linux / macOS : dlopen(RTLD_NOW | RTLD_LOCAL)  dlsym  dlclose
 //   Windows       : LoadLibraryW  GetProcAddress  FreeLibrary
 //
 // Флаги dlopen:
 //   RTLD_NOW    — все неразрешённые символы проверяются немедленно.
 //                 Ошибка при dlopen(), а не при первом вызове функции.
-//   RTLD_GLOBAL — символы плагина экспортируются в глобальное пространство,
-//                 и плагин видит символы уже загруженных библиотек.
-//
-//   Без RTLD_GLOBAL плагин не видит Logger, Config и т.д. из ядра →
-//   первый LOG_* в плагине → SIGSEGV на нулевом Logger::logger_.
-//
-//   Если ядро скомпилировано как STATIC (.a) и слинковано в исполняемый файл,
-//   исполняемый должен быть собран с -rdynamic (ENABLE_EXPORTS в CMake),
-//   чтобы его символы были видны через dl-механизм.
+//   RTLD_LOCAL  — символы плагина видны только внутри него. Плагины изолированы
+//                 друг от друга, нет конфликтов имён символов.
+//                 Logger не нужен через RTLD_GLOBAL: он передаётся явно через
+//                 api->internal_logger (sync_plugin_context в plugin.hpp).
 
 class DynLib {
 public:
@@ -125,6 +120,10 @@ public:
     [[nodiscard]] bool is_open() const noexcept { return handle_ != nullptr; }
     explicit operator bool()    const noexcept  { return is_open(); }
 
+    // close() безопасен благодаря порядку завершения в main():
+    //   manager.unload_all() вызывает shutdown() всех плагинов до dlclose.
+    //   После shutdown() on_shutdown() уже отработал — LOG_* не вызываются.
+    //   Logger::shutdown() вызывается после unload_all() — logger жив до закрытия.
     void close() noexcept {
         if (!handle_) return;
 #if defined(_WIN32)

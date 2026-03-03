@@ -52,4 +52,17 @@ void PluginManager::list_plugins() const {
                  info->path.filename().string());
 }
 
+std::vector<handler_t*> PluginManager::get_active_handlers() const {
+    std::shared_lock lock(rw_mutex_);
+    std::vector<handler_t*> active;
+    active.reserve(handlers_.size());
+    
+    for (const auto& [name, info] : handlers_) {
+        if (info->enabled && info->handler) {
+            active.push_back(info->handler);
+        }
+    }
+    return active;
+}
+
 } // namespace gn

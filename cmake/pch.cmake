@@ -52,6 +52,7 @@ set(GOODNET_PCH_SYSTEM
     # ── fmt / spdlog — самые тяжёлые (много шаблонного кода) ─────
     <fmt/core.h>
     <fmt/format.h>
+    <fmt/chrono.h>
     <spdlog/spdlog.h>
     <spdlog/sinks/rotating_file_sink.h>
     <spdlog/sinks/stdout_color_sinks.h>
@@ -95,6 +96,7 @@ set(GOODNET_PCH_PLUGIN
     <optional>
     <fmt/core.h>
     <fmt/format.h>
+    <fmt/chrono.h>
     <spdlog/spdlog.h>
 )
 

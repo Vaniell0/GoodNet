@@ -46,9 +46,14 @@ std::expected<void, std::string> PluginManager::load_plugin(const fs::path& path
 
     std::unique_lock lock(rw_mutex_);
 
-    // RTLD_GLOBAL: плагин видит символы libgoodnet_core.so / исполняемого файла.
-    // Без этого первый LOG_* в плагине дереференсирует нулевой Logger::logger_ → SIGSEGV.
-    // RTLD_NOW:    неразрешённые символы — ошибка сразу, не при первом вызове.
+    // RTLD_LOCAL:  символы плагина не экспортируются в глобальное пространство —
+    //              плагины изолированы друг от друга, нет конфликтов имён.
+    // RTLD_GLOBAL не нужен: Logger передаётся явно через api->internal_logger
+    //              (sync_plugin_context в plugin.hpp), а не через глобальный spdlog реестр.
+    //              Плагин оборачивает raw pointer в shared_ptr<no-op deleter> и вызывает
+    //              Logger::set_external_logger — после этого все LOG_* работают.
+    // RTLD_NOW:    неразрешённые символы проверяются немедленно при dlopen(), а не
+    //              при первом вызове функции — ошибки линковки видны сразу.
     ::dlerror();
     void* handle = ::dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
     if (!handle) {
@@ -160,8 +165,6 @@ std::expected<void, std::string> PluginManager::load_plugin(const fs::path& path
 
 void PluginManager::unload_all() {
     std::unique_lock lock(rw_mutex_);
-    LOG_INFO("Unloading all plugins ({} handlers, {} connectors)",
-             handlers_.size(), connectors_.size());
     handlers_.clear();
     connectors_.clear();
 }

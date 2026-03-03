@@ -42,7 +42,6 @@ public:
     using Value = std::variant<int, bool, double, std::string, fs::path>;
 
     Config();
-    ~Config();
 
     Config(const Config&)            = delete;
     Config& operator=(const Config&) = delete;

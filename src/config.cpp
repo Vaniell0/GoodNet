@@ -30,10 +30,6 @@ Config::Config() {
     load_from_file(fs::current_path() / "config.json");
 }
 
-Config::~Config() {
-    LOG_INFO("Config destroyed");
-}
-
 void Config::setup_defaults() {
     // Core модуль
     set("core.listen_address", Core::LISTEN_ADDRESS);
