@@ -10,8 +10,10 @@
 #include <optional>
 #include <vector>
 
-#include "../sdk/handler.h"
 #include "../sdk/connector.h"
+#include "../sdk/handler.h"
+#include "../sdk/plugin.h"
+#include "dynlib.hpp"
 
 namespace gn {
 
@@ -20,7 +22,7 @@ namespace fs = std::filesystem;
 class PluginManager {
 public:
     struct HandlerInfo {
-        void*       dl_handle = nullptr;
+        DynLib      lib;
         handler_t*  handler   = nullptr;
         fs::path    path;
         std::string name;
@@ -35,7 +37,7 @@ public:
     };
 
     struct ConnectorInfo {
-        void*            dl_handle = nullptr;
+        DynLib           lib;
         connector_ops_t* ops       = nullptr;
         fs::path         path;
         std::string      name;    // Заполняется через ops->get_name()
@@ -92,6 +94,10 @@ public:
 
     // Получение списка всех активных обработчиков для роутинга
     std::vector<handler_t*> get_active_handlers() const;
+
+    // Хелперы для верификации
+    std::expected<void, std::string> verify_metadata(const fs::path& so_path) const;
+    static std::string calculate_sha256(const fs::path& path);
 };
 
 } // namespace gn

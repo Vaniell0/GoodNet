@@ -41,6 +41,7 @@
               "-DINSTALL_DEVELOPMENT=ON"
               "-DCMAKE_BUILD_TYPE=${buildType}"
               "-DBUILD_TESTING=ON"
+              "-DGOODNET_DISABLE_PCH=ON"
             ] ++ (lib.optionals isDebug [
               "-DCMAKE_CXX_FLAGS=--coverage"
               "-DCMAKE_EXE_LINKER_FLAGS=--coverage"
@@ -49,7 +50,8 @@
             doCheck = true;
             checkPhase = ''
               export HOME=$TMPDIR
-              
+              export TMPDIR=$TMPDIR   # уже установлен Nix sandbox
+
               ${lib.optionalString isDebug ''
                 lcov --directory . --zerocounters
               ''}
@@ -173,11 +175,19 @@
         fullAppDebug = (makeApp {
           core   = goodnet-core-debug;
           bundle = pluginsBundleDebug;
-        }).overrideAttrs (_: {
+        }).overrideAttrs (old: {
           pname    = "goodnet-debug";
           dontStrip = true;
 
-          __impure = true;
+          # Обертка, чтобы gcov не пытался писать по путям сборки
+          nativeBuildInputs = (old.nativeBuildInputs or []) ++ [ pkgs.makeWrapper ];
+          
+          postFixup = ''
+            wrapProgram $out/bin/goodnet \
+              --set GCOV_ERROR_FILE /dev/null \
+              --set GCOV_PREFIX /tmp/goodnet-coverage \
+              --set GCOV_PREFIX_STRIP 10
+          '';
         });
 
       in {

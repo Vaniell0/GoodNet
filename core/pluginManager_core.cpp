@@ -1,32 +1,22 @@
 #include "pluginManager.hpp"
 #include "logger.hpp"
 
-#include "../sdk/handler.h"
-#include "../sdk/connector.h"
-#include "../sdk/plugin.h"
-#include <dlfcn.h>
-#include <fmt/format.h>
-
 namespace gn {
 
 // ─── Деструкторы ─────────────────────────────────────────────────────────────
-// Реализованы здесь: компилятор видит полные определения handler_t / connector_ops_t.
 
 PluginManager::HandlerInfo::~HandlerInfo() {
-    if (!dl_handle) return;
     if (handler && handler->shutdown)
         handler->shutdown(handler->user_data);
-    dlclose(dl_handle);
+    // lib.close() вызовется автоматически деструктором DynLib
 }
 
 PluginManager::ConnectorInfo::~ConnectorInfo() {
-    if (!dl_handle) return;
     if (ops && ops->shutdown)
         ops->shutdown(ops->connector_ctx);
-    dlclose(dl_handle);
 }
 
-// ─── Конструктор / деструктор ─────────────────────────────────────────────────
+// ─── Конструктор ─────────────────────────────────────────────────────────────
 
 PluginManager::PluginManager(host_api_t* api, fs::path plugins_base_dir)
     : host_api_(api), plugins_base_dir_(std::move(plugins_base_dir))
@@ -44,124 +34,84 @@ std::expected<void, std::string> PluginManager::load_plugin(const fs::path& path
     if (!fs::exists(path))
         return std::unexpected(fmt::format("Plugin not found: {}", path.string()));
 
-    std::unique_lock lock(rw_mutex_);
-
-    // RTLD_LOCAL:  символы плагина не экспортируются в глобальное пространство —
-    //              плагины изолированы друг от друга, нет конфликтов имён.
-    // RTLD_GLOBAL не нужен: Logger передаётся явно через api->internal_logger
-    //              (sync_plugin_context в plugin.hpp), а не через глобальный spdlog реестр.
-    //              Плагин оборачивает raw pointer в shared_ptr<no-op deleter> и вызывает
-    //              Logger::set_external_logger — после этого все LOG_* работают.
-    // RTLD_NOW:    неразрешённые символы проверяются немедленно при dlopen(), а не
-    //              при первом вызове функции — ошибки линковки видны сразу.
-    ::dlerror();
-    void* handle = ::dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
-    if (!handle) {
-        const char* e = ::dlerror();
-        return std::unexpected(fmt::format("dlopen failed: {}",
-                                            e ? e : "(unknown)"));
+    if (auto v = verify_metadata(path); !v) {
+        LOG_ERROR("Integrity check failed for '{}': {}", path.filename().string(), v.error());
+        return std::unexpected(v.error());
     }
 
-    // ── Обработчик (Handler) ──────────────────────────────────────────────────
-    //
-    // Сигнатура точки входа (из sdk/cpp/plugin.hpp HANDLER_PLUGIN макроса):
-    //   extern "C" int handler_init(host_api_t* api, handler_t** handler)
-    //
-    // Возвращает 0 при успехе, -1 при ошибке.
-    // api->plugin_type должен быть PLUGIN_TYPE_HANDLER.
+    // 1. Открываем библиотеку (RAII)
+    auto lib_res = DynLib::open(path);
+    if (!lib_res)
+        return std::unexpected(lib_res.error());
 
-    using handler_init_fn = handler_t*(*)(host_api_t*);
-    ::dlerror();
-    auto handler_init_sym = reinterpret_cast<handler_init_fn>(
-        reinterpret_cast<uintptr_t>(::dlsym(handle, "handler_init")));
+    DynLib lib = std::move(*lib_res);
+    std::unique_lock lock(rw_mutex_);
 
-    if (handler_init_sym && !::dlerror()) {
-        host_api_t handler_api = *host_api_;
-        handler_api.plugin_type = PLUGIN_TYPE_HANDLER;
-        handler_api.internal_logger = host_api_->internal_logger;
+    // 2. Пробуем загрузить как Handler
+    using h_init_t = handler_t*(*)(host_api_t*);
+    auto h_sym = lib.symbol<h_init_t>("handler_init");
 
-        handler_t* h = handler_init_sym(&handler_api);
+    if (h_sym) {
+        host_api_t api = *host_api_;
+        api.plugin_type = PLUGIN_TYPE_HANDLER;
         
-        if (!h) {
-            ::dlclose(handle);
-            return std::unexpected("handler_init() returned nullptr");
-        }
+        handler_t* h = (*h_sym)(&api);
+        if (!h) return std::unexpected("handler_init() returned nullptr");
 
-        auto info       = std::make_unique<HandlerInfo>();
-        info->dl_handle = handle;
-        info->handler   = h;
-        info->path      = path;
-        info->name      = path.stem().string();
+        auto info    = std::make_unique<HandlerInfo>();
+        info->lib     = std::move(lib);
+        info->handler = h;
+        info->path    = path;
+        info->name = (h->name && strlen(h->name) > 0) ? h->name : path.stem().string();
 
-        const std::string name = info->name;
-        handlers_[name] = std::move(info);
-        LOG_INFO("Loaded Handler: '{}' [{}]", name, path.filename().string());
+        handlers_[info->name] = std::move(info);
+        LOG_INFO("Loaded Handler: '{}'", path.stem().string());
         return {};
     }
 
-    // ── Коннектор (Connector) ─────────────────────────────────────────────────
-    //
-    // Сигнатура (из sdk/cpp/plugin.hpp CONNECTOR_PLUGIN макроса):
-    //   extern "C" int connector_init(host_api_t* api, connector_ops_t** ops)
+    // 3. Пробуем загрузить как Connector
+    using c_init_t = connector_ops_t*(*)(host_api_t*);
+    auto c_sym = lib.symbol<c_init_t>("connector_init");
 
-    using connector_init_fn = connector_ops_t*(*)(host_api_t*);
-    ::dlerror();
-    auto connector_init_sym = reinterpret_cast<connector_init_fn>(
-        reinterpret_cast<uintptr_t>(::dlsym(handle, "connector_init")));
+    if (c_sym) {
+        host_api_t api = *host_api_;
+        api.plugin_type = PLUGIN_TYPE_CONNECTOR;
 
-    if (connector_init_sym && !::dlerror()) {
-        host_api_t connector_api = *host_api_;
-        connector_api.plugin_type = PLUGIN_TYPE_CONNECTOR;
-        connector_api.internal_logger = host_api_->internal_logger;
+        connector_ops_t* ops = (*c_sym)(&api);
+        if (!ops) return std::unexpected("connector_init() returned nullptr");
 
-        connector_ops_t* ops = connector_init_sym(&connector_api);
-        
-        if (!ops) {
-            ::dlclose(handle);
-            return std::unexpected("connector_init() returned nullptr");
-        }
-
-        // Извлекаем name и scheme через геттеры
-        char buf[256];
-        std::string conn_name, conn_scheme;
+        char buf[256] = {0};
+        std::string c_name, c_scheme;
 
         if (ops->get_name) {
-            buf[0] = '\0';
             ops->get_name(ops->connector_ctx, buf, sizeof(buf));
-            conn_name = buf;
+            c_name = buf;
         }
-        if (conn_name.empty()) conn_name = path.stem().string();
+        if (c_name.empty()) { c_name = path.stem().string(); }
 
         if (ops->get_scheme) {
             buf[0] = '\0';
             ops->get_scheme(ops->connector_ctx, buf, sizeof(buf));
-            conn_scheme = buf;
-        }
-        if (conn_scheme.empty()) {
-            ::dlclose(handle);
-            return std::unexpected(fmt::format(
-                "Connector '{}': get_scheme() returned empty", conn_name));
+            c_scheme = buf;
         }
 
-        auto info        = std::make_unique<ConnectorInfo>();
-        info->dl_handle  = handle;
-        info->ops        = ops;
-        info->path       = path;
-        info->name       = std::move(conn_name);
-        info->scheme     = conn_scheme;
+        if (c_scheme.empty())
+            return std::unexpected(fmt::format("Connector '{}' has no scheme", c_name));
 
-        LOG_INFO("Loaded Connector: '{}' scheme='{}' [{}]",
-         info->name, conn_scheme, path.filename());
-        connectors_[conn_scheme] = std::move(info);
+        auto info    = std::make_unique<ConnectorInfo>();
+        info->lib     = std::move(lib);
+        info->ops     = ops;
+        info->path    = path;
+        info->name    = std::move(c_name);
+        info->scheme  = c_scheme;
+
+        LOG_INFO("Loaded Connector: '{}' [{}]", info->name, info->scheme);
+        connectors_[info->scheme] = std::move(info);
         return {};
     }
 
-    ::dlclose(handle);
-    return std::unexpected(
-        "Plugin exports neither 'handler_init' nor 'connector_init'");
+    return std::unexpected("Plugin has no known entry points");
 }
-
-// ─── unload_all ───────────────────────────────────────────────────────────────
 
 void PluginManager::unload_all() {
     std::unique_lock lock(rw_mutex_);

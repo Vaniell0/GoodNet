@@ -134,10 +134,30 @@ if(BUILD_TESTING)
     enable_testing()
     find_package(GTest REQUIRED)
 
-    add_executable(unit_tests tests/conf.cpp)
+    add_library(mock_handler SHARED tests/mock_handler.cpp)
+    target_link_libraries(mock_handler PRIVATE goodnet_core)
+    
+    add_library(mock_connector SHARED tests/mock_connector.cpp)
+    target_link_libraries(mock_connector PRIVATE goodnet_core)
+
+    add_executable(unit_tests
+        tests/conf.cpp
+        tests/plugins.cpp
+    )
     
     set_target_properties(unit_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
-    target_link_libraries(unit_tests PRIVATE goodnet_core GTest::gmock_main)
     
+    target_compile_definitions(unit_tests PRIVATE 
+        MOCK_HANDLER_PATH="$<TARGET_FILE:mock_handler>"
+        MOCK_CONNECTOR_PATH="$<TARGET_FILE:mock_connector>"
+    )
+
+    target_link_libraries(unit_tests PRIVATE
+        goodnet_core
+        GTest::gmock_main
+        sodium
+    )
+
+    target_include_directories(unit_tests PRIVATE ${CMAKE_SOURCE_DIR})
     add_test(NAME AllTests COMMAND unit_tests)
 endif()

@@ -11,7 +11,7 @@ namespace gn {
 
 // ─── SHA-256 через libsodium (потоковый, 64 KB буфер) ────────────────────────
 
-static std::string calculate_sha256(const fs::path& path) {
+std::string PluginManager::calculate_sha256(const fs::path& path) {
     std::ifstream file(path, std::ios::binary);
     if (!file) return "";
 
@@ -46,7 +46,7 @@ static std::string calculate_sha256(const fs::path& path) {
 //
 // Для ручной dev-сборки используйте: cmake --build build --target gen-manifests
 
-static std::expected<void, std::string> verify_metadata(const fs::path& so_path) {
+std::expected<void, std::string> PluginManager::verify_metadata(const fs::path& so_path) const {
     // Append, не replace_extension
     const fs::path json_path = so_path.string() + ".json";
 
@@ -90,11 +90,6 @@ void PluginManager::load_all_plugins() {
         for (const auto& entry : fs::directory_iterator(dir)) {
             const auto& p = entry.path();
             if (p.extension() != ".so") continue;
-
-            if (auto v = verify_metadata(p); !v) {
-                LOG_ERROR("Skip '{}': {}", p.filename().string(), v.error());
-                continue;
-            }
 
             if (auto r = load_plugin(p); !r)
                 LOG_ERROR("Load failed '{}': {}", p.filename().string(), r.error());
