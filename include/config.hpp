@@ -41,7 +41,7 @@ public:
     // JSON-парсинг загружает пути как std::string — get<fs::path> обрабатывает оба случая.
     using Value = std::variant<int, bool, double, std::string, fs::path>;
 
-    Config();
+    Config(bool defaults = false);
 
     Config(const Config&)            = delete;
     Config& operator=(const Config&) = delete;

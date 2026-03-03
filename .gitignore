@@ -5,6 +5,7 @@
 !flake.lock
 !CMakeLists.txt
 !cmake/
+!tests/
 
 !docs/
 
@@ -18,7 +19,7 @@
 
 !.gitignore
 !README.md
-!VISION.md
+!LISENCE
 
 /plugins/**/libs
 /plugins/**/build

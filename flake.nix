@@ -22,26 +22,71 @@
 
         # ── Функция сборки core ───────────────────────────────────────────────
         makeCore = { buildType ? "Release", extraFlags ? [] }:
+          let
+            isDebug = buildType == "Debug";
+          in
           pkgs.stdenv.mkDerivation {
             pname   = "goodnet-core";
             version = "0.1.0-alpha";
             src     = ./.;
 
-            nativeBuildInputs = coreNative;
-
-            # buildInputs: нужны при сборке ядра.
-            # propagatedBuildInputs: spdlog и fmt PUBLIC в cmake-таргете GoodNet::core.
-            # GoodNetConfig.cmake вызывает find_dependency(spdlog) и find_dependency(fmt).
-            # Плагины не имеют spdlog/fmt в своих buildInputs, но получают их
-            # транзитивно через propagatedBuildInputs goodnet-core.
-            # Nix cmake hook добавляет propagated deps в CMAKE_PREFIX_PATH потребителя.
-            buildInputs            = with pkgs; [ nlohmann_json libsodium boost ];
+            nativeBuildInputs = coreNative ++ [ pkgs.gtest ] ++ (lib.optional isDebug pkgs.lcov);
+            buildInputs = with pkgs; [ nlohmann_json libsodium boost gtest ];
             propagatedBuildInputs  = with pkgs; [ spdlog fmt ];
+
+            # Убираем дефолтный билд-тайп Nix, чтобы наш точно прошел первым
+            forceNoRelease = isDebug; 
 
             cmakeFlags = [
               "-DINSTALL_DEVELOPMENT=ON"
               "-DCMAKE_BUILD_TYPE=${buildType}"
-            ] ++ extraFlags;
+              "-DBUILD_TESTING=ON"
+              "-DGOODNET_DISABLE_PCH=ON"
+            ] ++ (lib.optionals isDebug [
+              "-DCMAKE_CXX_FLAGS=--coverage"
+              "-DCMAKE_EXE_LINKER_FLAGS=--coverage"
+            ]) ++ extraFlags;
+
+            doCheck = true;
+            checkPhase = ''
+              export HOME=$TMPDIR
+              export TMPDIR=$TMPDIR   # уже установлен Nix sandbox
+
+              ${lib.optionalString isDebug ''
+                lcov --directory . --zerocounters
+              ''}
+
+              ./bin/unit_tests --gtest_output="xml:test_results.xml"
+
+              ${lib.optionalString isDebug ''
+                # Собираем данные, игнорируя несоответствия GCC 15
+                lcov --directory . \
+                     --capture \
+                     --output-file coverage.info \
+                     --ignore-errors inconsistent,unused,mismatch \
+                     --rc geninfo_unexecuted_blocks=1
+
+                # Чистим от системного мусора
+                lcov --remove coverage.info '/nix/store/*' '*/tests/*' '*/_deps/*' \
+                     --output-file coverage_cleaned.info \
+                     --ignore-errors inconsistent,unused,mismatch
+
+                # Просто выводим в консоль для информации
+                lcov --list coverage_cleaned.info --ignore-errors inconsistent,unused,mismatch
+              ''}
+            '';
+
+            postInstall = ''
+              mkdir -p $out/share/test-results
+              cp test_results.xml $out/share/test-results/
+              
+              ${lib.optionalString isDebug ''
+                mkdir -p $out/share/coverage
+                genhtml coverage_cleaned.info \
+                        --output-directory $out/share/coverage \
+                        --ignore-errors inconsistent,unused,mismatch
+              ''}
+            '';
           };
 
         goodnet-core       = makeCore {};
@@ -111,6 +156,9 @@
               mkdir -p $out/bin $out/plugins
               cp ${core}/bin/goodnet     $out/bin/goodnet
               cp -r ${bundle}/plugins/*  $out/plugins/
+              if [ -d "${core}/share" ]; then
+                cp -r ${core}/share $out/share
+              fi
               wrapProgram $out/bin/goodnet \
                 --set LD_LIBRARY_PATH "${lib.makeLibraryPath ([ core ] ++ coreBuildInputs)}" \
                 --set GOODNET_PLUGINS_DIR "$out/plugins"
@@ -118,44 +166,28 @@
           };
 
         # ── Release ───────────────────────────────────────────────────────────
-        fullApp = makeApp { core = goodnet-core; bundle = pluginsBundle; };
+        fullApp = makeApp { core = goodnet-core; core-debug = goodnet-core-debug; bundle = pluginsBundle; };
 
         # ── Debug ─────────────────────────────────────────────────────────────
         #
         # nix build .#debug
         #
-        # Что даёт:
-        #   • CMAKE_BUILD_TYPE=Debug → без оптимизаций, с отладочными символами
-        #   • NDEBUG не выставлен → LOG_DEBUG/LOG_TRACE/SCOPED_* активны
-        #   • console sink включён (вывод в stderr при запуске)
-        #   • dontStrip = true → символы не вырезаются → gdb работает полноценно
-        #
-        # Когда пересобирается, а когда нет:
-        #   Nix кеширует деривации по хешу входных данных.
-        #   • Исходники не менялись → nix build .#debug возвращает result за <1с
-        #   • Изменился один .cpp → пересобирается goodnet-core-debug целиком
-        #   • Изменился только плагин → только плагин пересобирается, core кеширован
-        #
-        # Для по-файловой инкрементальной сборки (изменил один .cpp — пересобрал его):
-        #   Используй nix develop + cmake --build build/debug (см. shellHook ниже).
-        #   nix build работает на уровне деривации, не файла — это намеренно.
-        #
-        # После nixos-rebuild switch с impure-derivations в experimental-features
-        # можно раскомментировать __impure = true и использовать персистентный
-        # build cache → поведение идентично cmake --build но через nix build .#debug.
-        #
         fullAppDebug = (makeApp {
           core   = goodnet-core-debug;
           bundle = pluginsBundleDebug;
-        }).overrideAttrs (_: {
+        }).overrideAttrs (old: {
           pname    = "goodnet-debug";
           dontStrip = true;
 
-          # __impure = true;
-          # Раскомментировать ПОСЛЕ: sudo nixos-rebuild switch
-          # (нужно: nix.settings.experimental-features = ["impure-derivations"])
-          # Тогда nix build .#debug будет использовать persistent build cache
-          # и вести себя как make/ninja — пересобирать только изменённые файлы.
+          # Обертка, чтобы gcov не пытался писать по путям сборки
+          nativeBuildInputs = (old.nativeBuildInputs or []) ++ [ pkgs.makeWrapper ];
+          
+          postFixup = ''
+            wrapProgram $out/bin/goodnet \
+              --set GCOV_ERROR_FILE /dev/null \
+              --set GCOV_PREFIX /tmp/goodnet-coverage \
+              --set GCOV_PREFIX_STRIP 10
+          '';
         });
 
       in {
