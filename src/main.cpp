@@ -44,6 +44,7 @@ int main() {
     // ── 5. PluginManager ──────────────────────────────────────────────────────
     gn::PluginManager manager(&api, plugins_path);
     manager.load_all_plugins();
+    manager.list_plugins();
 
     // ── 6. Роутинг через сигнал ───────────────────────────────────────────────
     gn::PacketSignal packet_signal(ioc);
