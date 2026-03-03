@@ -19,7 +19,7 @@
 
 !.gitignore
 !README.md
-!VISION.md
+!LISENCE
 
 /plugins/**/libs
 /plugins/**/build
