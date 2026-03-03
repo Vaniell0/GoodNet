@@ -172,7 +172,9 @@ private:
     #define DEBUG_VALUE_DETAILED(var) ((void)0)
     #define TRACE_POINTER(ptr)        ((void)0)
     #define DEBUG_POINTER(ptr)        ((void)0)
-    #define SCOPED_TRACE()            ((void)0)
+    #ifndef SCOPED_TRACE
+        #define SCOPED_TRACE()        ((void)0)
+    #endif
     #define SCOPED_DEBUG()            ((void)0)
 #else
     #define LOG_TRACE(...) Logger::trace(std::string_view(__FILE__), __LINE__, __VA_ARGS__)
@@ -191,8 +193,10 @@ private:
     #define DEBUG_POINTER(ptr) \
         LOG_DEBUG("{} [{:p} valid:{}]", #ptr, static_cast<const void*>(ptr), (ptr) != nullptr)
 
-    #define SCOPED_TRACE() \
-        ScopedLogger scoped_logger_##__LINE__(__FUNCTION__, std::string_view(__FILE__), __LINE__, "TRACE")
+    #ifndef SCOPED_TRACE
+        #define SCOPED_TRACE() \
+            ScopedLogger scoped_logger_##__LINE__(__FUNCTION__, std::string_view(__FILE__), __LINE__, "TRACE")
+    #endif
     #define SCOPED_DEBUG() \
         ScopedLogger scoped_logger_##__LINE__(__FUNCTION__, std::string_view(__FILE__), __LINE__, "DEBUG")
 #endif

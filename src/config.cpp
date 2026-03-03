@@ -25,9 +25,10 @@ const int Config::Security::KEY_EXCHANGE_TIMEOUT = 30;
 const int Config::Security::MAX_AUTH_ATTEMPTS = 3;
 const int Config::Security::SESSION_TIMEOUT = 3600;
 
-Config::Config() {
+Config::Config(bool defaults) {
     setup_defaults();
-    load_from_file(fs::current_path() / "config.json");
+    if (!defaults)
+    { load_from_file(fs::current_path() / "config.json"); }
 }
 
 void Config::setup_defaults() {

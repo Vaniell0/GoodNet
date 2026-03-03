@@ -27,21 +27,27 @@
             version = "0.1.0-alpha";
             src     = ./.;
 
-            nativeBuildInputs = coreNative;
-
-            # buildInputs: нужны при сборке ядра.
-            # propagatedBuildInputs: spdlog и fmt PUBLIC в cmake-таргете GoodNet::core.
-            # GoodNetConfig.cmake вызывает find_dependency(spdlog) и find_dependency(fmt).
-            # Плагины не имеют spdlog/fmt в своих buildInputs, но получают их
-            # транзитивно через propagatedBuildInputs goodnet-core.
-            # Nix cmake hook добавляет propagated deps в CMAKE_PREFIX_PATH потребителя.
-            buildInputs            = with pkgs; [ nlohmann_json libsodium boost ];
+            nativeBuildInputs = coreNative ++ [ pkgs.gtest ];
+            buildInputs = with pkgs; [ nlohmann_json libsodium boost gtest ];
             propagatedBuildInputs  = with pkgs; [ spdlog fmt ];
 
             cmakeFlags = [
               "-DINSTALL_DEVELOPMENT=ON"
               "-DCMAKE_BUILD_TYPE=${buildType}"
+              "-DBUILD_TESTING=ON"
             ] ++ extraFlags;
+
+            doCheck = true;
+            checkPhase = ''
+              export HOME=$TMPDIR
+              # Запускаем тесты и генерируем XML отчет
+              ./bin/unit_tests --gtest_output="xml:test_results.xml"
+            '';
+
+            postInstall = ''
+              mkdir -p $out/share/test-results
+              cp test_results.xml $out/share/test-results/
+            '';
           };
 
         goodnet-core       = makeCore {};

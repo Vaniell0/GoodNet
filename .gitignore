@@ -5,6 +5,7 @@
 !flake.lock
 !CMakeLists.txt
 !cmake/
+!tests/
 
 !docs/
 

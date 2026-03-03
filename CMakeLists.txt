@@ -8,6 +8,7 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 cmake_policy(SET CMP0167 NEW)
 
 option(INSTALL_DEVELOPMENT "Install SDK headers and cmake config" OFF)
+option(BUILD_TESTING "Build the testing suite" OFF)
 
 # ─── Зависимости ─────────────────────────────────────────────────────────────
 
@@ -128,3 +129,15 @@ endif()
 
 install(TARGETS goodnet      RUNTIME DESTINATION bin)
 install(TARGETS goodnet_core LIBRARY DESTINATION lib)
+
+if(BUILD_TESTING)
+    enable_testing()
+    find_package(GTest REQUIRED)
+
+    add_executable(unit_tests tests/conf.cpp)
+    
+    set_target_properties(unit_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+    target_link_libraries(unit_tests PRIVATE goodnet_core GTest::gmock_main)
+    
+    add_test(NAME AllTests COMMAND unit_tests)
+endif()
