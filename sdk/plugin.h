@@ -5,8 +5,7 @@
 extern "C" {
 #endif
 typedef struct {
-    // Указатели на функции (чистый C, без std::function!)
-    void (*log)(const char* msg);
+    void* internal_logger;
     void (*send)(const char* uri, uint32_t type, const void* data, size_t size);
     handle_t (*create_connection)(const char* uri);
     void (*close_connection)(handle_t handle);
