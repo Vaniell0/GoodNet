@@ -92,8 +92,9 @@ public:
     bool disable_handler(std::string_view name);
     void unload_all();
 
-    // Получение списка всех активных обработчиков для роутинга
+    // Получение списка всех активных плагинов
     std::vector<handler_t*> get_active_handlers() const;
+    std::vector<connector_ops_t*> get_active_connectors() const;
 
     // Хелперы для верификации
     std::expected<void, std::string> verify_metadata(const fs::path& so_path) const;

@@ -58,8 +58,6 @@ typedef struct {
     uint64_t peer_id;
 } endpoint_t;
 
-typedef uint64_t handle_t;
-
 #ifdef __cplusplus
 }
 #endif
