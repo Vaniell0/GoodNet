@@ -147,7 +147,7 @@ if(BUILD_TESTING)
     
     set_target_properties(unit_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
     
-    target_compile_definitions(unit_tests PRIVATE 
+    target_compile_definitions(unit_tests PRIVATE
         MOCK_HANDLER_PATH="$<TARGET_FILE:mock_handler>"
         MOCK_CONNECTOR_PATH="$<TARGET_FILE:mock_connector>"
     )
