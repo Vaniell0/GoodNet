@@ -16,14 +16,16 @@ find_package(Boost         REQUIRED COMPONENTS system filesystem)
 find_package(nlohmann_json REQUIRED)
 find_package(spdlog        REQUIRED)
 find_package(fmt           REQUIRED)
+find_package(GTest QUIET)
 
-# ─── PCH (только в Debug) ─────────────────────────────────────────────────────
-# Ускоряет инкрементальные пересборки в nix develop + cmake --build build/debug
-# В Release не нужен: Nix кеширует деривацию целиком, перкомпиляция единичных
-# файлов не происходит.
+# libsodium — через pkg-config (Nix предоставляет libsodium.pc)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(SODIUM REQUIRED libsodium)
+
+# ─── PCH ─────────────────────────────────────────────────────────────────────
 include(cmake/pch.cmake)
 
-# ─── 1. SDK ───────────────────────────────────────────────────────────────────
+# ─── 1. SDK (INTERFACE) ───────────────────────────────────────────────────────
 
 add_library(goodnet_sdk INTERFACE)
 add_library(GoodNet::sdk ALIAS goodnet_sdk)
@@ -38,9 +40,8 @@ target_include_directories(goodnet_sdk INTERFACE
 
 # ─── 2. Core (SHARED) ────────────────────────────────────────────────────────
 #
-# SHARED обязателен — одна копия всех static переменных (Logger, once_flag).
-# Плагин через dlopen(RTLD_GLOBAL) видит тот же экземпляр Logger что и ядро.
-# STATIC → дублирование static в executable + в плагинах → double init → SIGSEGV.
+# SHARED обязателен: одна копия статических переменных (Logger, once_flag).
+# Плагин через dlopen(RTLD_GLOBAL) видит тот же Logger что и ядро.
 
 add_library(goodnet_core SHARED
     src/config.cpp
@@ -48,6 +49,7 @@ add_library(goodnet_core SHARED
     core/pluginManager_core.cpp
     core/pluginManager_state.cpp
     core/pluginManager_lookup.cpp
+    core/connectionManager.cpp
 )
 
 add_library(GoodNet::core ALIAS goodnet_core)
@@ -55,6 +57,7 @@ set_target_properties(goodnet_core PROPERTIES
     EXPORT_NAME core
     VERSION     0.1.0
     SOVERSION   0
+    ENABLE_EXPORTS ON      # -rdynamic: плагины видят символы ядра
 )
 
 target_link_libraries(goodnet_core PUBLIC goodnet_sdk)
@@ -64,27 +67,20 @@ target_include_directories(goodnet_core
         $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/include>
         $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/core>
         $<INSTALL_INTERFACE:include/goodnet>
+    PRIVATE
+        ${SODIUM_INCLUDE_DIRS}
 )
 
 target_link_libraries(goodnet_core
-    # PUBLIC: spdlog и fmt используются в logger.hpp (публичный заголовок).
-    # Потребители (плагины) не линкуют их напрямую, но cmake экспортирует
-    # их как INTERFACE_LINK_LIBRARIES → find_dependency в GoodNetConfig.cmake.
     PUBLIC  spdlog::spdlog fmt::fmt
-
-    # PRIVATE: используются только в .cpp файлах ядра, не в публичных заголовках.
-    # НЕ попадают в GoodNetTargets.cmake INTERFACE_LINK_LIBRARIES.
-    # Плагинам не нужно их находить при find_package(GoodNet).
-    PRIVATE nlohmann_json::nlohmann_json Boost::system sodium
+    PRIVATE nlohmann_json::nlohmann_json
+            Boost::system
+            ${SODIUM_LIBRARIES}
 )
-set_target_properties(goodnet_core PROPERTIES ENABLE_EXPORTS ON)
-target_compile_definitions(goodnet_core PUBLIC SPDLOG_COMPILED_LIB)
 
-# GOODNET_PROJECT_ROOT: CMake SOURCE_DIR → относительные пути в логах.
-# [src/config.cpp:42] вместо [/nix/store/...-source/src/config.cpp:42]
-# PRIVATE: compile-time константа, не нужна зависимым целям.
-target_compile_definitions(goodnet_core PRIVATE
-    GOODNET_PROJECT_ROOT="${CMAKE_SOURCE_DIR}/"
+target_compile_definitions(goodnet_core
+    PUBLIC  SPDLOG_COMPILED_LIB
+    PRIVATE GOODNET_PROJECT_ROOT="${CMAKE_SOURCE_DIR}/"
 )
 
 apply_pch(goodnet_core)
@@ -130,23 +126,26 @@ endif()
 install(TARGETS goodnet      RUNTIME DESTINATION bin)
 install(TARGETS goodnet_core LIBRARY DESTINATION lib)
 
-if(BUILD_TESTING)
+# ─── 5. Тесты ────────────────────────────────────────────────────────────────
+
+if(BUILD_TESTING AND GTest_FOUND)
     enable_testing()
-    find_package(GTest REQUIRED)
 
     add_library(mock_handler SHARED tests/mock_handler.cpp)
     target_link_libraries(mock_handler PRIVATE goodnet_core)
-    
+
     add_library(mock_connector SHARED tests/mock_connector.cpp)
     target_link_libraries(mock_connector PRIVATE goodnet_core)
 
     add_executable(unit_tests
         tests/conf.cpp
         tests/plugins.cpp
+        tests/connection_manager.cpp
     )
-    
-    set_target_properties(unit_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
-    
+
+    set_target_properties(unit_tests PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+
     target_compile_definitions(unit_tests PRIVATE
         MOCK_HANDLER_PATH="$<TARGET_FILE:mock_handler>"
         MOCK_CONNECTOR_PATH="$<TARGET_FILE:mock_connector>"
@@ -155,9 +154,13 @@ if(BUILD_TESTING)
     target_link_libraries(unit_tests PRIVATE
         goodnet_core
         GTest::gmock_main
-        sodium
+        ${SODIUM_LIBRARIES}
     )
 
-    target_include_directories(unit_tests PRIVATE ${CMAKE_SOURCE_DIR})
+    target_include_directories(unit_tests PRIVATE
+        ${CMAKE_SOURCE_DIR}
+        ${SODIUM_INCLUDE_DIRS}
+    )
+
     add_test(NAME AllTests COMMAND unit_tests)
 endif()

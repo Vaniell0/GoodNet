@@ -2,10 +2,9 @@
 #include <iostream>
 #include <sstream>
 #include <thread>
-#include <atomic>
-#include <cstring>
 #include <vector>
 
+#include "connectionManager.hpp"
 #include "pluginManager.hpp"
 #include "logger.hpp"
 #include "config.hpp"
@@ -13,170 +12,122 @@
 
 namespace fs = std::filesystem;
 
-// ─── Packet helpers ───────────────────────────────────────────────────────────
-
-/// Build a framed packet: header_t + raw text payload.
-static std::vector<char> make_packet(uint32_t type, std::string_view text) {
-    header_t hdr{};
-    hdr.magic        = GNET_MAGIC;
-    hdr.payload_type = type;
-    hdr.payload_len  = static_cast<uint32_t>(text.size());
-
-    std::vector<char> pkt(sizeof(hdr) + text.size());
-    std::memcpy(pkt.data(), &hdr, sizeof(hdr));
-    std::memcpy(pkt.data() + sizeof(hdr), text.data(), text.size());
-    return pkt;
-}
-
-/// Try to decode a GoodNet-framed message from raw bytes.
-/// Returns the text payload if magic matches, empty string otherwise.
-static std::string decode_packet(const void* data, size_t size) {
-    if (size < sizeof(header_t)) return {};
-    const auto* hdr = static_cast<const header_t*>(data);
-    if (hdr->magic != GNET_MAGIC) return {};
-    if (size < sizeof(header_t) + hdr->payload_len) return {};
-    return {static_cast<const char*>(data) + sizeof(header_t), hdr->payload_len};
-}
-
-// ─── main ─────────────────────────────────────────────────────────────────────
-
 int main() {
-    // ── 1. Logger & Config ────────────────────────────────────────────────────
+    // ── 1. Конфигурация ───────────────────────────────────────────────────────
 
-    Logger::log_level         = "info";
-    Logger::source_detail_mode = 3;   // compact: [filename] only
-
-    Config conf{true};
+    Config conf;
     conf.load_from_file("config.json");
 
-    LOG_INFO("Booting GoodNet demo node...");
+    Logger::log_level  = conf.get_or<std::string>("logging.level", "info");
+    Logger::log_file   = conf.get_or<std::string>("logging.file",  "logs/goodnet.log");
+    Logger::max_size   = static_cast<size_t>(
+                           conf.get_or<int>("logging.max_size",  10 * 1024 * 1024));
+    Logger::max_files  = conf.get_or<int>("logging.max_files", 5);
 
-    // ── 2. Active connection handle (CLI thread writes, IO thread reads) ──────
-    //
-    // connection_ops_t* is a non-owning pointer into TcpConnector's storage.
-    // Guarded by atomic_flag for the "connection registered" check only;
-    // actual concurrent use of send/close goes through Boost.Asio which
-    // already serialises via its own strand inside the connector.
+    LOG_INFO("Booting GoodNet...");
 
-    static std::atomic<connection_ops_t*> active_conn{nullptr};
+    // ── 2. Идентификатор узла (SSH-style Ed25519 keypair) ─────────────────────
 
-    // ── 3. Host API ───────────────────────────────────────────────────────────
-    //
-    // api.send is the single data ingress point from connectors to the core.
-    // Both server-side incoming data AND outgoing echo from handlers arrive here.
-
-    host_api_t api{};
-    api.internal_logger = static_cast<void*>(Logger::get().get());
-
-    api.update_connection_state = [](const char* uri, conn_state_t state) {
-        const char* names[] = {
-            "CONNECTING","AUTH_PENDING","KEY_EXCHANGE",
-            "ESTABLISHED","CLOSING","BLOCKED","CLOSED"
-        };
-        const char* name = (state <= STATE_CLOSED) ? names[state] : "UNKNOWN";
-        LOG_INFO("[NET] {} → {}", uri, name);
-    };
-
-    // Server-side incoming data arrives here (wired in tcp.cpp do_accept).
-    // Client-side incoming data is handled via per-connection on_data callback
-    // set after connect (see below) and does NOT go through api.send.
-    api.send = [](const char* /*uri*/, uint32_t /*type*/,
-                              const void* data, size_t size) {
-        // Guard: tcp.cpp do_accept passes raw bytes from remote peer.
-        // If it's a framed GoodNet packet — print it.
-        // If not (e.g. plain text from netcat) — print raw.
-        std::string msg = decode_packet(data, size);
-        if (msg.empty() && size > 0)
-            msg = std::string(static_cast<const char*>(data), size);
-
-        // Print with a fresh prompt so the CLI stays tidy.
-        std::cout << "\n\033[32m[IN]\033[0m " << msg << "\ngoodnet> " << std::flush;
-    };
-
-    // ── 4. Plugin manager ─────────────────────────────────────────────────────
-
-    gn::PluginManager manager(&api, "./result/plugins");
-    manager.load_all_plugins();
-
-    // Locate the TCP connector by scheme.
-    connector_ops_t* tcp = nullptr;
-    {
-        char scheme[32];
-        for (auto* c : manager.get_active_connectors()) {
-            c->get_scheme(c->connector_ctx, scheme, sizeof(scheme));
-            if (std::string_view(scheme) == "tcp") { tcp = c; break; }
-        }
-    }
-    if (!tcp) {
-        LOG_CRITICAL("TCP connector not loaded — check ./result/plugins/connectors/");
-        return 1;
+    fs::path key_dir = conf.get_or<std::string>("identity.dir", "~/.goodnet");
+    if (key_dir.string().starts_with("~/")) {
+        const char* home = std::getenv("HOME");
+        key_dir = fs::path(home ? home : ".") / key_dir.string().substr(2);
     }
 
-    // ── 5. PacketSignal → handlers ────────────────────────────────────────────
-    //
-    // Normally the core routes packets from connectors to handlers via this
-    // signal. For the demo we wire it up so outgoing sends also pass through
-    // the handler chain (e.g. the bundle-logger handler sees every message).
+    auto identity = gn::NodeIdentity::load_or_generate(key_dir);
+
+    // ── 3. IO context + PacketSignal ──────────────────────────────────────────
 
     boost::asio::io_context ioc;
-    auto work = boost::asio::make_work_guard(ioc);
+    auto work_guard = boost::asio::make_work_guard(ioc);
+
     gn::PacketSignal packet_signal(ioc);
 
-    packet_signal.connect(
-        [&manager](std::shared_ptr<header_t> hdr, const endpoint_t* ep,
-                   gn::PacketData payload) {
-            for (auto* h : manager.get_active_handlers()) {
-                bool accept = (h->num_supported_types == 0);
-                for (size_t i = 0; !accept && i < h->num_supported_types; ++i)
-                    accept = (h->supported_types[i] == 0 ||
-                              h->supported_types[i] == hdr->payload_type);
-                if (accept && h->handle_message)
-                    h->handle_message(h->user_data, hdr.get(), ep,
-                                      payload->data(), payload->size());
-            }
-        });
+    // ── 4. ConnectionManager ──────────────────────────────────────────────────
 
-    std::thread io_thread([&ioc] { ioc.run(); });
+    gn::ConnectionManager conn_mgr(packet_signal, std::move(identity));
 
-    // ── 6. CLI ────────────────────────────────────────────────────────────────
+    // ── 5. host_api_t (заполняет ConnectionManager) ──────────────────────────
+
+    static host_api_t api{};
+    api.internal_logger = static_cast<void*>(Logger::get().get());
+    conn_mgr.fill_host_api(&api);
+
+    // ── 6. Плагины ────────────────────────────────────────────────────────────
+
+    fs::path plugins_path = conf.get_or<std::string>("plugins.base_dir", "");
+    if (plugins_path.empty()) {
+        const char* env = std::getenv("GOODNET_PLUGINS_DIR");
+        plugins_path = env ? env : "./result/plugins";
+    }
+
+    gn::PluginManager plugin_mgr(&api, plugins_path);
+    plugin_mgr.load_all_plugins();
+    plugin_mgr.list_plugins();
+
+    // Регистрируем загруженные коннекторы в ConnectionManager
+    // (ConnectionManager шифрует и маршрутизирует через них)
+    for (const auto& scheme : {"tcp", "udp", "ws", "mock"}) {
+        auto opt = plugin_mgr.find_connector_by_scheme(scheme);
+        if (opt) {
+            conn_mgr.register_connector(scheme, *opt);
+            LOG_INFO("Registered connector '{}' in ConnectionManager", scheme);
+        }
+    }
+
+    // ── 7. PacketSignal → активные хендлеры ──────────────────────────────────
+    //
+    // Хендлеры получают уже расшифрованные пакеты от ConnectionManager.
+    // Маршрутизация по payload_type.
+
+    packet_signal.connect([&plugin_mgr](std::shared_ptr<header_t> hdr,
+                                         const endpoint_t* ep,
+                                         gn::PacketData            data) {
+        if (hdr->payload_type == MSG_TYPE_CHAT) {
+            std::string msg(reinterpret_cast<const char*>(data->data()), data->size());
+            std::cout << "\n\033[32m[IN ← " << ep->address << ":" << ep->port << "]\033[0m " 
+                      << msg << "\ngoodnet> " << std::flush;
+        }
+
+        for (handler_t* h : plugin_mgr.get_active_handlers()) {
+            if (!h->handle_message) continue;
+            // ... (далее стандартный код вызова хендлеров)
+            bool accepted = (h->num_supported_types == 0);
+            for (size_t i = 0; !accepted && i < h->num_supported_types; ++i)
+                accepted = (h->supported_types[i] == 0 ||
+                            h->supported_types[i] == hdr->payload_type);
+
+            if (accepted)
+                h->handle_message(h->user_data, hdr.get(), ep, data->data(), data->size());
+        }
+    });
+
+    // ── 8. IO thread pool ─────────────────────────────────────────────────────
+
+    const int thread_count = std::max(2, static_cast<int>(
+                                std::thread::hardware_concurrency()));
+    std::vector<std::thread> pool;
+    pool.reserve(static_cast<size_t>(thread_count));
+    for (int i = 0; i < thread_count; ++i)
+        pool.emplace_back([&ioc] { ioc.run(); });
+
+    LOG_INFO("GoodNet ready. {} IO threads.", thread_count);
+    LOG_INFO("User pubkey: {}", conn_mgr.identity().user_pubkey_hex());
+
+    // ── 9. CLI ────────────────────────────────────────────────────────────────
 
     std::cout << R"(
-╔══════════════════════════════════════════════════════╗
-║              GoodNet  —  Demo Node                   ║
-║                                                      ║
-║  Two-terminal cross-connect demo:                    ║
-║    Terminal A:  listen 11000                         ║
-║    Terminal B:  connect 127.0.0.1 11000              ║
-║    Terminal B:  send Hello from B!                   ║
-║    Terminal A:  send Hello back from A!              ║
-║                                                      ║
-║  Commands:                                           ║
-║    listen  <port>                                    ║
-║    connect <ip> <port>                               ║
-║    send    <message text>                            ║
-║    status                                            ║
-║    exit                                              ║
-╚══════════════════════════════════════════════════════╝
-)";
-
-    // Per-connection callback for CLIENT-side (outgoing) connections.
-    // Stored as a raw struct; lifetime matches active_conn.
-    // One active connection at a time is enough for the demo.
-    connection_callbacks_t client_cbs{};
-    client_cbs.user_data = nullptr;
-    client_cbs.on_data = [](void*, const void* data, size_t size) {
-        std::string msg = decode_packet(data, size);
-        if (msg.empty() && size > 0)
-            msg = std::string(static_cast<const char*>(data), size);
-        std::cout << "\n\033[36m[IN]\033[0m " << msg << "\ngoodnet> " << std::flush;
-    };
-    client_cbs.on_close = [](void*) {
-        std::cout << "\n\033[33m[NET]\033[0m Connection closed\ngoodnet> " << std::flush;
-    };
-    client_cbs.on_error = [](void*, int code) {
-        std::cout << "\n\033[31m[NET]\033[0m Connection error: " << code
-                  << "\ngoodnet> " << std::flush;
-    };
+╔══════════════════════════════════════════════════╗
+║              GoodNet  —  Node CLI                ║
+║                                                  ║
+║  listen  <port>         — принять входящие       ║
+║  connect <ip> <port>    — подключиться           ║
+║  send    <text>         — отправить сообщение    ║
+║  whoami                 — показать pubkey        ║
+║  status                 — список плагинов        ║
+║  exit                   — завершить              ║
+╚══════════════════════════════════════════════════╝
+)" << std::flush;
 
     std::string line;
     while (true) {
@@ -189,20 +140,20 @@ int main() {
         iss >> cmd;
 
         // ── exit ──────────────────────────────────────────────────────────────
-        if (cmd == "exit" || cmd == "quit") {
-            break;
-        }
+        if (cmd == "exit" || cmd == "quit") break;
 
         // ── listen <port> ─────────────────────────────────────────────────────
         else if (cmd == "listen") {
             uint16_t port = 0;
             if (!(iss >> port)) { LOG_ERROR("Usage: listen <port>"); continue; }
 
-            int rc = tcp->listen(tcp->connector_ctx, "0.0.0.0", port);
-            if (rc == 0)
-                LOG_INFO("Listening on 0.0.0.0:{} — waiting for connections", port);
+            auto opt = plugin_mgr.find_connector_by_scheme("tcp");
+            if (!opt) { LOG_ERROR("TCP connector not loaded"); continue; }
+
+            if ((*opt)->listen((*opt)->connector_ctx, "0.0.0.0", port) == 0)
+                LOG_INFO("Listening on 0.0.0.0:{}", port);
             else
-                LOG_ERROR("Failed to listen on port {}", port);
+                LOG_ERROR("listen() failed on port {}", port);
         }
 
         // ── connect <ip> <port> ───────────────────────────────────────────────
@@ -211,77 +162,64 @@ int main() {
             if (!(iss >> ip >> port)) {
                 LOG_ERROR("Usage: connect <ip> <port>"); continue;
             }
+            std::string uri = fmt::format("tcp://{}:{}", ip, port);
 
-            std::string uri = "tcp://" + ip + ":" + std::to_string(port);
-            LOG_INFO("Connecting to {}...", uri);
-
-            connection_ops_t* conn =
-                tcp->connect(tcp->connector_ctx, uri.c_str());
-
-            if (!conn) {
-                LOG_ERROR("Failed to connect to {}", uri);
-                continue;
-            }
-
-            // Register the incoming-data callback.
-            conn->set_callbacks(conn->conn_ctx, &client_cbs);
-            active_conn.store(conn);
-            LOG_INFO("Connected — ready to send. Try: send Hello!");
+            // ConnectionManager: найдёт TCP коннектор по схеме, установит
+            // соединение, получит conn_id через on_connect, запишет в реестр,
+            // отправит AUTH-пакет.
+            conn_mgr.send(uri.c_str(), MSG_TYPE_SYSTEM, nullptr, 0);
+            LOG_INFO("Connection initiated: {}", uri);
         }
 
-        // ── send <text> ───────────────────────────────────────────────────────
+        // ── send <text> ───────────────────────────────────────────
         else if (cmd == "send") {
             std::string text;
-            std::getline(iss >> std::ws, text);
-            if (text.empty()) { LOG_ERROR("Usage: send <text>"); continue; }
-
-            auto* conn = active_conn.load();
-            if (!conn) { LOG_ERROR("No active connection. Use 'connect' first."); continue; }
-
-            // Build framed packet.
-            auto pkt = make_packet(MSG_TYPE_CHAT, text);
-
-            int rc = conn->send(conn->conn_ctx, pkt.data(), pkt.size());
-            if (rc == 0) {
-                LOG_INFO("\033[34m[OUT]\033[0m {}", text);
-
-                // Also push through the local handler chain so bundle-logger
-                // records outgoing messages too.
-                auto hdr_copy = std::make_shared<header_t>();
-                *hdr_copy = *reinterpret_cast<const header_t*>(pkt.data());
-                auto payload = std::make_shared<std::vector<char>>(
-                    pkt.begin() + sizeof(header_t), pkt.end());
-                static endpoint_t local_ep{};
-                std::strncpy(local_ep.address, "127.0.0.1",
-                             sizeof(local_ep.address) - 1);
-                packet_signal.emit(hdr_copy, &local_ep, payload);
-            } else {
-                LOG_ERROR("Send failed");
+            if (!(std::getline(iss >> std::ws, text)) || text.empty()) {
+                LOG_ERROR("Usage: send <message>"); continue;
             }
+            
+            auto uris = conn_mgr.get_active_uris();
+            if (uris.empty()) {
+                LOG_WARN("No active connections."); continue;
+            }
+
+            for (const auto& uri : uris) {
+                conn_mgr.send(uri.c_str(), MSG_TYPE_CHAT, text.data(), text.size());
+            }
+            
+            std::cout << "\033[34m[SENT TO " << uris.size() << " PEERS]\033[0m " << text << "\n";
+        }
+
+        // ── whoami ────────────────────────────────────────────────────────────
+        else if (cmd == "whoami") {
+            std::cout << "User   pubkey: "
+                      << conn_mgr.identity().user_pubkey_hex()   << "\n"
+                      << "Device pubkey: "
+                      << conn_mgr.identity().device_pubkey_hex() << "\n";
         }
 
         // ── status ────────────────────────────────────────────────────────────
         else if (cmd == "status") {
-            manager.list_plugins();
-            auto* conn = active_conn.load();
-            std::cout << "Active connection: "
-                      << (conn ? "YES" : "none") << "\n";
+            plugin_mgr.list_plugins();
+            std::cout << "Active connections: "
+                      << conn_mgr.connection_count() << "\n";
         }
 
         else {
-            LOG_ERROR("Unknown command: '{}'  (try: listen / connect / send / status / exit)", cmd);
+            LOG_ERROR("Unknown command: '{}'. Try: listen / connect / send / whoami / status / exit", cmd);
         }
     }
 
-    // ── 7. Shutdown ───────────────────────────────────────────────────────────
+    // ── 10. Shutdown ──────────────────────────────────────────────────────────
 
     LOG_INFO("Shutting down...");
 
-    work.reset();
+    work_guard.reset();
     ioc.stop();
-    if (io_thread.joinable()) io_thread.join();
+    for (auto& t : pool)
+        if (t.joinable()) t.join();
 
-    manager.unload_all();
+    plugin_mgr.unload_all();
     Logger::shutdown();
     return 0;
 }

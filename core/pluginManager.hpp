@@ -27,6 +27,7 @@ public:
         fs::path    path;
         std::string name;
         bool        enabled   = true;
+        host_api_t api_c;
 
         HandlerInfo() = default;
         ~HandlerInfo();  // Реализация в pluginManager_core.cpp
@@ -40,9 +41,10 @@ public:
         DynLib           lib;
         connector_ops_t* ops       = nullptr;
         fs::path         path;
-        std::string      name;    // Заполняется через ops->get_name()
-        std::string      scheme;  // Заполняется через ops->get_scheme()
+        std::string      name;
+        std::string      scheme;
         bool             enabled  = true;
+        host_api_t api_c;
 
         ConnectorInfo() = default;
         ~ConnectorInfo();

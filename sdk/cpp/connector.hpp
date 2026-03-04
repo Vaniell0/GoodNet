@@ -1,183 +1,111 @@
 #pragma once
 
-#include "connector.h"
+#include "../connector.h"
 
 #include <string>
-#include <memory>
-#include <functional>
 #include <cstring>
 
 namespace gn {
 
-class IConnection {
-protected:
-    connection_ops_t ops_;
-    connection_callbacks_t callbacks_;
-    
-public:
-    IConnection() {
-        callbacks_.on_data = nullptr;
-        callbacks_.on_close = nullptr;
-        callbacks_.on_error = nullptr;
-        callbacks_.user_data = nullptr;
-        
-        ops_.send = nullptr;
-        ops_.close = nullptr;
-        ops_.is_active = nullptr;
-        ops_.get_endpoint = nullptr;
-        ops_.get_uri = nullptr;
-        ops_.set_callbacks = nullptr;
-        ops_.conn_ctx = this;
-    }
-    
-    virtual ~IConnection() = default;
-
-    virtual bool do_send(const void* data, size_t size) = 0;
-    virtual void do_close() = 0;
-
-    virtual bool is_connected() const = 0;
-    
-    virtual endpoint_t get_remote_endpoint() const = 0;
-    
-    virtual std::string get_uri_string() const = 0;
-    
-    void notify_data(const void* data, size_t size) {
-        if (callbacks_.on_data) {
-            callbacks_.on_data(callbacks_.user_data, data, size);
-        }
-    }
-    
-    void notify_close() {
-        if (callbacks_.on_close) {
-            callbacks_.on_close(callbacks_.user_data);
-        }
-    }
-    
-    void notify_error(int error_code) {
-        if (callbacks_.on_error) {
-            callbacks_.on_error(callbacks_.user_data, error_code);
-        }
-    }
-    
-    connection_ops_t* to_c_ops() {
-        ops_.send = [](void* ctx, const void* data, size_t size) -> int {
-            IConnection* self = static_cast<IConnection*>(ctx);
-            return self->do_send(data, size) ? 0 : -1;
-        };
-        
-        ops_.close = [](void* ctx) -> int {
-            IConnection* self = static_cast<IConnection*>(ctx);
-            self->do_close();
-            return 0;
-        };
-        
-        ops_.is_active = [](void* ctx) -> int {
-            IConnection* self = static_cast<IConnection*>(ctx);
-            return self->is_connected() ? 1 : 0;
-        };
-        
-        ops_.get_endpoint = [](void* ctx, endpoint_t* endpoint) {
-            IConnection* self = static_cast<IConnection*>(ctx);
-            *endpoint = self->get_remote_endpoint();
-        };
-        
-        ops_.get_uri = [](void* ctx, char* buffer, size_t size) {
-            IConnection* self = static_cast<IConnection*>(ctx);
-            std::string uri = self->get_uri_string();
-            
-            strncpy(buffer, uri.c_str(), size - 1);
-            buffer[size - 1] = '\0';
-        };
-        
-        ops_.set_callbacks = [](void* ctx, const connection_callbacks_t* cb) {
-            IConnection* self = static_cast<IConnection*>(ctx);
-            if (cb) { self->callbacks_ = *cb; }
-        };
-        
-        return &ops_;
-    }
-};
+// ─── IConnector ──────────────────────────────────────────────────────────────
+//
+// Базовый класс для транспортных плагинов.
+//
+// Плагин наследует IConnector, реализует виртуальные методы,
+// добавляет CONNECTOR_PLUGIN(MyConnectorClass) в конец файла.
+//
+// Важно: коннектор вызывает api_->on_connect() / on_data() / on_disconnect()
+// чтобы уведомлять ядро о событиях соединений.
+// conn_id_t который возвращает on_connect() нужно хранить рядом с сокетом.
 
 class IConnector {
 protected:
-    connector_ops_t ops_;
-    host_api_t* api_ = nullptr;
-    
+    connector_ops_t ops_{};
+    host_api_t*     api_ = nullptr;
+
 public:
     IConnector() {
-        ops_.connect = nullptr;
-        ops_.listen = nullptr;
-        ops_.get_scheme = nullptr;
-        ops_.get_name = nullptr;
-        ops_.shutdown = nullptr;
         ops_.connector_ctx = this;
     }
-    
     virtual ~IConnector() = default;
-    
+
+    // Вызывается из CONNECTOR_PLUGIN макроса
     void init(host_api_t* api) {
         api_ = api;
         on_init();
     }
-    
+
     connector_ops_t* to_c_ops() {
-        ops_.connect = [](void* ctx, const char* uri) -> connection_ops_t* {
-            IConnector* self = static_cast<IConnector*>(ctx);
-            
-            std::unique_ptr<IConnection> connection = self->create_connection(uri);
-            
-            if (connection) {
-                IConnection* raw_ptr = connection.release();
-                return raw_ptr->to_c_ops();
-            }
-            
-            return nullptr;
+        ops_.connect = [](void* ctx, const char* uri) -> int {
+            return static_cast<IConnector*>(ctx)->do_connect(uri);
         };
-        
         ops_.listen = [](void* ctx, const char* host, uint16_t port) -> int {
-            IConnector* self = static_cast<IConnector*>(ctx);
-            return self->start_listening(host, port) ? 0 : -1;
+            return static_cast<IConnector*>(ctx)->do_listen(host, port);
         };
-        
-        ops_.get_scheme = [](void* ctx, char* scheme, size_t size) {
-            IConnector* self = static_cast<IConnector*>(ctx);
-            std::string s = self->get_scheme();
-            strncpy(scheme, s.c_str(), size - 1);
-            scheme[size - 1] = '\0';
+        ops_.send_to = [](void* ctx, conn_id_t id,
+                          const void* data, size_t size) -> int {
+            return static_cast<IConnector*>(ctx)->do_send_to(id, data, size);
         };
-        
-        ops_.get_name = [](void* ctx, char* name, size_t size) {
-            IConnector* self = static_cast<IConnector*>(ctx);
-            std::string n = self->get_name();
-            strncpy(name, n.c_str(), size - 1);
-            name[size - 1] = '\0';
+        ops_.close = [](void* ctx, conn_id_t id) {
+            static_cast<IConnector*>(ctx)->do_close(id);
         };
-        
+        ops_.get_scheme = [](void* ctx, char* buf, size_t sz) {
+            auto s = static_cast<IConnector*>(ctx)->get_scheme();
+            std::strncpy(buf, s.c_str(), sz - 1);
+            buf[sz - 1] = '\0';
+        };
+        ops_.get_name = [](void* ctx, char* buf, size_t sz) {
+            auto n = static_cast<IConnector*>(ctx)->get_name();
+            std::strncpy(buf, n.c_str(), sz - 1);
+            buf[sz - 1] = '\0';
+        };
         ops_.shutdown = [](void* ctx) {
-            IConnector* self = static_cast<IConnector*>(ctx);
-            self->on_shutdown();
+            static_cast<IConnector*>(ctx)->on_shutdown();
         };
-        
         return &ops_;
     }
-    
-    virtual void on_init() {}
+
+    // ── Для наследника ─────────────────────────────────────────────────────────
+
+    virtual void on_init()     {}
     virtual void on_shutdown() {}
-    
-    virtual std::unique_ptr<IConnection> create_connection(const std::string& uri) = 0;
-    
-    virtual bool start_listening(const std::string& host, uint16_t port) = 0;
-    
+
+    // Схема URI: "tcp", "mock", …
     virtual std::string get_scheme() const = 0;
-    
-    virtual std::string get_name() const = 0;
-    
+    virtual std::string get_name()   const = 0;
+
+    // Инициировать подключение к uri. Результат — через api_->on_connect().
+    virtual int  do_connect(const char* uri)                        = 0;
+
+    // Начать слушать. Входящие → api_->on_connect().
+    virtual int  do_listen(const char* host, uint16_t port)         = 0;
+
+    // Отправить bytes в соединение conn_id.
+    virtual int  do_send_to(conn_id_t id,
+                             const void* data, size_t size)          = 0;
+
+    // Закрыть соединение conn_id. Плагин вызовет api_->on_disconnect().
+    virtual void do_close(conn_id_t id)                              = 0;
+
 protected:
-    void send(const char* uri, uint32_t type, const void* data, size_t size) {
-        if (api_ && api_->send) {
-            api_->send(uri, type, data, size);
-        }
+    // Сообщить ядру о новом соединении → получить conn_id
+    conn_id_t notify_connect(const endpoint_t* ep) {
+        if (api_ && api_->on_connect)
+            return api_->on_connect(api_->ctx, ep);
+        return CONN_ID_INVALID;
+    }
+
+    // Передать ядру сырые байты
+    void notify_data(conn_id_t id, const void* data, size_t size) {
+        if (api_ && api_->on_data)
+            api_->on_data(api_->ctx, id, data, size);
+    }
+
+    // Сообщить ядру об отключении
+    void notify_disconnect(conn_id_t id, int error = 0) {
+        if (api_ && api_->on_disconnect)
+            api_->on_disconnect(api_->ctx, id, error);
     }
 };
 
-}  /* namespace gn */
+} // namespace gn

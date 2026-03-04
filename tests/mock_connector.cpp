@@ -1,43 +1,41 @@
-#include <connector.hpp>
-#include <plugin.hpp>
+// Мок-коннектор для unit-тестов PluginManager.
+// Схема: "mock". Имя: "MockConnector".
+// Компилируется как libmock_connector.so.
+// Экспортирует connector_init() через GN_EXPORT (CONNECTOR_PLUGIN макрос).
+//
+// do_send_to(), do_connect() и do_listen() — заглушки (no-op).
+// Используется только для тестирования загрузки и поиска коннектора по схеме.
+
+#include <connector.hpp>  // sdk/cpp/connector.hpp → IConnector
+#include <plugin.hpp>     // sdk/cpp/plugin.hpp    → CONNECTOR_PLUGIN
+
 #include <cstring>
 
-/**
- * @brief Minimal connection that always succeeds.
- */
-class MockConnection : public gn::IConnection {
-public:
-    bool        do_send(const void*, size_t) override { return true; }
-    void        do_close()                  override { notify_close(); }
-    bool        is_connected() const        override { return true; }
-    std::string get_uri_string() const      override { return "mock://test"; }
-
-    endpoint_t get_remote_endpoint() const override {
-        endpoint_t ep{};
-        std::strncpy(ep.address, "127.0.0.1", sizeof(ep.address) - 1);
-        ep.port = 0;
-        return ep;
-    }
-};
-
-/**
- * @brief Minimal connector for unit tests.
- *
- * Scheme: "mock". Name: "MockDevice".
- */
 class MockConnector : public gn::IConnector {
 public:
     std::string get_scheme() const override { return "mock"; }
-    std::string get_name()   const override { return "MockDevice"; }
+    std::string get_name()   const override { return "MockConnector"; }
 
-    std::unique_ptr<gn::IConnection>
-    create_connection(const std::string&) override {
-        return std::make_unique<MockConnection>();
+    // Подключение: в тестах не используется реальная сеть
+    int do_connect(const char* /*uri*/) override {
+        return -1;  // не поддерживается в моке
     }
 
-    bool start_listening(const std::string&, uint16_t) override {
-        return true;
+    // Listen: не нужен для тестов PM
+    int do_listen(const char* /*host*/, uint16_t /*port*/) override {
+        return 0;
     }
+
+    // send_to: молча отбрасываем
+    int do_send_to(conn_id_t /*id*/,
+                   const void* /*data*/, size_t /*size*/) override {
+        return 0;
+    }
+
+    // close: no-op
+    void do_close(conn_id_t /*id*/) override {}
+
+    void on_shutdown() override {}
 };
 
 CONNECTOR_PLUGIN(MockConnector)
