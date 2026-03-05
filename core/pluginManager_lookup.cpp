@@ -2,6 +2,7 @@
 #include "logger.hpp"
 #include <ranges>
 #include <algorithm>
+#include <optional>
 
 namespace gn {
 

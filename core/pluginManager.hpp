@@ -1,13 +1,9 @@
 #pragma once
 
-#include <string>
 #include <string_view>
-#include <memory>
 #include <unordered_map>
 #include <shared_mutex>
-#include <filesystem>
 #include <expected>
-#include <optional>
 #include <vector>
 
 #include "../sdk/connector.h"

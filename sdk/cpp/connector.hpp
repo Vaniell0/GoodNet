@@ -4,8 +4,31 @@
 
 #include <string>
 #include <cstring>
+#include <span>
 
 namespace gn {
+
+namespace sdk {
+    class IConnection {
+    public:
+        virtual ~IConnection() = default;
+
+        // Вызывается при установке соединения
+        virtual void on_connect(const endpoint_t* remote) = 0;
+
+        // Новые данные пришли (сырые байты)
+        virtual void on_data(std::span<const uint8_t> data) = 0;
+
+        // Соединение закрыто
+        virtual void on_disconnect(int error_code) = 0;
+
+        // Отправить данные (реализация коннектора сама решает как)
+        virtual void send(std::span<const uint8_t> data) = 0;
+
+        // Опционально: имя схемы (tcp, ws, bluetooth...)
+        virtual std::string scheme() const = 0;
+    };
+}
 
 // ─── IConnector ──────────────────────────────────────────────────────────────
 //

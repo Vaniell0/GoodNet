@@ -8,7 +8,7 @@
 #include <fmt/ranges.h>
 #include <nlohmann/json.hpp>
 
-#include "core/pluginManager.hpp"
+#include "pluginManager.hpp"
 #include "sdk/types.h"
 #include "sdk/plugin.h"
 

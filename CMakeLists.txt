@@ -18,7 +18,6 @@ find_package(spdlog        REQUIRED)
 find_package(fmt           REQUIRED)
 find_package(GTest QUIET)
 
-# libsodium — через pkg-config (Nix предоставляет libsodium.pc)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(SODIUM REQUIRED libsodium)
 
@@ -49,7 +48,11 @@ add_library(goodnet_core SHARED
     core/pluginManager_core.cpp
     core/pluginManager_state.cpp
     core/pluginManager_lookup.cpp
-    core/connectionManager.cpp
+    core/cm_send.cpp
+    core/cm_session.cpp
+    core/cm_identity.cpp
+    core/cm_dispatch.cpp
+    core/cm_handshake.cpp
 )
 
 add_library(GoodNet::core ALIAS goodnet_core)
