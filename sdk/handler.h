@@ -5,44 +5,57 @@
 extern "C" {
 #endif
 
-/**
- * @brief Handler plugin descriptor.
- *
- * Returned by handler_init() and stored by PluginManager.
- * All function pointers except handle_message are optional (may be null).
- *
- * Lifetime: owned by the plugin's static instance. PluginManager holds a
- * non-owning pointer; it must not call free() on this struct.
- */
+// ─── handler_t ────────────────────────────────────────────────────────────────
+//
+// C-структура, которую плагин-хендлер передаёт ядру через handler_init().
+// Ядро хранит указатель на эту структуру — плагин владеет временем жизни.
+//
+// Типичный паттерн: статическая переменная внутри handler_init() (Meyers singleton).
+
 typedef struct {
-    /**
-     * Human-readable name used for lookup via find_handler_by_name().
-     * Optional: if NULL, PluginManager falls back to the .so stem.
-     */
+    // ── Идентификация ─────────────────────────────────────────────────────────
+
+    // Имя хендлера — ключ для find_handler_by_name().
+    // Должно быть уникальным среди загруженных плагинов.
+    // Указывает на статическую строку внутри плагина (не копируется).
     const char* name;
 
-    /**
-     * Called for each incoming packet whose payload_type is in supported_types
-     * (or for every packet if num_supported_types == 0). Required.
-     */
-    void (*handle_message)(void* user_data, const header_t* header,
-                           const endpoint_t* endpoint, const void* payload,
-                           size_t payload_size);
+    // ── Коллбэки ──────────────────────────────────────────────────────────────
 
-    /** Called when a connection changes state. Optional. */
-    void (*handle_conn_state)(void* user_data, const char* uri,
-                              conn_state_t state);
+    // Вызывается когда ConnectionManager получил полный пакет из ESTABLISHED соединения.
+    // payload уже расшифрован (TODO после реализации шифрования).
+    void (*handle_message)(void*              user_data,
+                           const header_t*    header,
+                           const endpoint_t*  endpoint,
+                           const void*        payload,
+                           size_t             payload_size);
 
-    /** Called by PluginManager before dlclose(). Optional. */
+    // Вызывается когда состояние соединения изменилось.
+    // uri — идентификатор соединения ("ip:port" или "gn://pubkey").
+    void (*handle_conn_state)(void*         user_data,
+                              const char*   uri,
+                              conn_state_t  state);
+
+    // Вызывается ядром перед dlclose() плагина.
+    // Должен освободить все ресурсы хендлера.
     void (*shutdown)(void* user_data);
 
-    /** Array of accepted payload_type values. NULL / 0 = accept all. */
-    uint32_t* supported_types;
-    size_t    num_supported_types;
+    // ── Фильтрация по типам сообщений ─────────────────────────────────────────
 
-    /** Passed as first argument to every callback. Typically `this`. */
-    void* user_data;
+    // Массив MSG_TYPE_* которые интересуют этот хендлер.
+    // PluginManager / ConnectionManager не доставляют пакеты с другими типами.
+    // Ядро не освобождает этот массив — он принадлежит плагину.
+    const uint32_t* supported_types;
+    size_t          num_supported_types;
+
+    // ── Пользовательские данные ───────────────────────────────────────────────
+
+    void* user_data;  // обычно this (указатель на C++ объект хендлера)
+
 } handler_t;
+
+// Сигнатура функции инициализации (HANDLER_PLUGIN генерирует её автоматически)
+typedef int (*handler_init_t)(host_api_t* api, handler_t** out_handler);
 
 #ifdef __cplusplus
 }

@@ -48,10 +48,17 @@ private:
     void open_new_bundle() {
         if (out_file_.is_open()) out_file_.close();
         
-        std::string filename = fmt::format("./msgs/bundle_{}.bin", std::time(nullptr));
-        out_file_.open(filename, std::ios::binary | std::ios::out);
+        // Используем микросекунды для действительно уникальных имен
+        auto now = std::chrono::high_resolution_clock::now();
+        auto us = std::chrono::duration_cast<std::chrono::microseconds>(now.time_since_epoch()).count();
+        
+        std::string filename = fmt::format("./msgs/bundle_{}.bin", us);
+        
+        // ios::app гарантирует, что мы пишем в конец и не затираем данные
+        out_file_.open(filename, std::ios::binary | std::ios::out | std::ios::app);
         current_size_ = 0;
-        LOG_DEBUG("Opened new bundle file: {}", filename);
+        
+        LOG_INFO("Opened new bundle file: {}", filename);
     }
 
     std::ofstream out_file_;

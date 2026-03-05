@@ -234,7 +234,7 @@ Every plugin built through the Nix pipeline is accompanied by a JSON manifest (`
 }
 ```
 
-`PluginManager::load_all_plugins()` verifies the SHA-256 of each `.so` against its manifest before calling `dlopen`. A plugin with a missing or mismatched manifest is skipped with an error log. For development builds, manifests can be generated locally using the `gen-manifests` CMake target.
+`PluginManager::load_all_plugins()` verifies the SHA-256 of each `.so` against its manifest before calling `dlopen`. A plugin with a missing or mismatched manifest is skipped with an error log.
 
 ---
 

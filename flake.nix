@@ -166,7 +166,7 @@
           };
 
         # ── Release ───────────────────────────────────────────────────────────
-        fullApp = makeApp { core = goodnet-core; core-debug = goodnet-core-debug; bundle = pluginsBundle; };
+        fullApp = makeApp { core = goodnet-core; bundle = pluginsBundle; };
 
         # ── Debug ─────────────────────────────────────────────────────────────
         #

@@ -1,24 +1,32 @@
-#include <handler.hpp>
-#include <plugin.hpp>
+// Мок-хендлер для unit-тестов PluginManager и ConnectionManager.
+// Компилируется как libmock_handler.so.
+// Экспортирует handler_init() через GN_EXPORT (HANDLER_PLUGIN макрос).
 
-/**
- * @brief Minimal handler used in unit tests.
- *
- * Subscribes to message types 1, 2, 3.
- * On type 1: echoes the payload back via send().
- */
+#include <handler.hpp>   // sdk/cpp/handler.hpp → IHandler
+#include <plugin.hpp>    // sdk/cpp/plugin.hpp  → HANDLER_PLUGIN
+
 class MockHandler : public gn::IHandler {
 public:
-    const char* get_plugin_name() const override { return "mock_handler"; }
-
-    void on_init() override {
-        set_supported_types({1, 2, 3});
+    const char* get_plugin_name() const override {
+        return "mock_handler";
     }
 
-    void handle_message(const header_t* header, const endpoint_t*,
-                        const void* payload, size_t size) override {
-        if (header->payload_type == 1)
-            send("test://uri", 1, payload, size);
+    void on_init() override {
+        // Подписываемся на несколько типов чтобы тесты могли проверять фильтрацию
+        set_supported_types({MSG_TYPE_SYSTEM, MSG_TYPE_CHAT, MSG_TYPE_FILE});
+    }
+
+    void handle_message(const header_t*   header,
+                         const endpoint_t* /*ep*/,
+                         const void*       /*payload*/,
+                         size_t            size) override {
+        // В тестах достаточно не падать. Реальная логика не нужна.
+        (void)header;
+        (void)size;
+    }
+
+    void on_shutdown() override {
+        // Cleanup — ничего не надо для мока
     }
 };
 

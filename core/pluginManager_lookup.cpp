@@ -2,6 +2,7 @@
 #include "logger.hpp"
 #include <ranges>
 #include <algorithm>
+#include <optional>
 
 namespace gn {
 
@@ -60,6 +61,19 @@ std::vector<handler_t*> PluginManager::get_active_handlers() const {
     for (const auto& [name, info] : handlers_) {
         if (info->enabled && info->handler) {
             active.push_back(info->handler);
+        }
+    }
+    return active;
+}
+
+std::vector<connector_ops_t*> PluginManager::get_active_connectors() const {
+    std::shared_lock lock(rw_mutex_);
+    std::vector<connector_ops_t*> active;
+    active.reserve(connectors_.size());
+    
+    for (const auto& [name, info] : connectors_) {
+        if (info->enabled && info->ops) {
+            active.push_back(info->ops);
         }
     }
     return active;

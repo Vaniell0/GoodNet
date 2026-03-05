@@ -1,193 +1,303 @@
 #include <boost/asio.hpp>
-#include <iostream>
-#include <thread>
+#include <atomic>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <string>
+#include <thread>
+#include <unordered_map>
+#include <vector>
 
 #include <connector.hpp>
 #include <plugin.hpp>
+#include <logger.hpp>
 
 using boost::asio::ip::tcp;
+namespace asio = boost::asio;
 
-using namespace gn;
+namespace gn {
 
-class TcpConnection : public IConnection, public std::enable_shared_from_this<TcpConnection> {
-private:
-    tcp::socket socket_;
-    endpoint_t remote_ep_;
-    std::string uri_;
-    char read_buffer_[8192];
+/**
+ * @brief Структура владения TCP соединением.
+ * * ВАЖНО: Все операции с socket (async_read/write) должны происходить 
+ * ТОЛЬКО в потоке io_context.
+ */
+struct TcpConnection {
+    tcp::socket socket;
+    conn_id_t   id;
+    endpoint_t  remote;
+    uint8_t     read_buf[65536];
 
-public:
-    TcpConnection(tcp::socket socket) 
-        : socket_(std::move(socket)) {
-        
-        try {
-            auto ep = socket_.remote_endpoint();
-            strncpy(remote_ep_.address, ep.address().to_string().c_str(), sizeof(remote_ep_.address) - 1);
-            remote_ep_.port = ep.port();
-            uri_ = "tcp://" + std::string(remote_ep_.address) + ":" + std::to_string(remote_ep_.port);
-        } catch (...) {
-            uri_ = "tcp://unknown";
-        }
-    }
-
-    // Запуск цикла чтения
-    void start() {
-        do_read();
-    }
-
-    bool do_send(const void* data, size_t size) override {
-        if (!socket_.is_open()) return false;
-        try {
-            // Синхронная отправка для простоты, либо можно сделать async_write
-            boost::asio::write(socket_, boost::asio::buffer(data, size));
-            return true;
-        } catch (const boost::system::system_error& e) {
-            notify_error(e.code().value());
-            return false;
-        }
-    }
-
-    void do_close() override {
-        boost::system::error_code ec;
-        socket_.shutdown(tcp::socket::shutdown_both, ec);
-        socket_.close(ec);
-        notify_close();
-    }
-
-    bool is_connected() const override {
-        return socket_.is_open();
-    }
-
-    endpoint_t get_remote_endpoint() const override {
-        return remote_ep_;
-    }
-
-    std::string get_uri_string() const override {
-        return uri_;
-    }
-
-private:
-    void do_read() {
-        auto self = shared_from_this();
-        socket_.async_read_some(boost::asio::buffer(read_buffer_),
-            [this, self](boost::system::error_code ec, std::size_t length) {
-                if (!ec) {
-                    notify_data(read_buffer_, length);
-                    do_read(); // Продолжаем чтение
-                } else {
-                    if (ec != boost::asio::error::operation_aborted) {
-                        notify_error(ec.value());
-                        do_close();
-                    }
-                }
-            });
-    }
+    TcpConnection(tcp::socket s, conn_id_t cid, const endpoint_t& ep)
+        : socket(std::move(s)), id(cid), remote(ep) {}
+    
+    // Запрещаем копирование
+    TcpConnection(const TcpConnection&) = delete;
+    TcpConnection& operator=(const TcpConnection&) = delete;
 };
 
+/**
+ * @brief TcpConnector — Транспортный плагин на базе Boost.Asio.
+ */
 class TcpConnector : public IConnector {
-private:
-    boost::asio::io_context io_context_;
-    std::unique_ptr<tcp::acceptor> acceptor_;
-    std::thread io_thread_;
-    std::vector<std::shared_ptr<TcpConnection>> active_connections_; // Для контроля жизненного цикла
-
 public:
     TcpConnector() = default;
+    virtual ~TcpConnector() = default;
 
-    ~TcpConnector() override {
-        on_shutdown();
-    }
-
+    // Идентификация плагина
     std::string get_scheme() const override { return "tcp"; }
-    std::string get_name() const override { return "Boost Asio TCP Connector"; }
+    std::string get_name()   const override { return "GoodNet Boost.Asio TCP"; }
+
+    // ─── Жизненный цикл ──────────────────────────────────────────────────────
 
     void on_init() override {
-        // Запускаем io_context в отдельном потоке
-        io_thread_ = std::thread([this]() {
-            auto work = boost::asio::make_work_guard(io_context_);
-            io_context_.run();
+        // Создаем guard, чтобы io_.run() не завершался при отсутствии задач
+        work_.emplace(asio::make_work_guard(io_));
+        
+        // Запускаем выделенный поток для сетевых операций
+        io_thread_ = std::thread([this] { 
+            LOG_DEBUG("[TCP] io_thread started");
+            io_.run(); 
         });
+        
+        LOG_INFO("[TCP] connector ready");
     }
 
     void on_shutdown() override {
-        io_context_.stop();
+        LOG_INFO("[TCP] shutting down...");
+
+        // Корректно закрываем всё внутри io_thread
+        asio::post(io_, [this] {
+            if (acceptor_ && acceptor_->is_open()) {
+                boost::system::error_code ec;
+                acceptor_->close(ec);
+            }
+
+            std::lock_guard lock(conn_mu_);
+            for (auto& [id, conn] : connections_) {
+                boost::system::error_code ec;
+                conn->socket.close(ec);
+            }
+            connections_.clear();
+        });
+
+        // Останавливаем цикл событий
+        work_.reset();
+        io_.stop();
+
         if (io_thread_.joinable()) {
             io_thread_.join();
         }
-        if (acceptor_) {
-            acceptor_->close();
-        }
+        LOG_INFO("[TCP] shutdown complete");
     }
 
-    std::unique_ptr<IConnection> create_connection(const std::string& uri) override {
-        try {
-            // Парсинг простого формата "host:port" или "tcp://host:port"
-            std::string target = uri;
-            if (target.find("://") != std::string::npos) {
-                target = target.substr(target.find("://") + 3);
+    // ─── Сетевые операции (Thread-Safe) ──────────────────────────────────────
+
+    /**
+     * @brief Исходящее подключение.
+     * Вызывается из CLI/Ядра. Постит задачу в IO поток.
+     */
+    int do_connect(const char* uri_cstr) override {
+        std::string target(uri_cstr);
+        
+        // Парсим URI (упрощенно)
+        if (const auto p = target.find("://"); p != std::string::npos)
+            target = target.substr(p + 3);
+
+        const auto colon = target.rfind(':');
+        if (colon == std::string::npos) {
+            LOG_ERROR("[TCP] Invalid URI format: {}", uri_cstr);
+            return -1;
+        }
+
+        std::string host = target.substr(0, colon);
+        std::string port = target.substr(colon + 1);
+
+        LOG_DEBUG("[TCP] Queuing async connect to {}:{}", host, port);
+
+        // Передаем управление в io_thread
+        asio::post(io_, [this, h = std::move(host), p = std::move(port)]() mutable {
+            auto resolver = std::make_shared<tcp::resolver>(io_);
+            
+            resolver->async_resolve(h, p,
+                [this, resolver, h, p](auto ec, tcp::resolver::results_type eps) {
+                    if (ec) {
+                        LOG_ERROR("[TCP] Resolve failed for {}:{}: {}", h, p, ec.message());
+                        return;
+                    }
+
+                    auto sock = std::make_shared<tcp::socket>(io_);
+                    asio::async_connect(*sock, eps,
+                        [this, sock, h, p](auto ec2, const tcp::endpoint& /*ep*/) {
+                            if (ec2) {
+                                LOG_ERROR("[TCP] Connect failed to {}:{}: {}", h, p, ec2.message());
+                                return;
+                            }
+                            LOG_INFO("[TCP] Connected to {}:{}", h, p);
+                            register_socket(std::move(*sock));
+                        });
+                });
+        });
+
+        return 0; // Возвращаем успех запроса (само подключение идет в фоне)
+    }
+
+    /**
+     * @brief Ожидание входящих соединений.
+     */
+    int do_listen(const char* host_str, uint16_t port) override {
+        std::string host(host_str);
+        auto result_promise = std::make_shared<std::promise<int>>();
+        auto result_future = result_promise->get_future();
+
+        asio::post(io_, [this, host, port, result_promise]() mutable {
+            try {
+                tcp::endpoint ep(asio::ip::make_address(host), port);
+                acceptor_ = std::make_unique<tcp::acceptor>(io_);
+                
+                acceptor_->open(ep.protocol());
+                // Исправляет "Address already in use" при рестартах
+                acceptor_->set_option(tcp::acceptor::reuse_address(true));
+                
+                acceptor_->bind(ep);
+                acceptor_->listen();
+
+                LOG_INFO("[TCP] Server listening on {}:{}", host, port);
+                accept_next();
+                result_promise->set_value(0);
+            } catch (const std::exception& e) {
+                LOG_ERROR("[TCP] Listen failed on {}:{}: {}", host, port, e.what());
+                result_promise->set_value(-1);
+            }
+        });
+
+        return result_future.get(); // Синхронно ждем только результата бинда
+    }
+
+    /**
+     * @brief Отправка данных.
+     * Вызывается из любого потока. Гарантирует thread-safety через post.
+     */
+    int do_send_to(conn_id_t id, const void* data, size_t size) override {
+        // Копируем данные в buffer для асинхронной передачи
+        auto buf = std::make_shared<std::vector<uint8_t>>(
+            static_cast<const uint8_t*>(data),
+            static_cast<const uint8_t*>(data) + size);
+
+        asio::post(io_, [this, id, buf]() {
+            std::shared_ptr<TcpConnection> conn;
+            {
+                std::lock_guard lock(conn_mu_);
+                auto it = connections_.find(id);
+                if (it == connections_.end()) return;
+                conn = it->second;
             }
 
-            size_t colon_pos = target.find(':');
-            if (colon_pos == std::string::npos) return nullptr;
-
-            std::string host = target.substr(0, colon_pos);
-            std::string port = target.substr(colon_pos + 1);
-
-            tcp::resolver resolver(io_context_);
-            auto endpoints = resolver.resolve(host, port);
-
-            tcp::socket socket(io_context_);
-            boost::asio::connect(socket, endpoints);
-
-            auto conn = std::make_shared<TcpConnection>(std::move(socket));
-            conn->start();
-            
-            // Возвращаем raw ptr через unique_ptr (как требует SDK)
-            // Но используем shared_ptr внутри для асинхронных операций
-            return std::unique_ptr<IConnection>(conn.get()); 
-            // Внимание: В реальной системе нужно продумать владение, 
-            // чтобы shared_ptr не удалился раньше времени.
-        } catch (const std::exception& e) {
-            std::cerr << "[TCP] Connect error: " << e.what() << std::endl;
-            return nullptr;
-        }
+            asio::async_write(conn->socket, asio::buffer(*buf),
+                [id, buf](auto ec, std::size_t n) {
+                    if (ec && ec != asio::error::operation_aborted) {
+                        LOG_WARN("[TCP] Send error on id={}: {}", id, ec.message());
+                    } else if (!ec) {
+                        LOG_TRACE("[TCP] Sent {} bytes to id={}", n, id);
+                    }
+                });
+        });
+        return 0;
     }
 
-    bool start_listening(const std::string& host, uint16_t port) override {
-        try {
-            tcp::endpoint endpoint(boost::asio::ip::make_address(host), port);
-            acceptor_ = std::make_unique<tcp::acceptor>(io_context_, endpoint);
-            
-            do_accept();
-            return true;
-        } catch (const std::exception& e) {
-            std::cerr << "[TCP] Listen error: " << e.what() << std::endl;
-            return false;
-        }
+    void do_close(conn_id_t id) override {
+        asio::post(io_, [this, id]() {
+            std::lock_guard lock(conn_mu_);
+            if (auto it = connections_.find(id); it != connections_.end()) {
+                boost::system::error_code ec;
+                it->second->socket.close(ec);
+                connections_.erase(it);
+                LOG_DEBUG("[TCP] Connection id={} closed manually", id);
+            }
+        });
     }
 
 private:
-    void do_accept() {
-        acceptor_->async_accept([this](boost::system::error_code ec, tcp::socket socket) {
-            if (!ec) {
-                auto conn = std::make_shared<TcpConnection>(std::move(socket));
-                conn->start();
+    // ─── Внутренняя логика (Выполняется в io_thread) ─────────────────────────
 
-                // Здесь нужно уведомить ядро о новом соединении.
-                // В вашем SDK обычно это делается через api_->on_connect или похожий механизм.
-                // Если ядро ожидает уведомления через send:
-                std::string uri = conn->get_uri_string();
-                this->send(uri.c_str(), MSG_TYPE_SYSTEM, nullptr, 0); 
-                
-                // Сохраняем в список активных, чтобы shared_ptr жил
-                active_connections_.push_back(conn);
+    void accept_next() {
+        if (!acceptor_ || !acceptor_->is_open()) return;
+
+        acceptor_->async_accept([this](auto ec, tcp::socket sock) {
+            if (!ec) {
+                register_socket(std::move(sock));
+            } else if (ec != asio::error::operation_aborted) {
+                LOG_WARN("[TCP] Accept error: {}", ec.message());
             }
-            do_accept();
+            accept_next();
         });
     }
+
+    void register_socket(tcp::socket sock) {
+        endpoint_t ep{};
+        try {
+            auto rep = sock.remote_endpoint();
+            std::strncpy(ep.address, rep.address().to_string().c_str(), sizeof(ep.address)-1);
+            ep.port = rep.port();
+        } catch(...) {}
+
+        LOG_DEBUG("[TCP] New socket from {}:{}", ep.address, ep.port);
+
+        // 1. Уведомляем ядро. 
+        // Важно: так как мы в io_thread, ядро сразу вызовет send_auth, 
+        // который через post встанет в очередь этого же потока.
+        conn_id_t id = notify_connect(&ep);
+        
+        if (id == CONN_ID_INVALID) {
+            LOG_WARN("[TCP] Kernel rejected connection from {}", ep.address);
+            sock.close();
+            return;
+        }
+
+        auto conn = std::make_shared<TcpConnection>(std::move(sock), id, ep);
+        {
+            std::lock_guard lock(conn_mu_);
+            connections_[id] = conn;
+        }
+
+        LOG_INFO("[TCP] Registered connection #{} ({}:{})", id, ep.address, ep.port);
+        start_read(std::move(conn));
+    }
+
+    void start_read(std::shared_ptr<TcpConnection> conn) {
+        // Захватываем shared_ptr в лямбду, чтобы объект жил пока идет чтение
+        conn->socket.async_read_some(asio::buffer(conn->read_buf),
+            [this, conn](auto ec, std::size_t n) {
+                if (ec) {
+                    // Обработка дисконнекта
+                    int err_code = (ec == asio::error::eof || ec == asio::error::operation_aborted) ? 0 : ec.value();
+                    
+                    LOG_INFO("[TCP] Connection #{} disconnected: {}", conn->id, ec.message());
+                    
+                    notify_disconnect(conn->id, err_code);
+                    
+                    std::lock_guard lock(conn_mu_);
+                    connections_.erase(conn->id);
+                } else {
+                    LOG_TRACE("[TCP] Received {} bytes from #{}", n, conn->id);
+                    notify_data(conn->id, conn->read_buf, n);
+                    start_read(std::move(conn));
+                }
+            });
+    }
+
+    // ─── Состояние ───────────────────────────────────────────────────────────
+
+    asio::io_context io_;
+    std::optional<asio::executor_work_guard<asio::io_context::executor_type>> work_;
+    std::unique_ptr<tcp::acceptor> acceptor_;
+    std::thread io_thread_;
+
+    std::mutex conn_mu_;
+    std::unordered_map<conn_id_t, std::shared_ptr<TcpConnection>> connections_;
 };
 
-// Экспорт плагина
-CONNECTOR_PLUGIN(TcpConnector)
+} // namespace gn
+
+// Регистрация плагина
+CONNECTOR_PLUGIN(gn::TcpConnector)

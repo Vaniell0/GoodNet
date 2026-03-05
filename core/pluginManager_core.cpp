@@ -1,4 +1,5 @@
 #include "pluginManager.hpp"
+#include "connectionManager.hpp"
 #include "logger.hpp"
 
 namespace gn {
@@ -8,7 +9,6 @@ namespace gn {
 PluginManager::HandlerInfo::~HandlerInfo() {
     if (handler && handler->shutdown)
         handler->shutdown(handler->user_data);
-    // lib.close() вызовется автоматически деструктором DynLib
 }
 
 PluginManager::ConnectorInfo::~ConnectorInfo() {
@@ -16,12 +16,13 @@ PluginManager::ConnectorInfo::~ConnectorInfo() {
         ops->shutdown(ops->connector_ctx);
 }
 
-// ─── Конструктор ─────────────────────────────────────────────────────────────
+// ─── Конструктор / деструктор ─────────────────────────────────────────────────
 
 PluginManager::PluginManager(host_api_t* api, fs::path plugins_base_dir)
     : host_api_(api), plugins_base_dir_(std::move(plugins_base_dir))
 {
-    LOG_INFO("PluginManager initialized. Base dir: {}", plugins_base_dir_.string());
+    LOG_INFO("PluginManager initialized. Base: {}",
+             plugins_base_dir_.empty() ? "(none)" : plugins_base_dir_.string());
 }
 
 PluginManager::~PluginManager() {
@@ -31,92 +32,151 @@ PluginManager::~PluginManager() {
 // ─── load_plugin ─────────────────────────────────────────────────────────────
 
 std::expected<void, std::string> PluginManager::load_plugin(const fs::path& path) {
-    if (!fs::exists(path))
-        return std::unexpected(fmt::format("Plugin not found: {}", path.string()));
+    if (!fs::exists(path)) { return std::unexpected(fmt::format("not found: {}", path.string())); }
 
     if (auto v = verify_metadata(path); !v) {
-        LOG_ERROR("Integrity check failed for '{}': {}", path.filename().string(), v.error());
         return std::unexpected(v.error());
     }
 
-    // 1. Открываем библиотеку (RAII)
-    auto lib_res = DynLib::open(path);
-    if (!lib_res)
-        return std::unexpected(lib_res.error());
+    auto lib_result = DynLib::open(path);
+    if (!lib_result)
+        return std::unexpected(fmt::format("dlopen '{}': {}",
+                                            path.filename().string(),
+                                            lib_result.error()));
 
-    DynLib lib = std::move(*lib_res);
-    std::unique_lock lock(rw_mutex_);
+    DynLib lib = std::move(*lib_result);
 
-    // 2. Пробуем загрузить как Handler
-    using h_init_t = handler_t*(*)(host_api_t*);
-    auto h_sym = lib.symbol<h_init_t>("handler_init");
+    // ── Попытка загрузить как хендлер ─────────────────────────────────────────
+
+    using handler_init_fn = int(*)(host_api_t*, handler_t**);
+    auto h_sym = lib.symbol<handler_init_fn>("handler_init");
 
     if (h_sym) {
-        host_api_t api = *host_api_;
-        api.plugin_type = PLUGIN_TYPE_HANDLER;
-        
-        handler_t* h = (*h_sym)(&api);
-        if (!h) return std::unexpected("handler_init() returned nullptr");
+        // 1. Создаем info ЗАРАНЕЕ, чтобы память под api_c была выделена в куче
+        auto info = std::make_unique<HandlerInfo>();
+        info->lib = std::move(lib);
 
-        auto info    = std::make_unique<HandlerInfo>();
-        info->lib     = std::move(lib);
+        // 2. Настраиваем долгоживущую копию API
+        info->api_c = *host_api_;
+        info->api_c.plugin_type = PLUGIN_TYPE_HANDLER;
+        info->api_c.internal_logger = host_api_->internal_logger;
+
+        handler_t* h = nullptr;
+        // 3. Передаем адрес api_c, которая живет внутри info
+        if ((*h_sym)(&info->api_c, &h) != 0 || !h) {
+            return std::unexpected(
+                fmt::format("handler_init() failed: {}", path.filename().string()));
+        }
+
+        std::string name = (h->name && h->name[0])
+                           ? h->name
+                           : path.stem().string();
+
+        std::unique_lock lock(rw_mutex_);
+        if (handlers_.contains(name))
+            return std::unexpected(fmt::format("handler '{}' already loaded", name));
+
         info->handler = h;
         info->path    = path;
-        info->name = (h->name && strlen(h->name) > 0) ? h->name : path.stem().string();
+        info->name    = name;
 
-        handlers_[info->name] = std::move(info);
-        LOG_INFO("Loaded Handler: '{}'", path.stem().string());
+        LOG_INFO("Handler loaded: '{}' [{}]", name, path.filename().string());
+        handlers_[name] = std::move(info);
         return {};
     }
 
-    // 3. Пробуем загрузить как Connector
-    using c_init_t = connector_ops_t*(*)(host_api_t*);
-    auto c_sym = lib.symbol<c_init_t>("connector_init");
+    // ── Попытка загрузить как коннектор ───────────────────────────────────────
+
+    using connector_init_fn = int(*)(host_api_t*, connector_ops_t**);
+    auto c_sym = lib.symbol<connector_init_fn>("connector_init");
 
     if (c_sym) {
-        host_api_t api = *host_api_;
-        api.plugin_type = PLUGIN_TYPE_CONNECTOR;
+        // 1. Создаем info ЗАРАНЕЕ
+        auto info = std::make_unique<ConnectorInfo>();
+        info->lib = std::move(lib);
 
-        connector_ops_t* ops = (*c_sym)(&api);
-        if (!ops) return std::unexpected("connector_init() returned nullptr");
+        // 2. Настраиваем долгоживущую копию API
+        info->api_c = *host_api_;
+        info->api_c.plugin_type = PLUGIN_TYPE_CONNECTOR;
+        info->api_c.internal_logger = host_api_->internal_logger;
 
-        char buf[256] = {0};
-        std::string c_name, c_scheme;
-
-        if (ops->get_name) {
-            ops->get_name(ops->connector_ctx, buf, sizeof(buf));
-            c_name = buf;
-        }
-        if (c_name.empty()) { c_name = path.stem().string(); }
-
-        if (ops->get_scheme) {
-            buf[0] = '\0';
-            ops->get_scheme(ops->connector_ctx, buf, sizeof(buf));
-            c_scheme = buf;
+        connector_ops_t* ops = nullptr;
+        // 3. Передаем адрес api_c, которая живет внутри info
+        if ((*c_sym)(&info->api_c, &ops) != 0 || !ops) {
+            return std::unexpected(
+                fmt::format("connector_init() failed: {}", path.filename().string()));
         }
 
-        if (c_scheme.empty())
-            return std::unexpected(fmt::format("Connector '{}' has no scheme", c_name));
+        char buf[256] = {};
+        if (ops->get_scheme) ops->get_scheme(ops->connector_ctx, buf, sizeof(buf));
+        std::string scheme = buf;
+        if (scheme.empty()) {
+            return std::unexpected(
+                fmt::format("connector '{}': get_scheme() empty",
+                            path.filename().string()));
+        }
 
-        auto info    = std::make_unique<ConnectorInfo>();
-        info->lib     = std::move(lib);
-        info->ops     = ops;
-        info->path    = path;
-        info->name    = std::move(c_name);
-        info->scheme  = c_scheme;
+        buf[0] = '\0';
+        if (ops->get_name) ops->get_name(ops->connector_ctx, buf, sizeof(buf));
+        std::string conn_name = buf[0] ? buf : path.stem().string();
 
-        LOG_INFO("Loaded Connector: '{}' [{}]", info->name, info->scheme);
-        connectors_[info->scheme] = std::move(info);
+        std::unique_lock lock(rw_mutex_);
+        if (connectors_.contains(scheme))
+            return std::unexpected(fmt::format("connector scheme '{}' already loaded", scheme));
+
+        info->ops    = ops;
+        info->path   = path;
+        info->name   = std::move(conn_name);
+        info->scheme = scheme;
+
+        LOG_INFO("Connector loaded: '{}' scheme='{}' [{}]",
+                 info->name, scheme, path.filename().string());
+        connectors_[scheme] = std::move(info);
         return {};
     }
 
-    return std::unexpected("Plugin has no known entry points");
+    return std::unexpected(fmt::format(
+        "'{}' exports neither handler_init nor connector_init",
+        path.filename().string()));
 }
+
+// ─── load_all_plugins ────────────────────────────────────────────────────────
+
+void PluginManager::load_all_plugins() {
+    if (plugins_base_dir_.empty()) {
+        LOG_WARN("PluginManager: plugins_base_dir not set, skipping scan");
+        return;
+    }
+
+    const std::array<fs::path, 2> subdirs = {
+        plugins_base_dir_ / "handlers",
+        plugins_base_dir_ / "connectors"
+    };
+
+    for (const auto& dir : subdirs) {
+        if (!fs::exists(dir)) {
+            LOG_DEBUG("Plugin dir not found: {}", dir.string());
+            continue;
+        }
+        for (const auto& entry : fs::directory_iterator(dir)) {
+            if (!entry.is_regular_file()) continue;
+            if (entry.path().extension() != DYNLIB_EXT) continue;
+
+            auto result = load_plugin(entry.path());
+            if (!result)
+                LOG_WARN("Skip '{}': {}", entry.path().filename().string(),
+                          result.error());
+        }
+    }
+}
+
+// ─── unload_all ───────────────────────────────────────────────────────────────
 
 void PluginManager::unload_all() {
     std::unique_lock lock(rw_mutex_);
     handlers_.clear();
     connectors_.clear();
+    LOG_INFO("PluginManager: all plugins unloaded");
 }
 
 } // namespace gn
