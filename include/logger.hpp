@@ -7,12 +7,8 @@
 #include <mutex>
 
 #include <fmt/core.h>
-#include "fmt_extensions.hpp"
-#include <spdlog/common.h>  // level_enum, source_loc — лёгкий хедер без тяжёлых зависимостей
+#include <spdlog/common.h> 
 
-// spdlog::logger — forward declaration.
-// Полный тип нужен только в logger.cpp.
-// Это предотвращает транзитивный include spdlog/spdlog.h в каждый TU проекта.
 namespace spdlog { class logger; }
 
 // ─── LoggerDetail ─────────────────────────────────────────────────────────────

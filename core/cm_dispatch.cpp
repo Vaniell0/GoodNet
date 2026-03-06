@@ -4,16 +4,9 @@
 
 namespace gn {
 
-// ─── handle_data ──────────────────────────────────────────────────────────────
-//
-// TCP reassembly: накапливаем байты в recv_buf, вырезаем полные пакеты.
-//
-// Wire-формат пакета:
-//   header_t (фиксированный размер)
-//   payload  (header.payload_len байт)
-//     → для ESTABLISHED non-localhost: nonce(8) + secretbox(plain)
-//     → для ESTABLISHED localhost:     plain
-//     → для AUTH:                      plain (auth_payload_t)
+// ─── handle_data ─────────────────────────────────────────────────────────────
+// TCP reassembly: accumulate bytes, extract complete packets.
+// Wire: header_t (fixed) | payload (header.payload_len bytes)
 
 void ConnectionManager::handle_data(conn_id_t id, const void* raw, size_t size) {
     if (shutting_down_.load(std::memory_order_relaxed)) return;
@@ -28,7 +21,7 @@ void ConnectionManager::handle_data(conn_id_t id, const void* raw, size_t size) 
 
     while (rec.recv_buf.size() >= sizeof(header_t)) {
         const auto* hdr = reinterpret_cast<const header_t*>(rec.recv_buf.data());
-        LOG_INFO("Incoming packet type={} from #{}", hdr->payload_type, id);
+        LOG_DEBUG("Incoming packet type={} from #{}", hdr->payload_type, id);
 
         if (hdr->magic != GNET_MAGIC) {
             LOG_WARN("handle_data #{}: bad magic 0x{:08X}, dropping", id, hdr->magic);
@@ -42,9 +35,8 @@ void ConnectionManager::handle_data(conn_id_t id, const void* raw, size_t size) 
         }
 
         const size_t total = sizeof(header_t) + hdr->payload_len;
-        if (rec.recv_buf.size() < total) break;  // ждём остаток
+        if (rec.recv_buf.size() < total) break;
 
-        // Вырезаем полный пакет из буфера
         std::vector<uint8_t> pkt(rec.recv_buf.begin(),
                                   rec.recv_buf.begin() + static_cast<ptrdiff_t>(total));
         rec.recv_buf.erase(rec.recv_buf.begin(),
@@ -54,7 +46,6 @@ void ConnectionManager::handle_data(conn_id_t id, const void* raw, size_t size) 
         const auto* payload = pkt.data() + sizeof(header_t);
         const size_t plen   = phdr->payload_len;
 
-        // Отпускаем lock перед dispatch — он может рекурсивно зайти в handle_data
         lock.unlock();
         dispatch_packet(id, phdr, payload, plen);
         lock.lock();
@@ -65,13 +56,10 @@ void ConnectionManager::handle_data(conn_id_t id, const void* raw, size_t size) 
 }
 
 // ─── dispatch_packet ─────────────────────────────────────────────────────────
-//
-// AUTH    → process_auth() (plain, до сессии)
-// прочие в AUTH_PENDING → drop (защита от preauth flood)
-// прочие в ESTABLISHED:
-//   localhost           → plain, прямо в bus_.emit
-//   remote, sess ready  → decrypt(payload) → bus_.emit
-//   remote, sess !ready → drop (не должно случиться в норме)
+// AUTH → process_auth (plain, pre-session)
+// Pre-auth non-AUTH → drop (flood protection)
+// ESTABLISHED localhost → plain dispatch
+// ESTABLISHED remote   → decrypt → dispatch
 
 void ConnectionManager::dispatch_packet(conn_id_t id, const header_t* hdr,
                                          const uint8_t* payload, size_t plen) {
@@ -80,15 +68,8 @@ void ConnectionManager::dispatch_packet(conn_id_t id, const header_t* hdr,
         return;
     }
 
-    // Читаем нужные поля под lock и сразу берём копию данных сессии
     endpoint_t remote{};
-    bool       is_localhost  = false;
-    bool       session_ready = false;
-
-    // Для расшифровки нам нужен указатель на SessionState.
-    // SessionState некопируем (atomic), поэтому берём shared_ptr-обёртку
-    // через ConnectionRecord::session (unique_ptr).
-    // Безопасный паттерн: расшифруем под отдельным lock.
+    bool       is_localhost = false;
     std::vector<uint8_t> plaintext;
 
     {
@@ -107,12 +88,8 @@ void ConnectionManager::dispatch_packet(conn_id_t id, const header_t* hdr,
         is_localhost = rec.is_localhost;
 
         if (is_localhost || !rec.session) {
-            // Plain — просто копируем payload
             plaintext.assign(payload, payload + plen);
         } else if (rec.session->ready) {
-            session_ready = true;
-            // Расшифровываем прямо под lock — session принадлежит record
-            // и изменяется (nonce counter), поэтому нужен exclusive lock
             plaintext = rec.session->decrypt(payload, plen);
             if (plaintext.empty()) {
                 LOG_WARN("dispatch #{}: decrypt failed (type={}), dropping",
@@ -124,12 +101,9 @@ void ConnectionManager::dispatch_packet(conn_id_t id, const header_t* hdr,
             return;
         }
     }
-    (void)session_ready;  // только для документации
 
     auto hdr_ptr  = std::make_shared<header_t>(*hdr);
     auto data_ptr = std::make_shared<std::vector<uint8_t>>(std::move(plaintext));
-
-    // emit за пределами records_mu_ — подписчики могут вызвать send()
     bus_.emit(hdr->payload_type, hdr_ptr, &remote, data_ptr);
 }
 

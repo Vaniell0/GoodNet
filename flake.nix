@@ -18,7 +18,7 @@
 
         # ── Общие зависимости ─────────────────────────────────────────────────
         coreBuildInputs = with pkgs; [ boost spdlog fmt nlohmann_json libsodium ];
-        coreNative      = with pkgs; [ cmake ninja pkg-config ];
+        coreNative      = with pkgs; [ cmake ninja pkg-config include-what-you-use ];
 
         # ── Функция сборки core ───────────────────────────────────────────────
         makeCore = { buildType ? "Release", extraFlags ? [] }:

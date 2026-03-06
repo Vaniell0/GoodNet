@@ -1,14 +1,12 @@
 #include "connectionManager.hpp"
 #include "logger.hpp"
 #include <cstring>
-#include <cstddef>   // offsetof
+#include <cstddef>
 #include <algorithm>
 
 namespace gn {
 
-std::string bytes_to_hex(const uint8_t* data, size_t len);  // cm_identity.cpp
-
-// ─── Getters ──────────────────────────────────────────────────────────────────
+std::string bytes_to_hex(const uint8_t* data, size_t len);
 
 size_t ConnectionManager::connection_count() const {
     std::shared_lock lk(records_mu_); return records_.size();
@@ -38,8 +36,6 @@ bool ConnectionManager::is_localhost_address(std::string_view a) {
     return a == "127.0.0.1" || a == "::1" || a == "localhost" || a.starts_with("127.");
 }
 
-// ─── Connector lookup ─────────────────────────────────────────────────────────
-
 connector_ops_t* ConnectionManager::find_connector(const std::string& scheme) {
     std::shared_lock lk(connectors_mu_);
     if (auto it = connectors_.find(scheme); it != connectors_.end()) return it->second;
@@ -47,7 +43,6 @@ connector_ops_t* ConnectionManager::find_connector(const std::string& scheme) {
 }
 
 std::optional<conn_id_t> ConnectionManager::resolve_uri(const std::string& uri) {
-    // Убираем схему: "tcp://host:port" → "host:port"
     std::string key = uri;
     if (const auto sep = key.find("://"); sep != std::string::npos)
         key = key.substr(sep + 3);
@@ -63,28 +58,12 @@ std::vector<std::string> ConnectionManager::local_schemes() const {
     return out;
 }
 
-// ─── negotiate_scheme ─────────────────────────────────────────────────────────
-//
-// Возвращает лучшую схему для отправки пакетов данному пиру.
-//
-// Алгоритм:
-//   1. Собираем локальные коннекторы.
-//   2. Итерируем scheme_priority_ в порядке предпочтения.
-//   3. Первая схема из приоритета, доступная локально И у пира → победитель.
-//   4. Если peer_schemes пуст (старый клиент без capability negotiation)
-//      → берём первую локально доступную схему по приоритету.
-//
-// Пример:
-//   local:    {tcp, ws}
-//   peer:     {udp, ws, tcp}
-//   priority: [tcp, ws, udp, mock]
-//   result:   "tcp"
-
+/// @brief Pick best scheme available on both sides, respecting scheme_priority_ order.
 std::string ConnectionManager::negotiate_scheme(const ConnectionRecord& rec) const {
     const auto local = local_schemes();
     for (const auto& prio : scheme_priority_) {
         if (std::find(local.begin(), local.end(), prio) == local.end()) continue;
-        if (rec.peer_schemes.empty()) return prio;  // старый клиент
+        if (rec.peer_schemes.empty()) return prio;
         if (std::find(rec.peer_schemes.begin(), rec.peer_schemes.end(), prio)
                 != rec.peer_schemes.end())
             return prio;
@@ -92,16 +71,11 @@ std::string ConnectionManager::negotiate_scheme(const ConnectionRecord& rec) con
     return local.empty() ? "tcp" : local.front();
 }
 
-// ─── send_frame ───────────────────────────────────────────────────────────────
-//
-// Низкоуровневая отправка: упаковывает header + payload в wire и отдаёт коннектору.
-// Для ESTABLISHED соединений (не localhost) payload шифруется session_key.
-// Для AUTH (всегда plain) используется явно msg_type == MSG_TYPE_AUTH.
-
+/// @brief Pack and send a single frame. Encrypts payload for non-localhost ESTABLISHED connections.
 void ConnectionManager::send_frame(conn_id_t id, uint32_t msg_type,
                                     const void* payload, size_t payload_size) {
     std::string scheme;
-    bool        is_localhost  = false;
+    bool        is_localhost = false;
     SessionState* session_ptr = nullptr;
 
     {
@@ -110,8 +84,8 @@ void ConnectionManager::send_frame(conn_id_t id, uint32_t msg_type,
         if (it == records_.end()) return;
         const auto& rec = it->second;
         scheme       = rec.negotiated_scheme.empty() ? rec.local_scheme : rec.negotiated_scheme;
-        is_localhost  = rec.is_localhost;
-        session_ptr   = rec.session.get();
+        is_localhost = rec.is_localhost;
+        session_ptr  = rec.session.get();
     }
 
     auto* ops = find_connector(scheme.empty() ? "tcp" : scheme);
@@ -120,22 +94,20 @@ void ConnectionManager::send_frame(conn_id_t id, uint32_t msg_type,
         return;
     }
 
-    // Шифруем payload для non-localhost ESTABLISHED пакетов (кроме AUTH)
     std::vector<uint8_t> encrypted;
-    const void* final_payload  = payload;
-    size_t      final_size     = payload_size;
+    const void* final_payload = payload;
+    size_t      final_size    = payload_size;
 
     const bool do_encrypt = msg_type != MSG_TYPE_AUTH
                          && !is_localhost
                          && session_ptr
                          && session_ptr->ready;
     if (do_encrypt) {
-        encrypted   = session_ptr->encrypt(payload, payload_size);
+        encrypted     = session_ptr->encrypt(payload, payload_size);
         final_payload = encrypted.data();
         final_size    = encrypted.size();
     }
 
-    // Собираем wire: header_t + (encrypted) payload
     header_t hdr{};
     hdr.magic        = GNET_MAGIC;
     hdr.proto_ver    = GNET_PROTO_VER;
@@ -143,7 +115,6 @@ void ConnectionManager::send_frame(conn_id_t id, uint32_t msg_type,
     hdr.payload_len  = static_cast<uint32_t>(final_size);
     hdr.status       = STATUS_OK;
 
-    // Подписываем header device_key'ом для non-localhost ESTABLISHED пакетов
     if (msg_type != MSG_TYPE_AUTH && !is_localhost) {
         const size_t hdr_body = offsetof(header_t, signature);
         crypto_sign_ed25519_detached(
@@ -160,23 +131,15 @@ void ConnectionManager::send_frame(conn_id_t id, uint32_t msg_type,
     ops->send_to(ops->connector_ctx, id, frame.data(), frame.size());
 }
 
-// ─── send ─────────────────────────────────────────────────────────────────────
-//
-// Публичный API для плагинов-хендлеров: api_->send(uri, type, data, size).
-// uri: "tcp://host:port" | "ws://host:port" | "host:port" (автосхема)
-
 void ConnectionManager::send(const char* uri, uint32_t msg_type,
                               const void* payload, size_t size) {
     if (!uri) return;
     const std::string uri_str(uri);
 
     auto conn_id_opt = resolve_uri(uri_str);
-
     if (!conn_id_opt) {
-        // Нет активного соединения → пробуем подключиться
         const auto sep = uri_str.find("://");
-        const std::string scheme = (sep != std::string::npos)
-                                   ? uri_str.substr(0, sep) : "tcp";
+        const std::string scheme = (sep != std::string::npos) ? uri_str.substr(0, sep) : "tcp";
         if (auto* ops = find_connector(scheme)) {
             if (ops->connect(ops->connector_ctx, uri_str.c_str()) != 0)
                 LOG_WARN("send: connect() failed for '{}'", uri_str);

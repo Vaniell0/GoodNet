@@ -10,54 +10,57 @@
 
 namespace gn::sdk {
 
-// ─── Базовые типы буферов ─────────────────────────────────────────────────────
+/// @defgroup data Message Data Types
+/// @brief Typed wrappers for plugin messages.
+/// @{
 
-using RawBuffer = std::vector<uint8_t>;
-using RawSpan   = std::span<const uint8_t>;
+using RawBuffer = std::vector<uint8_t>;  ///< Owned byte buffer
+using RawSpan   = std::span<const uint8_t>; ///< Non-owning byte view
 
-// ─── IData ────────────────────────────────────────────────────────────────────
-//
-// Интерфейс всех передаваемых сообщений.
-// Две специализации:
-//   PodData<T>  — фиксированный POD-layout (AUTH, HEARTBEAT, ключи и т.д.)
-
+/// @brief Abstract base for all transmittable messages.
 class IData {
 public:
     virtual ~IData() = default;
 
-    virtual RawBuffer serialize()                 const = 0;
-    virtual void      deserialize(RawSpan buffer)       = 0;
+    /// @brief Serialize to a heap-allocated byte buffer.
+    virtual RawBuffer serialize()                   const = 0;
 
-    // Хелпер: deserialize из сырого указателя
+    /// @brief Deserialize from a byte span. Throws on insufficient data.
+    virtual void      deserialize(RawSpan buffer)         = 0;
+
+    /// @brief Minimum valid payload size for pre-receive validation.
+    virtual size_t    min_size()                    const = 0;
+
+    /// @brief Convenience overload: deserialize from raw pointer.
     void deserialize(const void* data, size_t len) {
         deserialize(RawSpan(static_cast<const uint8_t*>(data), len));
     }
-
-    // Минимальный размер валидного payload (для проверки на приёмнике)
-    virtual size_t min_size() const = 0;
 };
 
-// ─── PodData<T> ───────────────────────────────────────────────────────────────
-//
-// Обёртка над #pragma pack(push,1) структурами из sdk/types.h
-// Никакого копирования не делает при сериализации — просто memcpy.
-//
-// Использование:
-//   using AuthMsg = PodData<auth_payload_t>;
-//   AuthMsg msg;
-//   msg->user_pubkey = ...;
-//   auto buf = msg.serialize();
-
+/// @brief Zero-copy wrapper for trivially-copyable (POD) structs.
+///
+/// Suitable for fixed-layout wire messages such as AUTH, HEARTBEAT,
+/// and KEY_EXCHANGE payloads. Serialization is a plain memcpy.
+///
+/// ## Usage
+/// ```cpp
+/// using HeartbeatMsg = gn::sdk::PodData<HeartbeatPayload>;
+/// HeartbeatMsg msg;
+/// msg->seq       = ++counter;
+/// msg->flags     = 0x00;  // ping
+/// auto wire      = msg.serialize();
+/// api_->send(ctx, uri, MSG_TYPE_HEARTBEAT, wire.data(), wire.size());
+/// ```
+/// @tparam T  Trivially-copyable struct, typically declared with #pragma pack(push,1)
 template<typename T>
 requires std::is_trivially_copyable_v<T>
 class PodData final : public IData {
 public:
-    T value{};
+    T value{};  ///< Payload struct; access via operator-> or operator*
 
     PodData() = default;
     explicit PodData(const T& v) : value(v) {}
 
-    // Arrow / dereference для удобного доступа к полям
     T*       operator->()       noexcept { return &value; }
     const T* operator->() const noexcept { return &value; }
     T&       operator* ()       noexcept { return value; }
@@ -78,9 +81,8 @@ public:
     size_t min_size() const override { return sizeof(T); }
 };
 
-// ─── Хелперы ─────────────────────────────────────────────────────────────────
-
-// Десериализовать из raw buffer
+/// @brief Deserialize bytes into a typed IData-derived object.
+/// @tparam T  Must derive from IData
 template<typename T>
 requires std::derived_from<T, IData>
 T from_bytes(const void* data, size_t len) {
@@ -89,9 +91,12 @@ T from_bytes(const void* data, size_t len) {
     return obj;
 }
 
-// Сериализовать в raw buffer (move-friendly)
+/// @brief Serialize an IData-derived object to bytes.
+/// @tparam T  Must derive from IData
 template<typename T>
 requires std::derived_from<T, IData>
 RawBuffer to_bytes(const T& obj) { return obj.serialize(); }
+
+/// @}  // defgroup data
 
 } // namespace gn::sdk

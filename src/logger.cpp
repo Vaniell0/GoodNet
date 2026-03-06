@@ -1,12 +1,9 @@
-#include "logger.hpp"
-
-// ─── Тяжёлые включения ТОЛЬКО здесь ─────────────────────────────────────────
-// spdlog/spdlog.h (~1000 строк + зависимости) не попадает в публичный хедер.
-// Все TU, включающие logger.hpp, компилируются без этой нагрузки.
 #include <spdlog/spdlog.h>
+#include <spdlog/pattern_formatter.h>
 #include <spdlog/sinks/rotating_file_sink.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
-#include <spdlog/pattern_formatter.h>
+#include "fmt_extensions.hpp"
+#include "logger.hpp"
 
 #include <filesystem>
 #include <iostream>

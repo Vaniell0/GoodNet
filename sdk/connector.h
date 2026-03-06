@@ -5,73 +5,69 @@
 extern "C" {
 #endif
 
-// ─── connector_ops_t ─────────────────────────────────────────────────────────
-//
-// C-интерфейс коннектора.
-// Коннектор — транспортный плагин (TCP, UDP, WebSocket, …).
-//
-// Модель владения соединениями:
-//   Плагин ВЛАДЕЕТ объектами соединений (IConnection, boost::tcp::socket, …).
-//   Ядро (ConnectionManager) ВЛАДЕЕТ только записью ConnectionRecord,
-//   идентифицируемой conn_id_t.
-//
-//   conn_id_t — непрозрачный ключ, который ядро передаёт плагину через
-//   on_connect() коллбэк (в host_api_t). Плагин хранит его рядом с сокетом.
-//
-// Жизненный цикл соединения:
-//   1. Входящее (listen): accept → api->on_connect() → conn_id → хранить в сокете
-//   2. Исходящее (connect): подключиться → api->on_connect() → conn_id → хранить
-//   3. Данные: прочитать → api->on_data(conn_id, buf, len)
-//   4. Закрытие: api->on_disconnect(conn_id, error)
-//   5. send_to: ядро говорит коннектору отправить bytes через conn_id
-
+/// @defgroup connector Connector Plugin C API
+/// @brief C interface for transport plugins (TCP, UDP, WebSocket, …).
+///
+/// ## Ownership model
+/// - The **plugin** owns connection objects (sockets, state machines, …).
+/// - The **core** (ConnectionManager) owns ConnectionRecord, keyed by conn_id_t.
+/// - conn_id_t is obtained from api->on_connect() and must be stored alongside
+///   the socket for use in subsequent on_data() and on_disconnect() calls.
+///
+/// ## Connection lifecycle
+/// 1. **Incoming**: accept → api->on_connect(ep) → store conn_id next to socket
+/// 2. **Outgoing**: async_connect → api->on_connect(ep) → store conn_id
+/// 3. **Data**:     read bytes → api->on_data(conn_id, buf, len)
+/// 4. **Close**:    socket closed → api->on_disconnect(conn_id, error)
+/// 5. **Send**:     core calls send_to(conn_id, data, size)
+/// @{
 typedef struct connector_ops_t {
 
-    // ── Управление соединениями ───────────────────────────────────────────────
-
-    // Подключиться к uri (например "tcp://192.168.1.1:25565").
-    // SYNC: функция должна вернуться быстро; подключение — в фоне.
-    // После установки: вызвать api->on_connect() → получить conn_id.
-    // Возвращает 0 если запрос принят, -1 при ошибке.
+    /// @brief Initiate an outgoing connection to uri (e.g., "tcp://host:4242").
+    ///        Must return quickly; actual connection happens asynchronously.
+    ///        On success: call api->on_connect() to register with the core.
+    /// @return 0 if request accepted, -1 on immediate error
     int (*connect)(void* connector_ctx, const char* uri);
 
-    // Начать слушать на адресе/порту.
-    // При каждом входящем соединении вызывать api->on_connect().
-    // Возвращает 0 при успехе.
+    /// @brief Start listening for incoming connections on host:port.
+    ///        For each accepted socket: call api->on_connect().
+    /// @return 0 on success, -1 on error
     int (*listen)(void* connector_ctx, const char* host, uint16_t port);
 
-    // Отправить сырые байты в соединение с данным conn_id.
-    // Плагин находит сокет по conn_id и записывает bytes.
-    // Возвращает 0 при успехе, -1 при ошибке.
-    int (*send_to)(void* connector_ctx,
-                   conn_id_t conn_id,
-                   const void* data, size_t size);
+    /// @brief Send raw bytes to the connection identified by conn_id.
+    /// @return 0 on success, -1 on error
+    int (*send_to)(void*       connector_ctx,
+                   conn_id_t   conn_id,
+                   const void* data,
+                   size_t      size);
 
-    // Закрыть соединение conn_id.
-    // Плагин закрывает сокет. Ядро получит on_disconnect().
+    /// @brief Close connection conn_id.
+    ///        The plugin must eventually call api->on_disconnect(conn_id, error).
     void (*close)(void* connector_ctx, conn_id_t conn_id);
 
-    // ── Идентификация ─────────────────────────────────────────────────────────
-
-    // Схема URI: "tcp", "udp", "ws", "mock", …
-    // PluginManager использует это для find_connector_by_scheme().
+    /// @brief Fill buf with the URI scheme: "tcp", "udp", "ws", "mock", …
+    ///        Used by PluginManager::find_connector_by_scheme().
     void (*get_scheme)(void* connector_ctx, char* buf, size_t buf_size);
 
-    // Человекочитаемое имя: "TCP Connector", "MockConnector", …
+    /// @brief Fill buf with a human-readable name: "TCP Connector", …
     void (*get_name)(void* connector_ctx, char* buf, size_t buf_size);
 
-    // ── Жизненный цикл ────────────────────────────────────────────────────────
-
-    // Вызывается ядром перед dlclose(). Закрыть все соединения и освободить ресурсы.
+    /// @brief Invoked by the core before dlclose(). Close all connections,
+    ///        stop io_context, free all resources.
     void (*shutdown)(void* connector_ctx);
 
-    // Непрозрачный контекст плагина (обычно this).
+    /// @brief Opaque plugin context, typically `this`.
     void* connector_ctx;
 
 } connector_ops_t;
 
-// Сигнатура функции инициализации (CONNECTOR_PLUGIN генерирует автоматически)
+/// @brief Connector plugin entry point signature.
+/// @param api     Host API provided by the core
+/// @param out_ops Output: pointer to connector operations table
+/// @return 0 on success, non-zero on failure
 typedef int (*connector_init_t)(host_api_t* api, connector_ops_t** out_ops);
+
+/// @}  // defgroup connector
 
 #ifdef __cplusplus
 }
