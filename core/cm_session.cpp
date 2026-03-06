@@ -3,6 +3,10 @@
 #include <cstring>
 #include <algorithm>
 
+#include <sodium/crypto_generichash.h>  // Для crypto_generichash_state, init, update, final
+#include <sodium/crypto_scalarmult.h>   // Для crypto_scalarmult и crypto_scalarmult_BYTES
+#include <sodium/crypto_secretbox.h>    // Для crypto_secretbox_KEYBYTES
+
 namespace gn {
 
 std::string bytes_to_hex(const uint8_t* data, size_t len);

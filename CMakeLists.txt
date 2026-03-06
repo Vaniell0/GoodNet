@@ -45,6 +45,7 @@ target_include_directories(goodnet_sdk INTERFACE
 add_library(goodnet_core SHARED
     src/config.cpp
     src/logger.cpp
+    src/signals.cpp
     core/pluginManager_core.cpp
     core/pluginManager_query.cpp
     core/cm_send.cpp
@@ -52,6 +53,7 @@ add_library(goodnet_core SHARED
     core/cm_identity.cpp
     core/cm_dispatch.cpp
     core/cm_handshake.cpp
+    core/data/machine_id.cpp
 )
 
 add_library(GoodNet::core ALIAS goodnet_core)
@@ -59,7 +61,7 @@ set_target_properties(goodnet_core PROPERTIES
     EXPORT_NAME core
     VERSION     0.1.0
     SOVERSION   0
-    ENABLE_EXPORTS ON      # -rdynamic: плагины видят символы ядра
+    ENABLE_EXPORTS ON       # -rdynamic: плагины видят символы ядра
 )
 
 target_link_libraries(goodnet_core PUBLIC goodnet_sdk)

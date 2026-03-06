@@ -20,18 +20,16 @@
 ///   cm_dispatch.cpp  — TCP reassembly, packet dispatch
 ///   cm_send.cpp      — send, send_frame, scheme negotiation
 
-#include <atomic>
-#include <filesystem>
-#include <functional>
 #include <memory>
-#include <mutex>
-#include <optional>
+#include <string>
 #include <vector>
-#include <unordered_map>
+#include <optional>
+#include <filesystem>
 
-#include <sodium.h>
-#include <fmt/core.h>
-#include <fmt/ranges.h>
+#include <sodium/crypto_secretbox.h> // для crypto_secretbox_KEYBYTES
+#include <sodium/crypto_sign.h>      // для crypto_sign_PUBLICKEYBYTES и т.д.
+#include <sodium/crypto_box.h>       // для crypto_box_PUBLICKEYBYTES и т.д.
+#include <sodium/utils.h>            // для sodium_memzero
 
 #include "logger.hpp"
 #include "signals.hpp"
@@ -48,7 +46,7 @@ namespace fs = std::filesystem;
 /// @brief Identity loading configuration (maps to config.json "identity" section).
 struct IdentityConfig {
     fs::path dir            = "~/.goodnet";
-    fs::path ssh_key_path;           ///< Empty = auto-detect ~/.ssh/id_ed25519
+    fs::path ssh_key_path   = ""; ///< Empty = auto-detect ~/.ssh/id_ed25519
     bool     use_machine_id = true;
 };
 

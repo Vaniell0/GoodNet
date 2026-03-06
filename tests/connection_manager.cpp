@@ -15,7 +15,7 @@
 #include <sodium.h>
 
 #include "connectionManager.hpp"
-#include "include/signals.hpp"
+#include "signals.hpp"
 #include "../sdk/types.h"
 #include "../sdk/plugin.h"
 #include "../sdk/handler.h"
