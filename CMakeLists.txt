@@ -46,8 +46,7 @@ add_library(goodnet_core SHARED
     src/config.cpp
     src/logger.cpp
     core/pluginManager_core.cpp
-    core/pluginManager_state.cpp
-    core/pluginManager_lookup.cpp
+    core/pluginManager_query.cpp
     core/cm_send.cpp
     core/cm_session.cpp
     core/cm_identity.cpp

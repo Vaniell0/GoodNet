@@ -1,13 +1,11 @@
 #pragma once
 
-// ─── include/signals.hpp ──────────────────────────────────────────────────────
-//
-// SignalBus — умная шина сигналов.
-//
-// Дерево каналов: bus[msg_type][handler_name] → HandlerPacketSignal
-// Wildcard: подписчик без типа получает все msg_type.
-//
-// Каждый канал — отдельный strand → хендлеры не блокируют друг друга.
+/// @file include/signals.hpp
+/// @brief Async signal bus with per-channel strands.
+///
+/// Tree: bus[msg_type][handler_name] → HandlerPacketSignal
+/// Wildcard subscribers receive all msg_types.
+/// Each channel runs on a dedicated strand — handlers never block each other.
 
 #include <string>
 #include <string_view>
@@ -25,11 +23,10 @@ namespace gn {
 
 using PacketData = std::shared_ptr<std::vector<uint8_t>>;
 
-// ─── Signal<Args...> ──────────────────────────────────────────────────────────
-
 template<typename Func, typename... Args>
 concept SignalHandler = std::invocable<Func, Args...>;
 
+/// @brief Thread-safe signal with strand-serialized dispatch.
 template<typename... Args>
 class Signal {
 public:
@@ -52,9 +49,9 @@ public:
             });
     }
 
-    void  clear() { std::lock_guard lock(mu_); handlers_.clear(); }
-    bool  empty() const { std::lock_guard lock(mu_); return handlers_.empty(); }
-    size_t size() const { std::lock_guard lock(mu_); return handlers_.size(); }
+    void   clear()  { std::lock_guard lock(mu_); handlers_.clear(); }
+    bool   empty()  const { std::lock_guard lock(mu_); return handlers_.empty(); }
+    size_t size()   const { std::lock_guard lock(mu_); return handlers_.size(); }
 
 private:
     mutable std::mutex mu_;
@@ -62,25 +59,20 @@ private:
     std::vector<std::function<void(Args...)>> handlers_;
 };
 
-// ─── HandlerPacketSignal ──────────────────────────────────────────────────────
-//
-// Сигнал для хендлера: несёт handler_name первым аргументом.
-// Хендлер знает своё имя → может логировать и отправлять ответ через api_->send().
-
+/// @brief Signal type for packet handlers: (handler_name, header, endpoint, payload).
 using HandlerPacketSignal = Signal<
-    std::string_view,           // handler_name
-    std::shared_ptr<header_t>,  // header (расшифрованный, validated)
-    const endpoint_t*,          // remote endpoint
-    PacketData                  // payload (plaintext)
+    std::string_view,
+    std::shared_ptr<header_t>,
+    const endpoint_t*,
+    PacketData
 >;
 
-// ─── SignalBus ────────────────────────────────────────────────────────────────
-
+/// @brief Multi-channel signal bus keyed by msg_type and handler name.
 class SignalBus {
 public:
     explicit SignalBus(boost::asio::io_context& ioc) : ioc_(ioc) {}
 
-    // Подписать хендлер на конкретный msg_type
+    /// @brief Subscribe handler to a specific msg_type.
     template<typename Func>
     void subscribe(uint32_t msg_type, std::string_view name, Func&& cb) {
         const std::string n(name);
@@ -93,7 +85,7 @@ public:
         channels_.at(msg_type).at(n)->connect(std::forward<Func>(cb));
     }
 
-    // Подписать хендлер на все msg_type (wildcard, num_supported_types == 0)
+    /// @brief Subscribe handler to all msg_types (wildcard).
     template<typename Func>
     void subscribe_wildcard(std::string_view name, Func&& cb) {
         const std::string n(name);
@@ -106,11 +98,11 @@ public:
         wildcards_.at(n)->connect(std::forward<Func>(cb));
     }
 
-    // Dispatch пакет всем подписчикам типа + wildcard
-    void emit(uint32_t                   msg_type,
-              std::shared_ptr<header_t>  hdr,
-              const endpoint_t*          ep,
-              PacketData                 data)
+    /// @brief Dispatch packet to all subscribers of msg_type and all wildcards.
+    void emit(uint32_t                  msg_type,
+              std::shared_ptr<header_t> hdr,
+              const endpoint_t*         ep,
+              PacketData                data)
     {
         {
             std::shared_lock lk(mu_);
@@ -130,6 +122,7 @@ public:
         if (auto it = channels_.find(t); it != channels_.end()) return it->second.size();
         return 0;
     }
+
     size_t wildcard_count() const { std::shared_lock lk(mu_); return wildcards_.size(); }
     void   clear()          { std::unique_lock lk(mu_); channels_.clear(); wildcards_.clear(); }
 
