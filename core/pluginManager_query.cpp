@@ -46,6 +46,15 @@ size_t PluginManager::get_enabled_connector_count() const {
                               [](const auto& i) { return i->enabled; }));
 }
 
+std::vector<std::string> PluginManager::get_enabled_handler_names() const {
+    std::shared_lock lock(rw_mutex_);
+    std::vector<std::string> names;
+    for (const auto& [name, info] : handlers_) {
+        if (info->enabled) names.push_back(name);
+    }
+    return names;
+}
+
 void PluginManager::list_plugins() const {
     std::shared_lock lock(rw_mutex_);
     LOG_INFO("=== Handlers ({}) ===", handlers_.size());

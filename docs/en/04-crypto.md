@@ -165,14 +165,15 @@ Only unencrypted (`cipher = "none"`) Ed25519 OpenSSH keys are supported.
 ```cpp
 // cm_identity.cpp
 static std::vector<uint8_t> base64_decode(std::string_view in) {
-    std::vector<uint8_t> out(in.size()); // upper bound: 3/4 of b64 length
-    size_t bin_len = 0;
-    if (sodium_base642bin(out.data(), out.size(),
-                          in.data(),  in.size(),
-                          nullptr,    &bin_len,
-                          nullptr,    sodium_base64_VARIANT_ORIGINAL) != 0)
-        return {};
-    out.resize(bin_len);
+    std::vector<uint8_t> out(in.size()); 
+    size_t bin_len;
+    
+    // Добавляем "\n\r " в параметр ignore (предпоследний аргумент)
+    if (sodium_base642bin(out.data(), out.size(), in.data(), in.size(),
+                          "\n\r ", &bin_len, nullptr,
+                          sodium_base64_VARIANT_ORIGINAL) != 0) {
+        return {}; 
+    } out.resize(bin_len);
     return out;
 }
 ```

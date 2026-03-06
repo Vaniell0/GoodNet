@@ -1,7 +1,6 @@
 // Мок-хендлер для unit-тестов PluginManager и ConnectionManager.
 // Компилируется как libmock_handler.so.
 // Экспортирует handler_init() через GN_EXPORT (HANDLER_PLUGIN макрос).
-
 #include <handler.hpp>   // sdk/cpp/handler.hpp → IHandler
 #include <plugin.hpp>    // sdk/cpp/plugin.hpp  → HANDLER_PLUGIN
 
@@ -17,12 +16,17 @@ public:
     }
 
     void handle_message(const header_t*   header,
-                         const endpoint_t* /*ep*/,
-                         const void*       /*payload*/,
-                         size_t            size) override {
+                        const endpoint_t* /*ep*/,
+                        const void*       /*payload*/,
+                        size_t            size) override {
         // В тестах достаточно не падать. Реальная логика не нужна.
         (void)header;
         (void)size;
+    }
+
+    void handle_connection_state(const char* /*uri*/,
+                                  conn_state_t /*state*/) override {
+        // no-op для тестов
     }
 
     void on_shutdown() override {

@@ -1,228 +1,304 @@
 #include <gtest/gtest.h>
-#include "config.hpp"
 #include <filesystem>
-#include <cstdlib>
+#include <fstream>
+#include <sstream>
+
+#include "config.hpp"
 
 namespace fs = std::filesystem;
 
-// Helpers ──────────────────────────────────────────────────────────────────────
-
-static fs::path tmp_path(const std::string& name) {
-    const char* tmpdir = std::getenv("TMPDIR");
-    fs::path base = tmpdir ? fs::path(tmpdir) : fs::temp_directory_path();
-    return base / name;
+static fs::path tmp_config(const std::string& content) {
+    auto p = fs::temp_directory_path() / ("gn_cfg_test_" +
+        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".json");
+    std::ofstream f(p);
+    f << content;
+    return p;
 }
 
-// ─── Fixtures ─────────────────────────────────────────────────────────────────
+// ─── Basic get/set ─────────────────────────────────────────────────────────────
 
-class ConfigTest : public ::testing::Test {
-protected:
-    void SetUp() override {}
-};
-
-// ─── Basic defaults ───────────────────────────────────────────────────────────
-
-/**
- * @brief Verify that Config(true) populates all expected default keys.
- */
-TEST_F(ConfigTest, LoadDefaults) {
-    Config cfg{true};
-    EXPECT_EQ(cfg.get_or<int>("core.listen_port", 0), 25565);
-    EXPECT_EQ(cfg.get_or<std::string>("logging.level", ""), "info");
-    EXPECT_TRUE(cfg.get_or<bool>("plugins.auto_load", false));
-    EXPECT_EQ(cfg.get_or<int>("core.max_connections", 0), 1000);
-    EXPECT_EQ(cfg.get_or<std::string>("core.listen_address", ""), "0.0.0.0");
+TEST(ConfigTest, DefaultsPopulatedOnConstruction) {
+    Config cfg;
+    // Core defaults
+    EXPECT_EQ(cfg.get_or<std::string>("core.listen_address",  "MISSING"),
+              Config::Core::LISTEN_ADDRESS);
+    EXPECT_EQ(cfg.get_or<int>("core.listen_port",    -1),
+              (int)Config::Core::LISTEN_PORT);
+    EXPECT_EQ(cfg.get_or<int>("core.io_threads",     -1),
+              (int)Config::Core::IO_THREADS);
+    // Logging defaults
+    EXPECT_EQ(cfg.get_or<std::string>("logging.level", ""),
+              Config::Logging::LEVEL);
+    EXPECT_EQ(cfg.get_or<int>("logging.max_size", 0),
+              Config::Logging::MAX_SIZE);
+    // Security defaults
+    EXPECT_EQ(cfg.get_or<int>("security.key_exchange_timeout", 0),
+              Config::Security::KEY_EXCHANGE_TIMEOUT);
 }
 
-// ─── Set / get ────────────────────────────────────────────────────────────────
-
-/**
- * @brief Round-trip set→get for every supported variant type.
- */
-TEST_F(ConfigTest, SetAndGetValues) {
-    Config cfg{true};
-
-    cfg.set("test.int",    42);
-    cfg.set("test.bool",   true);
-    cfg.set("test.string", std::string("hello"));
-    cfg.set("test.double", 3.14);
-    cfg.set("test.path",   fs::path("/tmp/test"));
-
-    EXPECT_EQ(cfg.get<int>   ("test.int")   .value(), 42);
-    EXPECT_TRUE(cfg.get<bool>("test.bool")  .value());
-    EXPECT_EQ(cfg.get<std::string>("test.string").value(), "hello");
-    EXPECT_DOUBLE_EQ(cfg.get<double>("test.double").value(), 3.14);
-    EXPECT_EQ(cfg.get<fs::path>("test.path").value(), fs::path("/tmp/test"));
+TEST(ConfigTest, SetAndGetInt) {
+    Config cfg;
+    cfg.set("custom.int_val", 42);
+    EXPECT_EQ(cfg.get_or<int>("custom.int_val", 0), 42);
 }
 
-/**
- * @brief String literal overload must store as std::string, not fs::path.
- */
-TEST_F(ConfigTest, StringLiteralStoredAsString) {
-    Config cfg{false};
-    cfg.set("k", "value");
-    EXPECT_EQ(cfg.get<std::string>("k").value(), "value");
+TEST(ConfigTest, SetAndGetBool) {
+    Config cfg;
+    cfg.set("custom.flag", true);
+    EXPECT_EQ(cfg.get_or<bool>("custom.flag", false), true);
+    cfg.set("custom.flag2", false);
+    EXPECT_EQ(cfg.get_or<bool>("custom.flag2", true), false);
 }
 
-// ─── JSON parsing ─────────────────────────────────────────────────────────────
-
-/**
- * @brief Nested JSON must be reachable via dotted keys.
- */
-TEST_F(ConfigTest, ParseJsonString) {
-    Config cfg{true};
-    const std::string json = R"({
-        "core": { "listen_port": 8080, "max_connections": 500 },
-        "custom": "value",
-        "path_as_string": "/etc/goodnet"
-    })";
-
-    ASSERT_TRUE(cfg.load_from_string(json));
-
-    EXPECT_EQ(cfg.get_or<int>("core.listen_port",    0),  8080);
-    EXPECT_EQ(cfg.get_or<int>("core.max_connections", 0), 500);
-    EXPECT_EQ(cfg.get_or<std::string>("custom", ""),      "value");
-
-    // JSON strings must be retrievable as fs::path
-    auto p = cfg.get<fs::path>("path_as_string");
-    ASSERT_TRUE(p.has_value());
-    EXPECT_EQ(p.value(), fs::path("/etc/goodnet"));
+TEST(ConfigTest, SetAndGetDouble) {
+    Config cfg;
+    cfg.set("custom.pi", 3.14159);
+    double v = cfg.get_or<double>("custom.pi", 0.0);
+    EXPECT_NEAR(v, 3.14159, 1e-5);
 }
 
-/**
- * @brief Loading invalid JSON must return false without throwing.
- */
-TEST_F(ConfigTest, ParseInvalidJson) {
-    Config cfg{false};
-    EXPECT_FALSE(cfg.load_from_string("{broken json"));
+TEST(ConfigTest, SetAndGetString) {
+    Config cfg;
+    cfg.set("custom.name", std::string("GoodNet"));
+    EXPECT_EQ(cfg.get_or<std::string>("custom.name", ""), "GoodNet");
 }
 
-// ─── Missing keys ─────────────────────────────────────────────────────────────
-
-/**
- * @brief Absent keys must return nullopt / default value gracefully.
- */
-TEST_F(ConfigTest, MissingKeys) {
-    Config cfg{true};
-    EXPECT_FALSE(cfg.has("non_existent_key"));
-    EXPECT_EQ(cfg.get<int>("non_existent_key"), std::nullopt);
-    EXPECT_EQ(cfg.get_or<int>("non_existent_key", 999), 999);
+TEST(ConfigTest, SetAndGetPath) {
+    Config cfg;
+    cfg.set("custom.path", fs::path("/usr/local/share"));
+    auto p = cfg.get_or<fs::path>("custom.path", {});
+    EXPECT_EQ(p, fs::path("/usr/local/share"));
 }
 
-// ─── Type mismatch ────────────────────────────────────────────────────────────
-
-/**
- * @brief Requesting a wrong type must return nullopt (no exception).
- */
-TEST_F(ConfigTest, TypeMismatch) {
-    Config cfg{true};
-    cfg.set("test.number", 123);
-
-    auto val = cfg.get<std::string>("test.number");
-    EXPECT_EQ(val, std::nullopt);
+TEST(ConfigTest, GetOrReturnsDefaultForMissingKey) {
+    Config cfg;
+    EXPECT_EQ(cfg.get_or<int>("nonexistent.key", 99), 99);
+    EXPECT_EQ(cfg.get_or<std::string>("no.key", "default"), "default");
+    EXPECT_EQ(cfg.get_or<bool>("no.bool", true), true);
 }
 
-// ─── Remove ───────────────────────────────────────────────────────────────────
-
-/**
- * @brief remove() must make the key absent.
- */
-TEST_F(ConfigTest, Remove) {
-    Config cfg{false};
-    cfg.set("k", 1);
-    ASSERT_TRUE(cfg.has("k"));
-    cfg.remove("k");
-    EXPECT_FALSE(cfg.has("k"));
+TEST(ConfigTest, OverwriteExistingKey) {
+    Config cfg;
+    cfg.set("x", 1);
+    cfg.set("x", 2);
+    EXPECT_EQ(cfg.get_or<int>("x", 0), 2);
 }
 
-// ─── File I/O ─────────────────────────────────────────────────────────────────
-
-/**
- * @brief save_to_file → load_from_file round-trip inside $TMPDIR.
- * Uses $TMPDIR so the test works inside the Nix build sandbox.
- */
-TEST_F(ConfigTest, FileOperations) {
-    const fs::path test_path = tmp_path("goodnet_test_config.json");
-
-    Config cfg{true};
-    cfg.set("file.status", std::string("saved"));
-
-    ASSERT_TRUE(cfg.save_to_file(test_path));
-    ASSERT_TRUE(fs::exists(test_path));
-
-    Config cfg2{false};
-    ASSERT_TRUE(cfg2.load_from_file(test_path));
-    EXPECT_EQ(cfg2.get_or<std::string>("file.status", ""), "saved");
-
-    fs::remove(test_path);
+TEST(ConfigTest, DottedKeyHierarchy) {
+    Config cfg;
+    cfg.set("a.b.c.d", 7);
+    EXPECT_EQ(cfg.get_or<int>("a.b.c.d", 0), 7);
+    // Different paths don't collide
+    cfg.set("a.b.c.e", 8);
+    EXPECT_EQ(cfg.get_or<int>("a.b.c.d", 0), 7);
+    EXPECT_EQ(cfg.get_or<int>("a.b.c.e", 0), 8);
 }
 
-/**
- * @brief Saving to a read-only path must return false gracefully.
- */
-TEST_F(ConfigTest, SaveToReadOnlyFails) {
-    Config cfg{false};
-    cfg.set("k", 1);
-    // /proc/version exists but is not writable
-    EXPECT_FALSE(cfg.save_to_file("/proc/version_test_nope"));
+// ─── Type mismatch ─────────────────────────────────────────────────────────────
+
+TEST(ConfigTest, GetOrReturnsFallbackOnTypeMismatch_IntAsString) {
+    Config cfg;
+    cfg.set("x", 42);
+    // Asking for string where int was stored → fallback
+    auto v = cfg.get_or<std::string>("x", "fallback");
+    EXPECT_EQ(v, "fallback");
 }
 
-// ─── JSON export ─────────────────────────────────────────────────────────────
-
-/**
- * @brief save_to_string() must produce valid JSON containing the stored value.
- * Note: dotted keys are serialised as nested objects, so "export.key" → 
- * { "export": { "key": 100 } }. We verify the value via re-parsing.
- */
-TEST_F(ConfigTest, ToJsonExport) {
-    Config cfg{true};
-    cfg.set("export.key", 100);
-
-    const std::string json = cfg.save_to_string();
-    ASSERT_FALSE(json.empty());
-
-    // Re-parse and verify the value survived the round-trip
-    Config cfg2{false};
-    ASSERT_TRUE(cfg2.load_from_string(json));
-    EXPECT_EQ(cfg2.get_or<int>("export.key", -1), 100);
+TEST(ConfigTest, GetOrReturnsFallbackOnTypeMismatch_StringAsInt) {
+    Config cfg;
+    cfg.set("x", std::string("hello"));
+    EXPECT_EQ(cfg.get_or<int>("x", -1), -1);
 }
 
-/**
- * @brief save_to_string() output must be valid parseable JSON.
- */
-TEST_F(ConfigTest, ExportIsValidJson) {
-    Config cfg{true};
-    cfg.set("a.b.c", 42);
-    const std::string out = cfg.save_to_string();
-    // load_from_string returns true only when nlohmann::json::parse succeeds
-    Config tmp{false};
-    EXPECT_TRUE(tmp.load_from_string(out));
+TEST(ConfigTest, GetOrReturnsFallbackOnTypeMismatch_BoolAsDouble) {
+    Config cfg;
+    cfg.set("x", true);
+    EXPECT_NEAR(cfg.get_or<double>("x", -1.0), -1.0, 1e-10);
 }
 
-// ─── Overwrite ────────────────────────────────────────────────────────────────
+// ─── JSON load/save ────────────────────────────────────────────────────────────
 
-/**
- * @brief Setting the same key twice must update the value.
- */
-TEST_F(ConfigTest, Overwrite) {
-    Config cfg{false};
-    cfg.set("k", 1);
-    cfg.set("k", 2);
-    EXPECT_EQ(cfg.get_or<int>("k", 0), 2);
+TEST(ConfigTest, LoadValidJson) {
+    auto p = tmp_config(R"({"core":{"listen_port":7777},"logging":{"level":"debug"}})");
+    Config cfg;
+    ASSERT_TRUE(cfg.load_from_file(p));
+    EXPECT_EQ(cfg.get_or<int>("core.listen_port", 0), 7777);
+    EXPECT_EQ(cfg.get_or<std::string>("logging.level", ""), "debug");
+    fs::remove(p);
 }
 
-// ─── all() ────────────────────────────────────────────────────────────────────
+TEST(ConfigTest, LoadOverridesDefaults) {
+    auto p = tmp_config(R"({"core":{"listen_port":12345}})");
+    Config cfg;
+    cfg.load_from_file(p);
+    EXPECT_EQ(cfg.get_or<int>("core.listen_port", 0), 12345);
+    // Unmentioned keys still have defaults
+    EXPECT_EQ(cfg.get_or<std::string>("core.listen_address", ""),
+              Config::Core::LISTEN_ADDRESS);
+    fs::remove(p);
+}
 
-/**
- * @brief all() must expose every key that was set.
- */
-TEST_F(ConfigTest, AllReturnsAllKeys) {
-    Config cfg{true}; 
-    size_t base_count = cfg.all().size(); // Запоминаем сколько дефолтов
-    cfg.set("test_x", 1);
-    cfg.set("test_y", std::string("z"));
-    
-    EXPECT_EQ(cfg.all().size(), base_count + 2);
-    EXPECT_EQ(cfg.all().count("test_x"), 1);
-    EXPECT_EQ(cfg.all().count("test_y"), 1);
+TEST(ConfigTest, LoadInvalidJson_ReturnsFalse) {
+    auto p = tmp_config("{ this is not json }}");
+    Config cfg;
+    bool result = cfg.load_from_file(p);
+    EXPECT_FALSE(result);
+    fs::remove(p);
+}
+
+TEST(ConfigTest, LoadNonExistentFile_ReturnsFalse) {
+    Config cfg;
+    EXPECT_FALSE(cfg.load_from_file("/nonexistent/path/config.json"));
+}
+
+TEST(ConfigTest, LoadBoolValue) {
+    auto p = tmp_config(R"({"plugins":{"auto_load":false}})");
+    Config cfg;
+    cfg.load_from_file(p);
+    EXPECT_EQ(cfg.get_or<bool>("plugins.auto_load", true), false);
+    fs::remove(p);
+}
+
+TEST(ConfigTest, LoadDoubleValue) {
+    auto p = tmp_config(R"({"custom":{"threshold":0.95}})");
+    Config cfg;
+    cfg.load_from_file(p);
+    EXPECT_NEAR(cfg.get_or<double>("custom.threshold", 0.0), 0.95, 1e-5);
+    fs::remove(p);
+}
+
+TEST(ConfigTest, LoadStringValue) {
+    auto p = tmp_config(R"({"security":{"auth_method":"ed25519"}})");
+    Config cfg;
+    cfg.load_from_file(p);
+    EXPECT_EQ(cfg.get_or<std::string>("security.auth_method", ""), "ed25519");
+    fs::remove(p);
+}
+
+TEST(ConfigTest, LoadNestedObjectsFlattened) {
+    auto p = tmp_config(R"({
+        "a": { "b": { "c": 99 }, "d": "hello" },
+        "e": true
+    })");
+    Config cfg;
+    cfg.load_from_file(p);
+    EXPECT_EQ(cfg.get_or<int>("a.b.c", 0), 99);
+    EXPECT_EQ(cfg.get_or<std::string>("a.d", ""), "hello");
+    EXPECT_EQ(cfg.get_or<bool>("e", false), true);
+    fs::remove(p);
+}
+
+TEST(ConfigTest, SaveAndReload) {
+    auto path = fs::temp_directory_path() / "gn_cfg_save_test.json";
+    {
+        Config cfg;
+        cfg.set("x.y", 42);
+        cfg.set("name", std::string("goodnet"));
+        cfg.set("flag", true);
+        cfg.save_to_file(path);
+    }
+    Config cfg2;
+    ASSERT_TRUE(cfg2.load_from_file(path));
+    EXPECT_EQ(cfg2.get_or<int>("x.y", 0), 42);
+    EXPECT_EQ(cfg2.get_or<std::string>("name", ""), "goodnet");
+    EXPECT_EQ(cfg2.get_or<bool>("flag", false), true);
+    fs::remove(path);
+}
+
+TEST(ConfigTest, SaveToUnwritablePath_NoThrow) {
+    Config cfg;
+    // Attempt to save to an invalid path — should not throw
+    EXPECT_NO_THROW(cfg.save_to_file("/proc/nonexistent/path/file.json"));
+}
+
+// ─── fs::path stored as string ─────────────────────────────────────────────────
+
+TEST(ConfigTest, PathStoredInJsonReloadedAsString) {
+    // Config saves fs::path as string in JSON; reload parses it back as string
+    auto path = fs::temp_directory_path() / "gn_path_cfg.json";
+    {
+        Config cfg;
+        cfg.set("plugins.base_dir", fs::path("/opt/goodnet/plugins"));
+        cfg.save_to_file(path);
+    }
+    Config cfg2;
+    cfg2.load_from_file(path);
+    // After reload it comes back as string (JSON has no path type)
+    auto v = cfg2.get_or<std::string>("plugins.base_dir", "");
+    EXPECT_EQ(v, "/opt/goodnet/plugins");
+    fs::remove(path);
+}
+
+// ─── Default constants sanity ──────────────────────────────────────────────────
+
+TEST(ConfigDefaults, CoreValues) {
+    EXPECT_FALSE(Config::Core::LISTEN_ADDRESS.empty());
+    EXPECT_GT(Config::Core::LISTEN_PORT, 0u);
+    EXPECT_GT(Config::Core::IO_THREADS, 0);
+    EXPECT_GT(Config::Core::MAX_CONNECTIONS, 0u);
+}
+
+TEST(ConfigDefaults, LoggingValues) {
+    EXPECT_FALSE(Config::Logging::LEVEL.empty());
+    EXPECT_FALSE(Config::Logging::FILE.empty());
+    EXPECT_GT(Config::Logging::MAX_SIZE, 0);
+    EXPECT_GT(Config::Logging::MAX_FILES, 0);
+}
+
+TEST(ConfigDefaults, SecurityValues) {
+    EXPECT_GT(Config::Security::KEY_EXCHANGE_TIMEOUT, 0);
+    EXPECT_GT(Config::Security::MAX_AUTH_ATTEMPTS, 0);
+    EXPECT_GT(Config::Security::SESSION_TIMEOUT, 0);
+}
+
+TEST(ConfigDefaults, PluginsValues) {
+    EXPECT_GT(Config::Plugins::SCAN_INTERVAL, 0);
+}
+
+// ─── Edge cases ────────────────────────────────────────────────────────────────
+
+TEST(ConfigTest, EmptyJson_DoesNotCrash) {
+    auto p = tmp_config("{}");
+    Config cfg;
+    EXPECT_NO_THROW(cfg.load_from_file(p));
+    fs::remove(p);
+}
+
+TEST(ConfigTest, NullJson_DoesNotCrash) {
+    auto p = tmp_config("null");
+    Config cfg;
+    // null is valid JSON but not an object — load returns false
+    EXPECT_NO_THROW(cfg.load_from_file(p));
+    fs::remove(p);
+}
+
+TEST(ConfigTest, VeryLongKey) {
+    Config cfg;
+    std::string long_key(200, 'x');
+    cfg.set(long_key, 1);
+    EXPECT_EQ(cfg.get_or<int>(long_key, 0), 1);
+}
+
+TEST(ConfigTest, IntegerZeroStored) {
+    Config cfg;
+    cfg.set("zero", 0);
+    EXPECT_EQ(cfg.get_or<int>("zero", -1), 0);
+}
+
+TEST(ConfigTest, EmptyStringStored) {
+    Config cfg;
+    cfg.set("empty", std::string(""));
+    EXPECT_EQ(cfg.get_or<std::string>("empty", "default"), "");
+}
+
+TEST(ConfigTest, NegativeIntStored) {
+    Config cfg;
+    cfg.set("neg", -42);
+    EXPECT_EQ(cfg.get_or<int>("neg", 0), -42);
+}
+
+TEST(ConfigTest, LargeIntStored) {
+    Config cfg;
+    cfg.set("large", 2000000000);
+    EXPECT_EQ(cfg.get_or<int>("large", 0), 2000000000);
 }

@@ -89,6 +89,7 @@ public:
     size_t get_enabled_handler_count()   const;
     size_t get_enabled_connector_count() const;
     void   list_plugins()                const;
+    std::vector<std::string> get_enabled_handler_names() const;
 
     bool unload_handler (std::string_view name);
     bool enable_handler (std::string_view name);

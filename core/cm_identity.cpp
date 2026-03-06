@@ -64,17 +64,15 @@ void NodeIdentity::load_or_gen_keypair(const fs::path& path,
 // ─── OpenSSH Ed25519 private key parser ───────────────────────────────────────
 
 static std::vector<uint8_t> base64_decode(std::string_view in) {
-    // Максимальный размер бинарных данных — 3/4 от строки
     std::vector<uint8_t> out(in.size()); 
     size_t bin_len;
     
-    // sodium_base64_VARIANT_ORIGINAL — это стандартный Base64 (как в SSH)
-    if (sodium_base642bin(out.data(), out.size(), in.data(), in.size(), 
-                          nullptr, &bin_len, nullptr, sodium_base64_VARIANT_ORIGINAL) != 0) {
+    // Добавляем "\n\r " в параметр ignore (предпоследний аргумент)
+    if (sodium_base642bin(out.data(), out.size(), in.data(), in.size(),
+                          "\n\r ", &bin_len, nullptr, 
+                          sodium_base64_VARIANT_ORIGINAL) != 0) {
         return {}; 
-    }
-    
-    out.resize(bin_len);
+    } out.resize(bin_len);
     return out;
 }
 
