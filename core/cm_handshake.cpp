@@ -6,20 +6,13 @@
 
 namespace gn {
 
-std::string bytes_to_hex(const uint8_t* data, size_t len);  // cm_identity.cpp
-
-// ─── Constructor / Destructor ─────────────────────────────────────────────────
+std::string bytes_to_hex(const uint8_t* data, size_t len);
 
 ConnectionManager::ConnectionManager(SignalBus& bus, NodeIdentity identity)
     : bus_(bus), identity_(std::move(identity))
 {}
 
 ConnectionManager::~ConnectionManager() = default;
-
-// ─── fill_host_api ────────────────────────────────────────────────────────────
-//
-// Заполняем host_api_t коллбэками.
-// Передаётся плагинам при их инициализации — единственный канал плагин↔ядро.
 
 void ConnectionManager::fill_host_api(host_api_t* api) {
     api->ctx              = this;
@@ -31,32 +24,23 @@ void ConnectionManager::fill_host_api(host_api_t* api) {
     api->verify_signature = s_verify;
 }
 
-// ─── register_connector ───────────────────────────────────────────────────────
-
 void ConnectionManager::register_connector(const std::string& scheme, connector_ops_t* ops) {
     std::unique_lock lock(connectors_mu_);
     connectors_[scheme] = ops;
     LOG_DEBUG("Connector '{}' registered", scheme);
 }
 
-// ─── register_handler ─────────────────────────────────────────────────────────
-//
-// Создаём канал bus[type][name] для каждого supported_type хендлера.
-// Wildcard (num_supported_types == 0) → subscribe_wildcard.
-
 void ConnectionManager::register_handler(handler_t* h) {
     if (!h || !h->name) return;
     const std::string name(h->name);
 
-    // Замыкание: вызывает C-коллбэк хендлера handle_message()
     auto make_cb = [h, name](std::string_view,
                               std::shared_ptr<header_t> hdr,
                               const endpoint_t*          ep,
                               PacketData                 data)
     {
         if (h->handle_message)
-            h->handle_message(h->user_data, hdr.get(), ep,
-                              data->data(), data->size());
+            h->handle_message(h->user_data, hdr.get(), ep, data->data(), data->size());
     };
 
     HandlerEntry entry; entry.name = name; entry.handler = h;
@@ -80,8 +64,6 @@ void ConnectionManager::register_handler(handler_t* h) {
 void ConnectionManager::set_scheme_priority(std::vector<std::string> p) {
     scheme_priority_ = std::move(p);
 }
-
-// ─── shutdown ─────────────────────────────────────────────────────────────────
 
 void ConnectionManager::shutdown() {
     shutting_down_.store(true, std::memory_order_relaxed);
@@ -108,8 +90,6 @@ void ConnectionManager::shutdown() {
     LOG_INFO("ConnectionManager: shutdown ({} connections closed)", to_close.size());
 }
 
-// ─── handle_connect ───────────────────────────────────────────────────────────
-
 conn_id_t ConnectionManager::handle_connect(const endpoint_t* ep) {
     if (shutting_down_.load(std::memory_order_relaxed)) return CONN_ID_INVALID;
 
@@ -120,10 +100,7 @@ conn_id_t ConnectionManager::handle_connect(const endpoint_t* ep) {
     rec.remote       = *ep;
     rec.state        = STATE_AUTH_PENDING;
     rec.is_localhost = is_localhost_address(ep->address);
-
-    // Предварительно генерируем эфемерный X25519 ключ
-    // (затирается в cm_session.cpp после ECDH)
-    rec.session = std::make_unique<SessionState>();
+    rec.session      = std::make_unique<SessionState>();
     crypto_box_keypair(rec.session->my_ephem_pk, rec.session->my_ephem_sk);
 
     {
@@ -142,17 +119,11 @@ conn_id_t ConnectionManager::handle_connect(const endpoint_t* ep) {
     return id;
 }
 
-// ─── send_auth ────────────────────────────────────────────────────────────────
-//
-// Отправляем MSG_TYPE_AUTH:
-//   user_pubkey || device_pubkey || sig(user_pk||device_pk||ephem_pk) || ephem_pk || schemes
-
 void ConnectionManager::send_auth(conn_id_t id) {
     auth_payload_t ap{};
     std::memcpy(ap.user_pubkey,   identity_.user_pubkey,   32);
     std::memcpy(ap.device_pubkey, identity_.device_pubkey, 32);
 
-    // Загружаем эфемерный pubkey из session
     {
         std::shared_lock lk(records_mu_);
         auto it = records_.find(id);
@@ -160,8 +131,6 @@ void ConnectionManager::send_auth(conn_id_t id) {
         std::memcpy(ap.ephem_pubkey, it->second.session->my_ephem_pk, 32);
     }
 
-    // Подпись охватывает user_pk || device_pk || ephem_pk (60 байт)
-    // Включение ephem_pk → защита от Replay Attack
     uint8_t to_sign[32 + 32 + 32];
     std::memcpy(to_sign,      identity_.user_pubkey,   32);
     std::memcpy(to_sign + 32, identity_.device_pubkey, 32);
@@ -171,15 +140,9 @@ void ConnectionManager::send_auth(conn_id_t id) {
                                   identity_.user_seckey);
 
     ap.set_schemes(local_schemes());
-
     send_frame(id, MSG_TYPE_AUTH, &ap, sizeof(auth_payload_t));
     LOG_DEBUG("send_auth #{}: ephem={}...", id, bytes_to_hex(ap.ephem_pubkey, 4));
 }
-
-// ─── process_auth ─────────────────────────────────────────────────────────────
-//
-// Принимаем и верифицируем MSG_TYPE_AUTH от пира.
-// После успешной проверки → вызываем derive_session для ECDH.
 
 bool ConnectionManager::process_auth(conn_id_t id, const uint8_t* payload, size_t size) {
     if (size < auth_payload_t::kBaseSize) {
@@ -188,29 +151,25 @@ bool ConnectionManager::process_auth(conn_id_t id, const uint8_t* payload, size_
     }
     const auto* ap = reinterpret_cast<const auth_payload_t*>(payload);
 
-    // Верифицируем Ed25519(user_pk, user_pk||device_pk||ephem_pk)
     uint8_t to_verify[32 + 32 + 32];
     std::memcpy(to_verify,      ap->user_pubkey,   32);
     std::memcpy(to_verify + 32, ap->device_pubkey, 32);
     std::memcpy(to_verify + 64, ap->ephem_pubkey,  32);
     if (crypto_sign_ed25519_verify_detached(ap->signature, to_verify, sizeof(to_verify),
                                              ap->user_pubkey) != 0) {
-        LOG_WARN("AUTH #{}: invalid signature (replay or tampered)", id);
+        LOG_WARN("AUTH #{}: invalid signature", id);
         return false;
     }
 
-    // Читаем схемы пира (только если пришёл расширенный формат)
     std::vector<std::string> peer_schemes;
     if (size >= auth_payload_t::kFullSize)
         peer_schemes = ap->get_schemes();
 
-    // Обновляем ConnectionRecord
     {
         std::unique_lock lk(records_mu_);
         auto it = records_.find(id);
         if (it == records_.end()) return false;
         auto& rec = it->second;
-
         std::memcpy(rec.peer_user_pubkey,   ap->user_pubkey,   32);
         std::memcpy(rec.peer_device_pubkey, ap->device_pubkey, 32);
         rec.peer_authenticated = true;
@@ -218,15 +177,12 @@ bool ConnectionManager::process_auth(conn_id_t id, const uint8_t* payload, size_
         rec.negotiated_scheme  = negotiate_scheme(rec);
     }
 
-    // ECDH → session_key
     if (!derive_session(id, ap->ephem_pubkey, ap->user_pubkey)) {
         LOG_ERROR("AUTH #{}: derive_session failed", id);
         return false;
     }
 
-    // Переход STATE_ESTABLISHED + уведомление хендлеров
-    std::string peer_hex;
-    std::string neg_scheme;
+    std::string peer_hex, neg_scheme;
     {
         std::unique_lock lk(records_mu_);
         auto it = records_.find(id);
@@ -240,11 +196,10 @@ bool ConnectionManager::process_auth(conn_id_t id, const uint8_t* payload, size_
         pk_index_[bytes_to_hex(ap->user_pubkey, 32)] = id;
     }
 
-    LOG_INFO("AUTH #{}: peer={}...  scheme='{}'{} → ESTABLISHED",
+    LOG_INFO("AUTH #{}: peer={}... scheme='{}'{} → ESTABLISHED",
              id, peer_hex, neg_scheme,
              records_[id].is_localhost ? " [no-encrypt]" : "");
 
-    // Уведомляем хендлеры об изменении состояния
     {
         std::shared_lock lk(handlers_mu_);
         const std::string uri = bytes_to_hex(ap->user_pubkey, 32);
@@ -256,30 +211,26 @@ bool ConnectionManager::process_auth(conn_id_t id, const uint8_t* payload, size_
     return true;
 }
 
-// ─── handle_disconnect ────────────────────────────────────────────────────────
-
 void ConnectionManager::handle_disconnect(conn_id_t id, int error) {
-    std::string uri_key, pk_key;
-    std::string peer_hex;
+    std::string uri_key, pk_key, peer_hex;
     {
         std::unique_lock lk(records_mu_);
         auto it = records_.find(id);
         if (it == records_.end()) return;
         const auto& rec = it->second;
-        uri_key  = std::string(rec.remote.address) + ":" + std::to_string(rec.remote.port);
+        uri_key = std::string(rec.remote.address) + ":" + std::to_string(rec.remote.port);
         if (rec.peer_authenticated) {
             pk_key   = bytes_to_hex(rec.peer_user_pubkey, 32);
             peer_hex = bytes_to_hex(rec.peer_user_pubkey, 4);
         }
-        LOG_INFO("Disconnect #{} {}:{} peer={}...  err={}",
+        LOG_INFO("Disconnect #{} {}:{} peer={}... err={}",
                  id, rec.remote.address, rec.remote.port,
                  peer_hex.empty() ? "(unauth)" : peer_hex, error);
         records_.erase(it);
     }
-    if (!uri_key.empty()) { std::unique_lock lk(uri_mu_);  uri_index_.erase(uri_key); }
-    if (!pk_key.empty())  { std::unique_lock lk(pk_mu_);   pk_index_.erase(pk_key);  }
+    if (!uri_key.empty()) { std::unique_lock lk(uri_mu_); uri_index_.erase(uri_key); }
+    if (!pk_key.empty())  { std::unique_lock lk(pk_mu_);  pk_index_.erase(pk_key);  }
 
-    // Уведомляем хендлеры
     {
         std::shared_lock lk(handlers_mu_);
         for (auto& [name, entry] : handler_entries_)
@@ -288,8 +239,6 @@ void ConnectionManager::handle_disconnect(conn_id_t id, int error) {
                                                   uri_key.c_str(), STATE_CLOSED);
     }
 }
-
-// ─── C-ABI адаптеры ───────────────────────────────────────────────────────────
 
 conn_id_t ConnectionManager::s_on_connect(void* ctx, const endpoint_t* ep) {
     return static_cast<ConnectionManager*>(ctx)->handle_connect(ep);
