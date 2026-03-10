@@ -127,7 +127,7 @@ PluginManager::verify_metadata(const fs::path& so_path) const {
     try {
         std::ifstream f(json_path);
         json data = json::parse(f);
-        auto& meta = data.at("meta");
+        [[maybe_unused]] auto& meta = data.at("meta");
 
         LOG_DEBUG("Verifying: {} v{}",
                   meta.at("name").get<std::string>(),

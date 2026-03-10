@@ -118,27 +118,20 @@ std::expected<void, std::string> PluginManager::load_plugin(const fs::path& path
 }
 
 void PluginManager::load_all_plugins() {
-    if (plugins_base_dir_.empty()) {
-        LOG_WARN("PluginManager: plugins_base_dir not set, skipping scan");
-        return;
-    }
+    if (plugins_base_dir_.empty()) return;
 
-    const std::array<fs::path, 2> subdirs = {
-        plugins_base_dir_ / "handlers",
-        plugins_base_dir_ / "connectors"
-    };
-
-    for (const auto& dir : subdirs) {
-        if (!fs::exists(dir)) {
-            LOG_DEBUG("Plugin dir not found: {}", dir.string());
-            continue;
-        }
-        for (const auto& entry : fs::directory_iterator(dir)) {
-            if (!entry.is_regular_file()) continue;
-            if (entry.path().extension() != DYNLIB_EXT) continue;
-            auto result = load_plugin(entry.path());
-            if (!result)
-                LOG_WARN("Skip '{}': {}", entry.path().filename().string(), result.error());
+    // Рекурсивный обход всех файлов в папке plugins
+    for (const auto& entry : fs::recursive_directory_iterator(plugins_base_dir_)) {
+        if (!entry.is_regular_file()) continue;
+        
+        auto path = entry.path();
+        // Загружаем только бинарники, игнорируем .json и прочее
+        if (path.extension() == DYNLIB_EXT) {
+            auto result = load_plugin(path);
+            if (!result) {
+                // Если это не плагин (нет нужных символов) - просто идем дальше
+                LOG_DEBUG("File {} is not a valid plugin: {}", path.filename().string(), result.error());
+            }
         }
     }
 }

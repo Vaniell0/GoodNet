@@ -205,7 +205,8 @@ public:
 
     size_t                      connection_count()       const;
     std::vector<std::string>    get_active_uris()        const;
-    std::optional<conn_state_t> get_state(conn_id_t id) const;
+    std::optional<conn_state_t> get_state(conn_id_t id)  const;
+    const std::atomic<size_t>& get_pending_bytes() const { return pending_bytes_; }
     std::optional<std::string>  get_negotiated_scheme(conn_id_t id) const;
     const NodeIdentity&         identity()               const { return identity_; }
 
@@ -214,6 +215,11 @@ private:
     void      handle_disconnect(conn_id_t id, int error);
     void      send_auth        (conn_id_t id);
     bool      process_auth     (conn_id_t id, const uint8_t* payload, size_t size);
+    
+    // ─── MEMORY GUARD + CHUNKING ─────────────────────────────────────
+    std::atomic<size_t> pending_bytes_{0};
+    static constexpr size_t MAX_IN_FLIGHT_BYTES = 512UL * 1024 * 1024;
+    static constexpr size_t CHUNK_SIZE = 1UL * 1024 * 1024;
 
     bool derive_session(conn_id_t id,
                         const uint8_t peer_ephem_pk[32],

@@ -20,6 +20,7 @@ find_package(GTest QUIET)
 
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(SODIUM REQUIRED libsodium)
+pkg_check_modules(ZSTD REQUIRED libzstd)
 
 # ─── PCH ─────────────────────────────────────────────────────────────────────
 include(cmake/pch.cmake)
@@ -76,9 +77,10 @@ target_include_directories(goodnet_core
 )
 
 target_link_libraries(goodnet_core
-    PUBLIC  spdlog::spdlog fmt::fmt
-    PRIVATE nlohmann_json::nlohmann_json
+    PUBLIC  spdlog::spdlog
+    PRIVATE nlohmann_json::nlohmann_json fmt::fmt
             Boost::system
+            ${ZSTD_LIBRARIES}
             ${SODIUM_LIBRARIES}
 )
 

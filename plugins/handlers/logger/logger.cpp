@@ -1,70 +1,111 @@
+/// @file plugins/logger/logger.cpp
+/// @brief Built-in handler that LOG_INFO-logs every packet passing through the core.
+///
+/// What it logs (one line per packet, level INFO):
+///   [MsgLogger] <direction> type=<hex> id=<conn_id> from=<addr>:<port>
+///               size=<payload_bytes> ts=<unix_us> pk=<peer_pubkey_prefix>
+///
+/// Subscribes as a wildcard listener — receives ALL message types without
+/// touching the payload bytes themselves (no copy, header pointer only).
+
 #include <handler.hpp>
 #include <plugin.hpp>
 #include <logger.hpp>
+#include <fmt/format.h>
 
-#include <fstream>
-#include <filesystem>
-#include <mutex>
 #include <atomic>
+#include <chrono>
+#include <cstdint>
+#include <cstdio>
 
-namespace fs = std::filesystem;
+namespace gn {
 
-class RawBundleLogger : public gn::IHandler {
+class MsgLogger final : public IHandler {
 public:
-    const char* get_plugin_name() const override { return "BundleLogger"; }
+    // ── IHandler interface ────────────────────────────────────────────────────
+
+    const char* get_plugin_name() const override { return "MsgLogger"; }
 
     void on_init() override {
-        if (!fs::exists("./msgs")) fs::create_directories("./msgs");
-        open_new_bundle();
-        set_supported_types({0}); 
-        LOG_INFO("Bundle Logger initialized. Max file size: 100MB");
+        // Wildcard: receive every message type.
+        // MSG_TYPE_AUTH (1) is included so key-exchange can be audited.
+        set_supported_types({0, 1, 2, 100, 200});
+        start_ts_ = now_us();
+        LOG_INFO("[MsgLogger] started — logging all packet types");
     }
 
-    void handle_message(const header_t* header, const endpoint_t* endpoint, 
-                        const void* payload, size_t payload_size) override {
-        std::lock_guard<std::mutex> lock(file_mtx_);
+    void handle_message(const header_t*   hdr,
+                        const endpoint_t* ep,
+                        const void*       /*payload*/,
+                        size_t            payload_size) override
+    {
+        if (!hdr) return;
 
-        // Проверяем размер перед записью (100 MB = 104,857,600 байт)
-        if (current_size_ > 100 * 1024 * 1024) {
-            open_new_bundle();
+        const uint64_t count = ++count_;
+
+        // Peer address string
+        const char* addr = (ep && ep->address[0]) ? ep->address : "?";
+        const uint16_t port = ep ? ep->port : 0;
+
+        // Peer pubkey prefix (first 4 bytes → 8 hex chars) — enough to identify
+        char pk_prefix[9] = "????????";
+        if (ep) {
+            std::snprintf(pk_prefix, sizeof(pk_prefix),
+                          "%02x%02x%02x%02x",
+                          ep->pubkey[0], ep->pubkey[1],
+                          ep->pubkey[2], ep->pubkey[3]);
         }
 
-        if (out_file_.is_open()) {
-            // Пишем метаданные, чтобы потом можно было распарсить
-            out_file_.write(reinterpret_cast<const char*>(header), sizeof(header_t));
-            out_file_.write(reinterpret_cast<const char*>(payload), payload_size);
-            
-            current_size_ += (sizeof(header_t) + payload_size);
-            total_count_++;
-        }
+        // Human-readable type name for common types
+        const char* type_name = type_str(hdr->payload_type);
+
+        LOG_INFO("[MsgLogger] #{} type={} ({}) from={}:{} size={} ts={} pk={}...",
+                 count,
+                 hdr->payload_type, type_name,
+                 addr, port,
+                 payload_size,
+                 hdr->timestamp,
+                 pk_prefix);
     }
 
     void on_shutdown() override {
-        if (out_file_.is_open()) out_file_.close();
-        LOG_INFO("Bundle Logger stopped. Total messages captured: {}", total_count_.load());
+        const uint64_t elapsed_ms = (now_us() - start_ts_) / 1000;
+        LOG_INFO("[MsgLogger] stopped — {} packets logged in {} ms",
+                 count_.load(), elapsed_ms);
+    }
+
+    // ── Factory for embedded use (no .so) ────────────────────────────────────
+
+    /// @brief Create an instance without going through the plugin system.
+    ///        Call node.register_handler(MsgLogger::create()) to embed.
+    static std::unique_ptr<MsgLogger> create() {
+        return std::make_unique<MsgLogger>();
     }
 
 private:
-    void open_new_bundle() {
-        if (out_file_.is_open()) out_file_.close();
-        
-        // Используем микросекунды для действительно уникальных имен
-        auto now = std::chrono::high_resolution_clock::now();
-        auto us = std::chrono::duration_cast<std::chrono::microseconds>(now.time_since_epoch()).count();
-        
-        std::string filename = fmt::format("./msgs/bundle_{}.bin", us);
-        
-        // ios::app гарантирует, что мы пишем в конец и не затираем данные
-        out_file_.open(filename, std::ios::binary | std::ios::out | std::ios::app);
-        current_size_ = 0;
-        
-        LOG_INFO("Opened new bundle file: {}", filename);
+    static const char* type_str(uint32_t t) noexcept {
+        switch (t) {
+            case 0:   return "SYSTEM";
+            case 1:   return "AUTH";
+            case 2:   return "KEY_EXCHANGE";
+            case 3:   return "HEARTBEAT";
+            case 100: return "CHAT";
+            case 200: return "FILE";
+            default:  return "USER";
+        }
     }
 
-    std::ofstream out_file_;
-    std::mutex file_mtx_;
-    size_t current_size_ = 0;
-    std::atomic<uint64_t> total_count_{0};
+    static uint64_t now_us() {
+        using namespace std::chrono;
+        return (uint64_t)duration_cast<microseconds>(
+            steady_clock::now().time_since_epoch()).count();
+    }
+
+    std::atomic<uint64_t> count_{0};
+    uint64_t              start_ts_{0};
 };
 
-HANDLER_PLUGIN(RawBundleLogger)
+} // namespace gn
+
+// ── Plugin export (for .so build) ─────────────────────────────────────────────
+HANDLER_PLUGIN(gn::MsgLogger)

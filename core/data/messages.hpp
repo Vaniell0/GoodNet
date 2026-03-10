@@ -10,8 +10,8 @@
 //   • JsonData    — расширяемые сообщения (CHAT, FILE metadata)
 //   • Все структуры #pragma pack(push,1) — гарантируют wire-совместимость
 
-#include "../../sdk/cpp/data.hpp"
-#include "../../sdk/types.h"
+#include "../sdk/types.h"
+#include "data.hpp"
 #include <cstdint>
 #include <string>
 
