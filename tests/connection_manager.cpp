@@ -524,10 +524,20 @@ TEST(AuthPayloadTest, EmptySchemesProducesWildcard) {
 }
 
 TEST(AuthPayloadTest, SizeAssert) {
-    // The static_assert in the header ensures this:
-    EXPECT_EQ(sizeof(auth_payload_t), auth_payload_t::kFullSize);
-    EXPECT_EQ(auth_payload_t::kBaseSize, 160u);
-    EXPECT_EQ(auth_payload_t::kFullSize, 289u);
+    using gn::msg::AuthPayload;
+    
+    // Проверка базовой части (до схем)
+    EXPECT_EQ(AuthPayload::kBaseSize, 160u);
+    
+    // Проверка блока схем (1 + 8 * 16)
+    EXPECT_EQ(AuthPayload::kSchemeBlock, 129u);
+    
+    // Проверка мета-данных (2 * uint32)
+    EXPECT_EQ(sizeof(gn::msg::CoreMeta), 8u);
+    
+    // Итоговый размер: 160 + 129 + 8 = 297
+    EXPECT_EQ(sizeof(AuthPayload), 297u);
+    EXPECT_EQ(AuthPayload::kFullSize, 297u);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

@@ -1,4 +1,4 @@
-# GoodNet — Documentation
+# GoodNet — Documentation(УСТАРЕЛ)
 
 > Version: **0.1.0-alpha** · C++23 · Nix Flakes · libsodium · Boost.Asio
 

@@ -7,7 +7,6 @@
 // do_connect() — всегда возвращает -1 (не поддерживается в моке).
 // Используется только для тестирования загрузки и поиска коннектора по схеме.
 #include <connector.hpp>  // sdk/cpp/connector.hpp → IConnector
-#include <plugin.hpp>     // sdk/cpp/plugin.hpp    → CONNECTOR_PLUGIN
 #include <cstring>
 
 class MockConnector : public gn::IConnector {

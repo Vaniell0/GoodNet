@@ -15,6 +15,7 @@ option(BUILD_TESTING "Build the testing suite" OFF)
 find_package(Boost         REQUIRED COMPONENTS system filesystem)
 find_package(nlohmann_json REQUIRED)
 find_package(spdlog        REQUIRED)
+find_package(ftxui         REQUIRED)
 find_package(fmt           REQUIRED)
 find_package(GTest QUIET)
 
@@ -44,16 +45,22 @@ target_include_directories(goodnet_sdk INTERFACE
 # Плагин через dlopen(RTLD_GLOBAL) видит тот же Logger что и ядро.
 
 add_library(goodnet_core SHARED
+    src/capi.cpp
+    src/core.cpp
+
     src/config.cpp
     src/logger.cpp
     src/signals.cpp
+
     core/pluginManager_core.cpp
     core/pluginManager_query.cpp
+
     core/cm_send.cpp
     core/cm_session.cpp
     core/cm_identity.cpp
     core/cm_dispatch.cpp
     core/cm_handshake.cpp
+
     core/data/machine_id.cpp
 )
 
@@ -94,7 +101,11 @@ apply_pch(goodnet_core)
 # ─── 3. Executable ────────────────────────────────────────────────────────────
 
 add_executable(goodnet src/main.cpp)
-target_link_libraries(goodnet PRIVATE goodnet_core)
+target_include_directories(goodnet PRIVATE ${CMAKE_SOURCE_DIR}/cli)
+target_link_libraries(goodnet PRIVATE goodnet_core
+    ${SODIUM_LIBRARIES}
+    boost_program_options
+)
 target_compile_definitions(goodnet PRIVATE
     GOODNET_PROJECT_ROOT="${CMAKE_SOURCE_DIR}/"
 )
@@ -144,6 +155,7 @@ if(BUILD_TESTING AND GTest_FOUND)
     target_link_libraries(mock_connector PRIVATE goodnet_core)
 
     add_executable(unit_tests
+        tests/core.cpp
         tests/conf.cpp
         tests/plugins.cpp
         tests/connection_manager.cpp

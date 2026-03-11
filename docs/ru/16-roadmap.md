@@ -27,4 +27,4 @@
 
 ---
 
-*← [15 — Безопасность](15-security.md) · [README →](README.md)*
+*← [15 — Безопасность](15-security.md) · [](17-core-api.md)*

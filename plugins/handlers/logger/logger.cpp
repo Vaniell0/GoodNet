@@ -9,7 +9,6 @@
 /// touching the payload bytes themselves (no copy, header pointer only).
 
 #include <handler.hpp>
-#include <plugin.hpp>
 #include <logger.hpp>
 #include <fmt/format.h>
 

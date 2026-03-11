@@ -1,12 +1,5 @@
 #pragma once
 
-/// @file include/signals.hpp
-/// @brief Async signal bus with per-channel strands.
-///
-/// Tree: bus[msg_type][handler_name] → HandlerPacketSignal
-/// Wildcard subscribers receive all msg_types.
-/// Each channel runs on a dedicated strand — handlers never block each other.
-
 #include <string_view>
 #include <vector>
 #include <functional>
@@ -22,26 +15,57 @@ namespace gn {
 
 using PacketData = std::shared_ptr<std::vector<uint8_t>>;
 
-class SignalBase {
-public:
-    explicit SignalBase(boost::asio::io_context& ioc);
-    virtual ~SignalBase();
+// --- 1. PIPELINE (Для пакетов, синхронно, быстро) ---
 
-protected:
-    void post_to_strand(std::function<void()> task);
+using HandlerPacketFn = std::function<
+    propagation_t(std::string_view handler_name,
+                  std::shared_ptr<header_t> hdr,
+                  const endpoint_t* ep,
+                  PacketData data)>;
+
+class PipelineSignal {
+public:
+    explicit PipelineSignal() 
+        : handlers_ptr_(std::make_shared<const std::vector<Entry>>()) {}
+
+    void connect(uint8_t priority, std::string_view name, HandlerPacketFn fn);
+    void disconnect(std::string_view name);
+
+    struct EmitResult {
+        propagation_t result = PROPAGATION_CONTINUE;
+        std::string consumed_by;
+    };
+
+    EmitResult emit(std::shared_ptr<header_t> hdr, const endpoint_t* ep, PacketData data) const;
 
 private:
-    struct Impl;
-    std::unique_ptr<Impl> impl_; // PIMPL для скрытия boost::asio::strand
+    struct Entry {
+        uint8_t priority;
+        std::string name;
+        HandlerPacketFn fn;
+    };
+    mutable std::shared_mutex mu_;
+    std::shared_ptr<const std::vector<Entry>> handlers_ptr_;
 };
 
-/// @brief Thread-safe signal with strand-serialized dispatch.
+// --- 2. EVENTS (Для уведомлений, асинхронно, через strand) ---
+
+class EventSignalBase {
+public:
+    explicit EventSignalBase(boost::asio::io_context& ioc);
+    virtual ~EventSignalBase();
+protected:
+    bool try_post_to_strand(std::function<void()> task);
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
 template<typename... Args>
-class Signal : public SignalBase {
+class EventSignal : public EventSignalBase {
 public:
     using Handler = std::function<void(Args...)>;
-
-    explicit Signal(boost::asio::io_context& ioc) : SignalBase(ioc) {}
+    explicit EventSignal(boost::asio::io_context& ioc) : EventSignalBase(ioc) {}
 
     void connect(Handler h) {
         std::lock_guard lock(mu_);
@@ -49,65 +73,43 @@ public:
     }
 
     void emit(Args... args) {
-        std::vector<Handler> snap;
-        {
-            std::lock_guard lock(mu_);
-            snap = handlers_;
-        }
+        std::unique_lock lock(mu_);
+        auto snap = handlers_;
+        lock.unlock();
+
         for (auto& h : snap) {
-            // Передаем аргументы по значению в лямбду
-            post_to_strand([h, args...]() mutable {
+            try_post_to_strand([h, args...]() mutable {
                 try { h(args...); } catch (...) {}
             });
         }
     }
-
-    void clear() { std::lock_guard lock(mu_); handlers_.clear(); }
-
 private:
     mutable std::mutex mu_;
     std::vector<Handler> handlers_;
 };
 
-/// @brief Signal type for packet handlers: (handler_name, header, endpoint, payload).
-using HandlerPacketSignal = Signal<
-    std::string_view,
-    std::shared_ptr<header_t>,
-    const endpoint_t*,
-    PacketData
->;
+// --- 3. BUS (Управляющий центр) ---
 
-/// @brief Multi-channel signal bus keyed by msg_type and handler name.
 class SignalBus {
 public:
     explicit SignalBus(boost::asio::io_context& ioc);
-    ~SignalBus();
 
-    void subscribe(uint32_t msg_type, std::string_view name, HandlerPacketSignal::Handler cb);
-    void subscribe_wildcard(std::string_view name, HandlerPacketSignal::Handler cb);
-    
-    void emit(uint32_t msg_type, std::shared_ptr<header_t> hdr, const endpoint_t* ep, PacketData data);
+    // Подписка на пакеты
+    void subscribe(uint32_t msg_type, std::string_view name, HandlerPacketFn cb, uint8_t prio = 128);
+    void subscribe_wildcard(std::string_view name, HandlerPacketFn cb, uint8_t prio = 128);
 
-    void clear();
+    // Диспетчеризация пакета
+    PipelineSignal::EmitResult dispatch_packet(uint32_t msg_type, std::shared_ptr<header_t> hdr, 
+                                              const endpoint_t* ep, PacketData data);
 
-    size_t subscriber_count(uint32_t t) const {
-        std::shared_lock lk(mu_);
-        auto it = channels_.find(t);
-        return (it != channels_.end()) ? it->second.size() : 0;
-    }
-
-    size_t wildcard_count() const { 
-        std::shared_lock lk(mu_); 
-        return wildcards_.size(); 
-    }
+    // Сигналы событий (публичные поля для прямого доступа)
+    EventSignal<std::string> on_log;
+    EventSignal<uint32_t /*conn_id*/, bool /*connected*/> on_connection_state;
 
 private:
-    boost::asio::io_context& ioc_;
     mutable std::shared_mutex mu_;
-    
-    using SignalMap = std::unordered_map<std::string, std::unique_ptr<HandlerPacketSignal>>;
-    std::unordered_map<uint32_t, SignalMap> channels_;
-    SignalMap wildcards_;
+    std::unordered_map<uint32_t, std::unique_ptr<PipelineSignal>> channels_;
+    PipelineSignal wildcards_;
 };
 
 } // namespace gn

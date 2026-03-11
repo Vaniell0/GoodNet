@@ -5,8 +5,6 @@
 namespace gn {
 
 // ─── handle_data ─────────────────────────────────────────────────────────────
-// TCP reassembly: accumulate bytes, extract complete packets.
-// Wire: header_t (fixed) | payload (header.payload_len bytes)
 
 void ConnectionManager::handle_data(conn_id_t id, const void* raw, size_t size) {
     if (shutting_down_.load(std::memory_order_relaxed)) return;
@@ -21,17 +19,14 @@ void ConnectionManager::handle_data(conn_id_t id, const void* raw, size_t size) 
 
     while (rec.recv_buf.size() >= sizeof(header_t)) {
         const auto* hdr = reinterpret_cast<const header_t*>(rec.recv_buf.data());
-        LOG_DEBUG("Incoming packet type={} from #{}", hdr->payload_type, id);
 
         if (hdr->magic != GNET_MAGIC) {
             LOG_WARN("handle_data #{}: bad magic 0x{:08X}, dropping", id, hdr->magic);
-            rec.recv_buf.clear();
-            break;
+            rec.recv_buf.clear(); break;
         }
         if (hdr->proto_ver != GNET_PROTO_VER) {
             LOG_WARN("handle_data #{}: bad proto_ver {}", id, hdr->proto_ver);
-            rec.recv_buf.clear();
-            break;
+            rec.recv_buf.clear(); break;
         }
 
         const size_t total = sizeof(header_t) + hdr->payload_len;
@@ -43,7 +38,7 @@ void ConnectionManager::handle_data(conn_id_t id, const void* raw, size_t size) 
                            rec.recv_buf.begin() + static_cast<ptrdiff_t>(total));
 
         const auto* phdr    = reinterpret_cast<const header_t*>(pkt.data());
-        const auto* payload = pkt.data() + sizeof(header_t);
+        const uint8_t* payload = pkt.data() + sizeof(header_t);
         const size_t plen   = phdr->payload_len;
 
         lock.unlock();
@@ -56,20 +51,19 @@ void ConnectionManager::handle_data(conn_id_t id, const void* raw, size_t size) 
 }
 
 // ─── dispatch_packet ─────────────────────────────────────────────────────────
-// AUTH → process_auth (plain, pre-session)
-// Pre-auth non-AUTH → drop (flood protection)
-// ESTABLISHED localhost → plain dispatch
-// ESTABLISHED remote   → decrypt → dispatch
 
 void ConnectionManager::dispatch_packet(conn_id_t id, const header_t* hdr,
                                          const uint8_t* payload, size_t plen) {
     if (hdr->payload_type == MSG_TYPE_AUTH) {
-        process_auth(id, payload, plen);
+        const bool ok = process_auth(id, payload, plen);
+        if (ok)   stats_.auth_ok  .fetch_add(1, std::memory_order_relaxed);
+        else      stats_.auth_fail.fetch_add(1, std::memory_order_relaxed);
         return;
     }
 
     endpoint_t remote{};
     bool       is_localhost = false;
+    std::string affinity_hint;
     std::vector<uint8_t> plaintext;
 
     {
@@ -84,8 +78,10 @@ void ConnectionManager::dispatch_packet(conn_id_t id, const header_t* hdr,
             return;
         }
 
-        remote       = rec.remote;
-        is_localhost = rec.is_localhost;
+        remote         = rec.remote;
+        remote.peer_id = id;          // lets handlers call send_response(ep->peer_id)
+        is_localhost   = rec.is_localhost;
+        affinity_hint  = rec.affinity_plugin;
 
         if (is_localhost || !rec.session) {
             plaintext.assign(payload, payload + plen);
@@ -94,6 +90,7 @@ void ConnectionManager::dispatch_packet(conn_id_t id, const header_t* hdr,
             if (plaintext.empty()) {
                 LOG_WARN("dispatch #{}: decrypt failed (type={}), dropping",
                          id, hdr->payload_type);
+                stats_.decrypt_fail.fetch_add(1, std::memory_order_relaxed);
                 return;
             }
         } else {
@@ -102,9 +99,39 @@ void ConnectionManager::dispatch_packet(conn_id_t id, const header_t* hdr,
         }
     }
 
+    stats_.on_rx(plen);
+
     auto hdr_ptr  = std::make_shared<header_t>(*hdr);
     auto data_ptr = std::make_shared<std::vector<uint8_t>>(std::move(plaintext));
-    bus_.emit(hdr->payload_type, hdr_ptr, &remote, data_ptr);
+
+    // Pipeline dispatch — replaces old bus_.emit()
+    const auto result = bus_.dispatch_packet(
+        hdr->payload_type, hdr_ptr, &remote, data_ptr);
+
+    // Session affinity: pin on first CONSUMED
+    if (result.result == PROPAGATION_CONSUMED && affinity_hint.empty()) {
+        std::unique_lock lk(records_mu_);
+        if (auto it = records_.find(id); it != records_.end())
+            it->second.affinity_plugin = result.consumed_by;
+        LOG_DEBUG("dispatch #{}: affinity pinned → '{}'", id, result.consumed_by);
+        stats_.consumed.fetch_add(1, std::memory_order_relaxed);
+    } else if (result.result == PROPAGATION_REJECT) {
+        LOG_WARN("dispatch #{}: REJECTED by '{}' (type={})",
+                 id, result.consumed_by, hdr->payload_type);
+        stats_.rejected.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+// ─── send_on_conn ─────────────────────────────────────────────────────────────
+// Used by host_api_t::send_response — direct reply without URI lookup.
+
+void ConnectionManager::send_on_conn(conn_id_t id, uint32_t msg_type,
+                                      const void* data, size_t size) {
+    {
+        std::shared_lock lk(records_mu_);
+        if (records_.find(id) == records_.end()) return;
+    }
+    send_frame(id, msg_type, data, size);
 }
 
 } // namespace gn

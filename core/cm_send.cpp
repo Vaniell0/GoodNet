@@ -160,7 +160,12 @@ void ConnectionManager::send(const char* uri, uint32_t msg_type,
     {
         std::shared_lock lk(records_mu_);
         auto it = records_.find(conn_id);
-        if (it == records_.end() || it->second.state != STATE_ESTABLISHED) return;
+        if (it == records_.end()) return;
+
+        // РАЗРЕШАЕМ системные сообщения (тип 0 - Handshake, AUTH и т.д.),
+        // даже если статус еще не ESTABLISHED
+        bool is_system = (msg_type == 0 || msg_type == 1 /* MSG_TYPE_AUTH */);
+        if (it->second.state != STATE_ESTABLISHED && !is_system) return;
     }
 
     // Memory Guard + Chunking (как раньше)
