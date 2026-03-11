@@ -9,7 +9,6 @@
 #include <vector>
 
 #include <connector.hpp>
-#include <plugin.hpp>
 #include <logger.hpp>
 
 using boost::asio::ip::tcp;

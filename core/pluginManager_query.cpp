@@ -46,6 +46,15 @@ size_t PluginManager::get_enabled_connector_count() const {
                               [](const auto& i) { return i->enabled; }));
 }
 
+std::vector<std::string> PluginManager::get_enabled_handler_names() const {
+    std::shared_lock lock(rw_mutex_);
+    std::vector<std::string> names;
+    for (const auto& [name, info] : handlers_) {
+        if (info->enabled) names.push_back(name);
+    }
+    return names;
+}
+
 void PluginManager::list_plugins() const {
     std::shared_lock lock(rw_mutex_);
     LOG_INFO("=== Handlers ({}) ===", handlers_.size());
@@ -118,7 +127,7 @@ PluginManager::verify_metadata(const fs::path& so_path) const {
     try {
         std::ifstream f(json_path);
         json data = json::parse(f);
-        auto& meta = data.at("meta");
+        [[maybe_unused]] auto& meta = data.at("meta");
 
         LOG_DEBUG("Verifying: {} v{}",
                   meta.at("name").get<std::string>(),

@@ -16,18 +16,33 @@
 | Утечка ephemeral ключей | `sodium_memzero` сразу после `derive_session()` |
 | Утечка session_key | `sodium_memzero` в `~SessionState()` |
 | Pre-auth flood | Пакеты до STATE_ESTABLISHED отбрасываются (кроме AUTH) |
+| OOM из очереди отправки | Backpressure: `pending_bytes > 512 МБ` → drop + `stats_.dropped_bp` |
 | Символьные конфликты между плагинами | `RTLD_LOCAL` изолирует каждый `.so` |
+| Символьный конфликт имён хендлеров | `PROPAGATION_REJECT` + `stats_.rejected` |
+
+---
+
+## Примитивы шифрования
+
+GoodNet использует `crypto_secretbox_easy` из libsodium — это **XSalsa20-Poly1305** (не ChaCha20). XSalsa20 использует 192-битный nonce вместо 96-битного у ChaCha20, что устраняет риск коллизии при случайной генерации nonce. GoodNet использует монотонный счётчик (`uint64_t`), поэтому nonce никогда не повторяется в рамках сессии.
+
+```
+XSalsa20-Poly1305 (crypto_secretbox_easy):
+  nonce: 24 байта (8 = uint64_t LE + 16 нулей)
+  MAC:   16 байт (Poly1305)
+  ключ:  32 байта (session_key из ECDH+BLAKE2b-256)
+```
 
 ---
 
 ## Localhost-оптимизация: безопасна ли?
 
-Для `127.x.x.x` / `::1` крипто пропускается. Обоснование:
+Для `127.x.x.x` / `::1` крипто и Zstd пропускаются. Обоснование:
 - AUTH всё равно выполняется — пир идентифицирован
 - Localhost-трафик не покидает machine — шифрование бессмысленно
 - Производительность IPC критична для некоторых применений
 
-Не используйте localhost-режим для трафика, который теоретически может быть перехвачен (container-to-container без изоляции сети).
+Не используйте localhost-режим для трафика, который может быть перехвачен (container-to-container без изоляции сети).
 
 ---
 
@@ -43,20 +58,23 @@
 
 ### Нет rate limiting в ядре
 
-Защита от DoS реализуется на уровне хендлера. Рекомендуемая схема:
+Защита от DoS реализуется на уровне хендлера:
 
 ```cpp
-// В обработчике AUTH/connect:
-if (++auth_attempts[remote_ip] > Config::Security::MAX_AUTH_ATTEMPTS)
-    disconnect(id);  // api->on_disconnect(...)
-
-if (auth_timer.elapsed() > Config::Security::KEY_EXCHANGE_TIMEOUT)
-    disconnect(id);
+propagation_t on_result(const header_t*, uint32_t) override {
+    if (++auth_attempts_[remote_ip_] > MAX_AUTH_ATTEMPTS)
+        return PROPAGATION_REJECT;  // дроп + счётчик rejected++
+    return PROPAGATION_CONTINUE;
+}
 ```
 
 ### Нет certificate pinning
 
-Нет глобального PKI. Доверие строится на Out-of-Band обмене `user_pubkey` (например, через QR-код, мессенджер, физическое присутствие).
+Нет глобального PKI. Доверие строится на Out-of-Band обмене `user_pubkey` (QR-код, мессенджер, физическое присутствие).
+
+### CoreMeta обратная совместимость
+
+Старые клиенты присылают `payload_len == kBaseSize` (160 байт) без `CoreMeta`. Ядро трактует `peer_core_meta = {0, 0}` как "версия неизвестна, возможности неизвестны". Ни один флаг `CORE_CAP_*` не включается автоматически.
 
 ---
 

@@ -1,4 +1,18 @@
 #pragma once
+/// @file sdk/types.h
+/// @brief GoodNet fundamental wire types, connection identifiers, plugin system.
+///
+/// Philosophy
+/// ──────────
+/// This header contains only what is needed to understand wire framing and
+/// the plugin ABI.  Protocol version negotiation and capability exchange are
+/// application-layer concerns — they are carried inside the AUTH payload and
+/// defined in sdk/messages.hpp, not here.
+///
+/// GN_MAGIC    — frame boundary marker only.
+/// GNET_PROTO_VER — framing schema version; changes only when header_t layout
+///               changes (extremely rare).
+
 #include <cstdint>
 #include <cstddef>
 
@@ -6,47 +20,32 @@
 extern "C" {
 #endif
 
-/// @defgroup types GoodNet Core Types
-/// @brief Fundamental wire types, identifiers and constants.
-/// @{
-
-/// @brief Ensures symbol visibility through dlsym with -fvisibility=hidden.
+// ── Visibility ────────────────────────────────────────────────────────────────
 #if defined(_WIN32)
 #   define GN_EXPORT __declspec(dllexport)
 #else
 #   define GN_EXPORT __attribute__((visibility("default")))
 #endif
 
-/// @name Protocol constants
-/// @{
-#define GNET_MAGIC     0x474E4554U  ///< Wire magic: ASCII 'GNET'
-#define GNET_PROTO_VER 1U           ///< Current protocol version
-/// @}
+// ── Wire framing ──────────────────────────────────────────────────────────────
+#define GNET_MAGIC      0x474E4554U  ///< ASCII 'GNET' — frame validation only
+#define GNET_PROTO_VER  1U           ///< header_t layout version
 
-/// @brief Opaque connection identifier. 0 = CONN_ID_INVALID.
+// ── Connection identifier ─────────────────────────────────────────────────────
 typedef uint64_t conn_id_t;
-#define CONN_ID_INVALID 0ULL        ///< Returned on connection failure
+#define CONN_ID_INVALID 0ULL
 
-/// @brief Plugin role, set by PluginManager before calling *_init().
-typedef enum {
-    PLUGIN_TYPE_UNKNOWN   = 0,
-    PLUGIN_TYPE_HANDLER   = 1,
-    PLUGIN_TYPE_CONNECTOR = 2
-} plugin_type_t;
+// ── Message type registry ─────────────────────────────────────────────────────
+/// Ranges: 0–99 core | 100–999 built-in | 1000–9999 user | 10000+ experimental
+#define MSG_TYPE_SYSTEM       0u
+#define MSG_TYPE_AUTH         1u
+#define MSG_TYPE_KEY_EXCHANGE 2u
+#define MSG_TYPE_HEARTBEAT    3u
+#define MSG_TYPE_ICE_SIGNAL  11u   ///< ICE/DTLS SDP exchange
+#define MSG_TYPE_CHAT       100u
+#define MSG_TYPE_FILE       200u
 
-/// @name Message types
-/// @brief Ranges: 0–99 reserved for core, 100–999 for built-in plugins,
-///        1000–9999 for user plugins, 10000+ experimental.
-/// @{
-#define MSG_TYPE_SYSTEM       0u   ///< Internal core messages
-#define MSG_TYPE_AUTH         1u   ///< Handshake (plaintext, pre-session)
-#define MSG_TYPE_KEY_EXCHANGE 2u   ///< Key exchange (reserved)
-#define MSG_TYPE_HEARTBEAT    3u   ///< Keepalive ping/pong
-#define MSG_TYPE_CHAT       100u   ///< Text messages
-#define MSG_TYPE_FILE       200u   ///< File transfer
-/// @}
-
-/// @brief Connection lifecycle state machine.
+// ── Connection lifecycle ──────────────────────────────────────────────────────
 typedef enum {
     STATE_CONNECTING,   ///< TCP connect in progress
     STATE_AUTH_PENDING, ///< Waiting for peer AUTH
@@ -57,46 +56,91 @@ typedef enum {
     STATE_CLOSED        ///< Connection terminated
 } conn_state_t;
 
-/// @brief Fixed-size packet header. Precedes every payload on the wire.
+// ── Wire header ───────────────────────────────────────────────────────────────
+/// Fixed-size frame header preceding every payload on the wire.
 ///
-/// Layout (packed, no padding):
-/// ```
-/// [0]  magic(4) proto_ver(1) flags(1) reserved(2)
-/// [8]  packet_id(8)
-/// [16] timestamp(8)  — unix microseconds
-/// [24] payload_type(4) status(2) payload_len(4)
-/// [34] signature(64) — Ed25519(device_sk, header[0..33]); zero until ESTABLISHED
-/// ```
+/// Offset | Field        | Size | Notes
+/// -------|--------------|------|----------------------------------------------
+///      0 | magic        |    4 | GNET_MAGIC
+///      4 | proto_ver    |    1 | GNET_PROTO_VER
+///      5 | flags        |    1 | reserved, 0
+///      6 | reserved     |    2 | reserved, 0
+///      8 | packet_id    |    8 | monotonic per-connection counter
+///     16 | timestamp    |    8 | sender unix microseconds
+///     24 | payload_type |    4 | MSG_TYPE_*
+///     28 | status       |    2 | STATUS_OK / STATUS_ERROR
+///     30 | payload_len  |    4 | bytes following this header
+///     34 | signature    |   64 | Ed25519(device_sk, header[0..33]); 0 pre-AUTH
 #pragma pack(push, 1)
 typedef struct {
-    uint32_t magic;         ///< Must equal GNET_MAGIC
-    uint8_t  proto_ver;     ///< Must equal GNET_PROTO_VER
-    uint8_t  flags;         ///< Reserved, must be 0
-    uint16_t reserved;      ///< Reserved, must be 0
-    uint64_t packet_id;     ///< Monotonic per-connection counter
-    uint64_t timestamp;     ///< Send time, unix microseconds
-    uint32_t payload_type;  ///< MSG_TYPE_* value
-    uint16_t status;        ///< STATUS_OK or STATUS_ERROR
-    uint32_t payload_len;   ///< Byte length of payload following this header
-    uint8_t  signature[64]; ///< Ed25519 signature; zero bytes until ESTABLISHED
+    uint32_t magic;
+    uint8_t  proto_ver;
+    uint8_t  flags;
+    uint16_t reserved;
+    uint64_t packet_id;
+    uint64_t timestamp;
+    uint32_t payload_type;
+    uint16_t status;
+    uint32_t payload_len;
+    uint8_t  signature[64];
 } header_t;
 #pragma pack(pop)
 
-/// @brief Remote peer address descriptor.
+/// @brief Remote peer descriptor.
+///
+/// peer_id is set to the conn_id by the core during dispatch — allows
+/// handle_message() to call api->send_response(ep->peer_id, ...) without a
+/// separate URI lookup.
 typedef struct {
-    char     address[128]; ///< IP or hostname, NUL-terminated
+    char     address[128]; ///< NUL-terminated IP or hostname
     uint16_t port;
-    uint8_t  pubkey[32];   ///< Peer Ed25519 user pubkey (populated after AUTH)
-    uint64_t peer_id;      ///< Reserved
+    uint8_t  pubkey[32];   ///< Peer Ed25519 user pubkey (valid after AUTH)
+    uint64_t peer_id;      ///< conn_id — set by core on every dispatch call
 } endpoint_t;
 
-/// @name Status codes
-/// @{
+// ── Status codes ──────────────────────────────────────────────────────────────
 #define STATUS_OK    0
 #define STATUS_ERROR 1
-/// @}
 
-/// @}  // defgroup types
+// ── Plugin system ─────────────────────────────────────────────────────────────
+
+/// @deprecated Superseded by plugin_info_t::caps_mask.
+///             Present so old ABI consumers that read this field don't crash.
+typedef enum {
+    PLUGIN_TYPE_UNKNOWN   = 0,
+    PLUGIN_TYPE_HANDLER   = 1,
+    PLUGIN_TYPE_CONNECTOR = 2
+} plugin_type_t;
+
+/// @brief PluginManager-managed lifecycle state (hot-reload state machine).
+typedef enum {
+    PLUGIN_STATE_PREPARING = 0, ///< Loaded; not yet receiving traffic
+    PLUGIN_STATE_ACTIVE    = 1, ///< Primary handler for new connections
+    PLUGIN_STATE_DRAINING  = 2, ///< Old version; existing sessions still served
+    PLUGIN_STATE_ZOMBIE    = 3  ///< Zero active connections; pending dlclose
+} plugin_state_t;
+
+/// @brief Packet dispatch chain result.
+typedef enum {
+    PROPAGATION_CONTINUE = 0, ///< Pass to next handler in priority chain
+    PROPAGATION_CONSUMED = 1, ///< Handled; stop chain (pins session affinity)
+    PROPAGATION_REJECT   = 2  ///< Invalid; drop silently
+} propagation_t;
+
+/// @brief Plugin self-description.
+///        Must point to a static object inside the plugin (lifetime = so lifetime).
+typedef struct {
+    const char* name;      ///< Unique plugin name
+    uint32_t    version;   ///< Semantic: (major<<16)|(minor<<8)|patch
+    uint8_t     priority;  ///< Dispatch order 0-255 (255 = first)
+    uint8_t     _pad[3];
+    uint32_t    caps_mask; ///< PLUGIN_CAP_* flags
+} plugin_info_t;
+
+/// @name Plugin capability flags (plugin_info_t::caps_mask)
+#define PLUGIN_CAP_COMPRESS_ZSTD (1U << 0)
+#define PLUGIN_CAP_ICE_SUPPORT   (1U << 1)
+#define PLUGIN_CAP_HOT_RELOAD    (1U << 2)
 
 #ifdef __cplusplus
 }

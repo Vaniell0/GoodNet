@@ -11,13 +11,16 @@
 | Подпись AUTH, заголовков | `crypto_sign_ed25519` | sk: 64 B, pk: 32 B, sig: 64 B |
 | ECDH обмен ключами | `crypto_scalarmult` (X25519) | shared: 32 B |
 | KDF поверх ECDH | `crypto_generichash` (BLAKE2b-256) | 32 B |
-| Шифрование пакетов | `crypto_secretbox_easy` (XSalsa20-Poly1305) | MAC: 16 B |
+| Шифрование пакетов | `crypto_secretbox_easy` (**XSalsa20-Poly1305**) | MAC: 16 B |
+| Сжатие пакетов (>512 B) | Zstd level 3 | — |
 | Хэш hardware ID | `crypto_generichash` (BLAKE2b-256) | 32 B |
 | Seed device_key | `crypto_generichash` (BLAKE2b-256) | 32 B |
 | SHA-256 манифестов | `crypto_hash_sha256` | 32 B |
 | Base64 → binary | `sodium_base642bin` | — |
 | Безопасное затирание | `sodium_memzero` | — |
 | Случайные байты | `randombytes_buf` | — |
+
+**Важно:** `crypto_secretbox_easy` — это **XSalsa20-Poly1305**, не ChaCha20-Poly1305. Libsodium использует XSalsa20 (расширенный nonce 192 бит) для `secretbox`. Это стандартный дефолт, не настраивается.
 
 ---
 
@@ -29,7 +32,7 @@
 
 ```
 Источники (приоритет):
-  1. config: "identity.ssh_key_path"
+  1. cfg.identity.ssh_key_path
   2. ~/.ssh/id_ed25519  (HOME / USERPROFILE на Windows)
   3. Генерация → <dir>/user_key  (64 байта raw, chmod 0600)
 
@@ -66,7 +69,7 @@ crypto_box_keypair(rec.session->my_ephem_pk,
                    rec.session->my_ephem_sk);
 
 // После derive_session():
-sess.clear_ephemeral();  // sodium_memzero(sk) + sodium_memzero(pk)
+sess.clear_ephemeral();  // sodium_memzero(sk + pk)
 ```
 
 ---
@@ -99,6 +102,8 @@ sess.clear_ephemeral();
 sess.ready = true;
 ```
 
+**Почему сортировать ключи?** Без сортировки A → `BLAKE2b(shared ‖ A‖B)`, B → `BLAKE2b(shared ‖ B‖A)`. Разные хэши — сессия не установится. Сортировка делает результат детерминированным независимо от направления.
+
 ---
 
 ## Шифрование / расшифровка
@@ -113,12 +118,29 @@ uint8_t nonce24[24] = {};
 for (int i = 0; i < 8; ++i)
     nonce24[i] = static_cast<uint8_t>(n >> (i * 8));  // little-endian
 
-// wire = nonce_prefix[8] ‖ secretbox(plain)
-// secretbox добавляет 16 байт MAC
-std::vector<uint8_t> wire(8 + plain_len + crypto_secretbox_MACBYTES);
+// ── Малые пакеты (≤ 512 байт) — без сжатия ─────────────────────────────────
+if (plain_len <= 512) {
+    std::vector<uint8_t> wire(8 + plain_len + crypto_secretbox_MACBYTES);
+    std::memcpy(wire.data(), nonce24, 8);
+    crypto_secretbox_easy(wire.data() + 8, plain, plain_len, nonce24, session_key);
+    return wire;
+}
+
+// ── Большие пакеты (> 512 байт) — Zstd + encrypt ───────────────────────────
+uint32_t orig_size = static_cast<uint32_t>(plain_len);
+std::vector<uint8_t> compressed(4 + ZSTD_compressBound(plain_len));
+std::memcpy(compressed.data(), &orig_size, 4);
+
+size_t csize = ZSTD_compress(compressed.data() + 4, ..., plain, plain_len, 3);
+if (ZSTD_isError(csize)) {
+    // fallback: без сжатия, но с orig_size префиксом
+}
+compressed.resize(4 + csize);
+
+std::vector<uint8_t> wire(8 + compressed.size() + crypto_secretbox_MACBYTES);
 std::memcpy(wire.data(), nonce24, 8);
-crypto_secretbox_easy(wire.data() + 8, plain, plain_len, nonce24, session_key);
-return wire;
+crypto_secretbox_easy(wire.data() + 8, compressed.data(), compressed.size(),
+                       nonce24, session_key);
 ```
 
 ### Приём
@@ -128,82 +150,76 @@ return wire;
 if (wire_len < 8 + crypto_secretbox_MACBYTES) return {};
 
 uint64_t n = 0;
-for (int i = 0; i < 8; ++i)
-    n |= static_cast<uint64_t>(wire[i]) << (i * 8);
+for (int i = 0; i < 8; ++i) n |= uint64_t(wire[i]) << (i * 8);
 
 // Replay protection
 const uint64_t exp = recv_nonce_expected.load(std::memory_order_acquire);
-if (n < exp) {
-    LOG_WARN("decrypt: replay nonce={} expected={}", n, exp);
-    return {};
-}
+if (n < exp) { LOG_WARN("replay nonce={} expected={}", n, exp); return {}; }
 recv_nonce_expected.store(n + 1, std::memory_order_release);
 
-uint8_t nonce24[24] = {};
-std::memcpy(nonce24, wire, 8);
+// Decrypt
+std::vector<uint8_t> decrypted(wire_len - 8 - crypto_secretbox_MACBYTES);
+if (crypto_secretbox_open_easy(decrypted.data(), wire + 8,
+        wire_len - 8, nonce24, session_key) != 0) return {};  // MAC fail
 
-std::vector<uint8_t> plain(wire_len - 8 - crypto_secretbox_MACBYTES);
-if (crypto_secretbox_open_easy(plain.data(), wire + 8,
-        wire_len - 8, nonce24, session_key) != 0) {
-    LOG_WARN("decrypt: MAC failed nonce={}", n);
-    return {};
+// Decompress (если нужно)
+if (decrypted.size() <= 512) return decrypted;  // малый пакет
+
+uint32_t orig_size;
+std::memcpy(&orig_size, decrypted.data(), 4);
+if (orig_size == 0 || orig_size > 100 * 1024 * 1024) {
+    return {decrypted.begin() + 4, decrypted.end()};  // нет сжатия
+}
+
+std::vector<uint8_t> plain(orig_size);
+size_t dsize = ZSTD_decompress(plain.data(), orig_size,
+                                decrypted.data() + 4, decrypted.size() - 4);
+if (ZSTD_isError(dsize)) {
+    return {decrypted.begin() + 4, decrypted.end()};  // fallback
 }
 return plain;
 ```
 
-### Overhead
+### Overhead на пакет
 
 ```
 8 байт   nonce prefix (uint64_t LE)
 16 байт  Poly1305 MAC
 ─────────
-24 байта на каждый зашифрованный пакет
+24 байта постоянный overhead
+
++ для пакетов > 512 байт:
+4 байта  orig_size prefix (внутри зашифрованного блока)
 ```
 
 ---
 
 ## OpenSSH Ed25519 parser
 
-`cm_identity.cpp: try_load_ssh_key()`
-
-Поддерживаются только незашифрованные (`cipher = "none"`) Ed25519 ключи формата OpenSSH.
-
-### Структура бинарного блока
-
-```
-"openssh-key-v1\0"           magic (15 bytes + NUL)
-string  cipher               должно быть "none"
-string  kdfname              "none"
-blob    kdf_options          пустой
-uint32  num_keys             == 1
-blob    pubkey_blob          пропускаем
-blob    private_block:
-  uint32  checkint[2]        должны совпадать (защита от неверного passphrase)
-  string  key_type           "ssh-ed25519"
-  blob    pub[32]            Ed25519 pubkey
-  blob    sec[64]            Ed25519 seckey (seed[32] ‖ pub[32])
-  string  comment            пропускаем
-```
-
-### Base64 декодирование
+`cm_identity.cpp: try_load_ssh_key()` — поддерживаются незашифрованные (`cipher = "none"`) Ed25519 ключи формата OpenSSH.
 
 ```cpp
-// cm_identity.cpp
-static std::vector<uint8_t> base64_decode(std::string_view in) {
-    std::vector<uint8_t> out(in.size()); // верхняя граница: 3/4 от b64
-    size_t bin_len = 0;
-    if (sodium_base642bin(out.data(), out.size(),
-                          in.data(),  in.size(),
-                          nullptr,    &bin_len,
-                          nullptr,    sodium_base64_VARIANT_ORIGINAL) != 0)
-        return {};
-    out.resize(bin_len);
-    return out;
-}
+// Base64 декодирование с игнорированием whitespace:
+sodium_base642bin(out, out_size, in, in_size,
+                  "\n\r ", &bin_len, nullptr,
+                  sodium_base64_VARIANT_ORIGINAL);
 ```
 
-`sodium_base64_VARIANT_ORIGINAL` — стандартный RFC 4648 Base64, используется в OpenSSH.
-`sodium_base642bin` корректно обрабатывает whitespace (переносы строк в PEM) и padding.
+---
+
+## Ротация ключей идентификации
+
+```cpp
+// ConnectionManager::rotate_identity_keys(cfg)
+// Без остановки сервера. Новые соединения получают новые ключи.
+// Существующие сессии продолжают работу со старым session_key.
+NodeIdentity next = NodeIdentity::load_or_generate(cfg);
+{
+    std::unique_lock lk(identity_mu_);
+    identity_ = std::move(next);
+}
+LOG_INFO("Identity keys rotated");
+```
 
 ---
 
@@ -217,15 +233,15 @@ static std::vector<uint8_t> base64_decode(std::string_view in) {
 | `device_key seed` | Сразу после `crypto_sign_seed_keypair()` |
 | `session_key` | В деструкторе `~SessionState()` |
 
-`sodium_memzero` гарантирует, что компилятор не оптимизирует затирание (в отличие от `memset`, который может быть выброшен как dead store).
+`sodium_memzero` гарантирует, что компилятор не выбросит затирание как dead store.
 
 ---
 
 ## Ограничения (alpha)
 
-**Нет PFS в строгом смысле.** Если `user_seckey` компрометирован задним числом + записан весь трафик → можно восстановить `session_key` из перехваченного AUTH. Настоящий PFS требует ephemeral signing (подпись ephem_pk краткосрочным ключом) — выходит за рамки alpha.
+**Нет PFS в строгом смысле.** Если `user_seckey` компрометирован задним числом + записан весь трафик → можно восстановить `session_key` из перехваченного AUTH.
 
-**Нет double ratchet.** Сессионный ключ фиксирован на время соединения. Компрометация `session_key` раскрывает всю сессию, не только один пакет.
+**Нет double ratchet.** Сессионный ключ фиксирован на время соединения.
 
 ---
 

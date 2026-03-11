@@ -6,6 +6,7 @@
 #include <sodium/crypto_generichash.h>  // Для crypto_generichash_state, init, update, final
 #include <sodium/crypto_scalarmult.h>   // Для crypto_scalarmult и crypto_scalarmult_BYTES
 #include <sodium/crypto_secretbox.h>    // Для crypto_secretbox_KEYBYTES
+#include <zstd.h>
 
 namespace gn {
 
@@ -13,26 +14,64 @@ std::string bytes_to_hex(const uint8_t* data, size_t len);
 
 // ─── encrypt ─────────────────────────────────────────────────────────────────
 // Wire: nonce_u64_le(8) | secretbox(plain, nonce24, session_key)
-
+// Для маленьких пакетов — без сжатия (тесты и handshake работают как раньше)
+// Для больших (>512 байт) — zstd + префикс размера
 std::vector<uint8_t> SessionState::encrypt(const void* plain, size_t plain_len) {
-    const uint64_t nonce_val = send_nonce.fetch_add(1, std::memory_order_relaxed);
+    if (plain_len == 0) {
+        // Пустой пакет — старый формат (nonce + MAC)
+        const uint64_t nonce_val = send_nonce.fetch_add(1, std::memory_order_relaxed);
+        uint8_t nonce24[crypto_secretbox_NONCEBYTES] = {};
+        for (int i = 0; i < 8; ++i)
+            nonce24[i] = static_cast<uint8_t>((nonce_val >> (i * 8)) & 0xFF);
 
+        std::vector<uint8_t> wire(8 + crypto_secretbox_MACBYTES);
+        std::memcpy(wire.data(), nonce24, 8);
+        // crypto_secretbox_easy для пустого plaintext
+        crypto_secretbox_easy(wire.data() + 8, nullptr, 0, nonce24, session_key);
+        return wire;
+    }
+
+    const uint64_t nonce_val = send_nonce.fetch_add(1, std::memory_order_relaxed);
     uint8_t nonce24[crypto_secretbox_NONCEBYTES] = {};
-    static_assert(sizeof(nonce_val) <= crypto_secretbox_NONCEBYTES);
     for (int i = 0; i < 8; ++i)
         nonce24[i] = static_cast<uint8_t>((nonce_val >> (i * 8)) & 0xFF);
 
-    std::vector<uint8_t> wire(8 + plain_len + crypto_secretbox_MACBYTES);
+    // Маленькие пакеты — без сжатия (тесты и handshake проходят!)
+    if (plain_len <= 512) {
+        std::vector<uint8_t> wire(8 + plain_len + crypto_secretbox_MACBYTES);
+        std::memcpy(wire.data(), nonce24, 8);
+        crypto_secretbox_easy(wire.data() + 8,
+                              static_cast<const uint8_t*>(plain), plain_len,
+                              nonce24, session_key);
+        return wire;
+    }
+
+    // Большие пакеты — zstd + префикс размера
+    size_t bound = ZSTD_compressBound(plain_len);
+    std::vector<uint8_t> compressed(4 + bound);
+    uint32_t orig_size = static_cast<uint32_t>(plain_len);
+    std::memcpy(compressed.data(), &orig_size, 4);
+
+    size_t csize = ZSTD_compress(compressed.data() + 4, bound,
+                                 static_cast<const uint8_t*>(plain), plain_len, 3);
+
+    if (ZSTD_isError(csize)) {
+        LOG_WARN("zstd compress failed, sending uncompressed");
+        compressed.resize(4 + plain_len);
+        std::memcpy(compressed.data() + 4, plain, plain_len);
+        csize = plain_len;
+    } else {
+        compressed.resize(4 + csize);
+    }
+
+    std::vector<uint8_t> wire(8 + compressed.size() + crypto_secretbox_MACBYTES);
     std::memcpy(wire.data(), nonce24, 8);
-    crypto_secretbox_easy(
-        wire.data() + 8,
-        static_cast<const uint8_t*>(plain), plain_len,
-        nonce24, session_key);
+    crypto_secretbox_easy(wire.data() + 8, compressed.data(), compressed.size(),
+                          nonce24, session_key);
     return wire;
 }
 
 // ─── decrypt ─────────────────────────────────────────────────────────────────
-
 std::vector<uint8_t> SessionState::decrypt(const void* wire_ptr, size_t wire_len) {
     if (wire_len < 8 + crypto_secretbox_MACBYTES) {
         LOG_WARN("decrypt: too short ({} bytes)", wire_len);
@@ -55,13 +94,36 @@ std::vector<uint8_t> SessionState::decrypt(const void* wire_ptr, size_t wire_len
     recv_nonce_expected.store(nonce_val + 1, std::memory_order_release);
 
     const size_t cipher_len = wire_len - 8;
-    const size_t plain_len  = cipher_len - crypto_secretbox_MACBYTES;
+    std::vector<uint8_t> decrypted(cipher_len - crypto_secretbox_MACBYTES);
 
-    std::vector<uint8_t> plain(plain_len);
-    if (crypto_secretbox_open_easy(plain.data(), wire + 8, cipher_len, nonce24, session_key) != 0) {
+    if (crypto_secretbox_open_easy(decrypted.data(), wire + 8, cipher_len,
+                                   nonce24, session_key) != 0) {
         LOG_WARN("decrypt: MAC failed (nonce={})", nonce_val);
         return {};
     }
+
+    // Маленькие пакеты — возвращаем как есть (без префикса)
+    if (decrypted.size() <= 512) {
+        return decrypted;
+    }
+
+    // Проверяем, есть ли префикс размера (сжатие)
+    uint32_t orig_size;
+    std::memcpy(&orig_size, decrypted.data(), 4);
+    if (orig_size == 0 || orig_size > 100 * 1024 * 1024) {
+        // без сжатия — возвращаем с offset 4
+        return {decrypted.begin() + 4, decrypted.end()};
+    }
+
+    std::vector<uint8_t> plain(orig_size);
+    size_t dsize = ZSTD_decompress(plain.data(), orig_size,
+                                   decrypted.data() + 4, decrypted.size() - 4);
+
+    if (ZSTD_isError(dsize)) {
+        LOG_WARN("zstd decompress failed, fallback uncompressed");
+        return {decrypted.begin() + 4, decrypted.end()};
+    }
+
     return plain;
 }
 

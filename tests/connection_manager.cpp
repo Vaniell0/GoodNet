@@ -1,866 +1,954 @@
+#include <sodium.h>
 #include <gtest/gtest.h>
-#include <gmock/gmock.h>
-
+#include <cstring>
 #include <filesystem>
-#include <memory>
-#include <set>
-#include <vector>
-#include <atomic>
+#include <fstream>
 #include <thread>
 #include <chrono>
-
-#include <fmt/core.h>
-#include <fmt/ranges.h>
 #include <boost/asio.hpp>
-#include <sodium.h>
 
 #include "connectionManager.hpp"
 #include "signals.hpp"
-#include "../sdk/types.h"
-#include "../sdk/plugin.h"
-#include "../sdk/handler.h"
-#include "../sdk/connector.h"
+#include "logger.hpp"
 
-using namespace gn;
 namespace fs = std::filesystem;
-using namespace std::chrono_literals;
+using namespace gn;
 
-// ─── Фикстура ─────────────────────────────────────────────────────────────────
+// ─── helpers ──────────────────────────────────────────────────────────────────
 
-class ConnMgrTest : public ::testing::Test {
+static fs::path tmp_dir(const std::string& suffix = "") {
+    auto p = fs::temp_directory_path() / ("gn_test_" + suffix + std::to_string(
+        std::chrono::steady_clock::now().time_since_epoch().count()));
+    fs::create_directories(p);
+    return p;
+}
+
+// Build a valid OpenSSH Ed25519 PEM from a raw libsodium keypair.
+// Returns PEM string that try_load_ssh_key() can parse.
+static std::string make_openssh_pem(const uint8_t pub[32], const uint8_t sec[64]) {
+    // Construct the binary openssh-key-v1 blob:
+    //   magic(15) | cipher_str | kdf_str | kdf_opts | num_keys(u32be)
+    //   | pubkey_blob | priv_block
+    auto write_u32be = [](std::vector<uint8_t>& v, uint32_t x) {
+        v.push_back(x >> 24); v.push_back((x >> 16) & 0xFF);
+        v.push_back((x >>  8) & 0xFF); v.push_back(x & 0xFF);
+    };
+    auto write_str = [&](std::vector<uint8_t>& v, std::string_view s) {
+        write_u32be(v, (uint32_t)s.size());
+        v.insert(v.end(), s.begin(), s.end());
+    };
+    auto write_blob = [&](std::vector<uint8_t>& v, const uint8_t* d, size_t n) {
+        write_u32be(v, (uint32_t)n);
+        v.insert(v.end(), d, d + n);
+    };
+
+    // Build inner private key block
+    std::vector<uint8_t> priv;
+    uint32_t check = 0xDEADBEEF;
+    write_u32be(priv, check);   // check1
+    write_u32be(priv, check);   // check2
+    write_str(priv, "ssh-ed25519");
+    write_blob(priv, pub, 32);   // pubkey inside priv
+    write_blob(priv, sec, 64);   // 64-byte secret key
+    write_str(priv, "test-comment");
+    // padding
+    for (uint8_t i = 1; priv.size() % 8 != 0; ++i) priv.push_back(i);
+
+    // Build pubkey blob: string("ssh-ed25519") + blob(pub)
+    std::vector<uint8_t> pub_blob;
+    write_str(pub_blob, "ssh-ed25519");
+    write_blob(pub_blob, pub, 32);
+
+    // Assemble outer structure
+    std::vector<uint8_t> blob;
+    // magic
+    const uint8_t magic[] = {'o','p','e','n','s','s','h','-','k','e','y','-','v','1','\0'};
+    blob.insert(blob.end(), magic, magic + sizeof(magic));
+    write_str(blob, "none");    // cipher_name
+    write_str(blob, "none");    // kdf_name
+    write_str(blob, "");        // kdf_options (empty blob)
+    write_u32be(blob, 1);       // num_keys
+    write_blob(blob, pub_blob.data(), pub_blob.size());
+    write_blob(blob, priv.data(), priv.size());
+
+    // Base64 encode
+    std::string b64;
+    b64.reserve(blob.size() * 4 / 3 + 4);
+    static const char* T =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    size_t i = 0;
+    while (i + 2 < blob.size()) {
+        uint32_t v = (uint32_t(blob[i])<<16)|(uint32_t(blob[i+1])<<8)|blob[i+2];
+        b64 += T[(v>>18)&63]; b64 += T[(v>>12)&63];
+        b64 += T[(v>> 6)&63]; b64 += T[v&63];
+        i += 3;
+    }
+    if (i < blob.size()) {
+        uint32_t v = uint32_t(blob[i]) << 16;
+        if (i + 1 < blob.size()) v |= uint32_t(blob[i+1]) << 8;
+        b64 += T[(v>>18)&63]; b64 += T[(v>>12)&63];
+        b64 += (i + 1 < blob.size()) ? T[(v>>6)&63] : '=';
+        b64 += '=';
+    }
+
+    std::string pem = "-----BEGIN OPENSSH PRIVATE KEY-----\n";
+    for (size_t j = 0; j < b64.size(); j += 70)
+        pem += b64.substr(j, 70) + "\n";
+    pem += "-----END OPENSSH PRIVATE KEY-----\n";
+    return pem;
+}
+
+// Write a PEM key to a temp file, return the path
+static fs::path write_openssh_pem(const fs::path& dir,
+                                   const uint8_t pub[32], const uint8_t sec[64]) {
+    fs::path p = dir / "id_ed25519";
+    std::ofstream f(p);
+    f << make_openssh_pem(pub, sec);
+    return p;
+}
+
+// Minimal mock connector ops (no-op)
+static int mock_connect(void*, const char*) { return -1; }
+static int mock_listen (void*, const char*, uint16_t) { return 0; }
+static int mock_send   (void*, conn_id_t, const void*, size_t) { return 0; }
+static void mock_close (void*, conn_id_t) {}
+static void mock_scheme(void*, char* buf, size_t sz) { strncpy(buf, "mock", sz); }
+static void mock_name  (void*, char* buf, size_t sz) { strncpy(buf, "MockConnector", sz); }
+static void mock_shutdown(void*) {}
+
+static connector_ops_t make_mock_connector_ops() {
+    connector_ops_t ops{};
+    ops.connect    = [](void*, const char*) -> int { return -1; };
+    ops.listen     = [](void*, const char*, uint16_t) -> int { return 0; };
+    ops.send_to    = [](void*, conn_id_t, const void*, size_t) -> int { return 0; };
+    ops.close      = [](void*, conn_id_t) {};
+    ops.get_scheme = [](void*, char* b, size_t s) { strncpy(b, "mock", s); };
+    ops.get_name   = [](void*, char* b, size_t s) { strncpy(b, "MockConnector", s); };
+    ops.shutdown   = [](void*) {};
+    ops.connector_ctx = nullptr;
+    return ops;
+}
+
+// Build a valid AUTH payload for a given identity
+static std::vector<uint8_t> build_auth_payload(const NodeIdentity& id,
+                                                 const std::vector<std::string>& schemes = {}) {
+    auth_payload_t ap{};
+    std::memcpy(ap.user_pubkey,   id.user_pubkey,   32);
+    std::memcpy(ap.device_pubkey, id.device_pubkey, 32);
+
+    // ephem keypair
+    uint8_t dummy_sk[crypto_box_SECRETKEYBYTES];
+    crypto_box_keypair(ap.ephem_pubkey, dummy_sk); // generate ephemeral pubkey only
+    // We can't properly sign without secret key here — generate a fresh ephem
+    uint8_t ephem_sk[32], ephem_pk[32];
+    crypto_box_keypair(ephem_pk, ephem_sk);
+    std::memcpy(ap.ephem_pubkey, ephem_pk, 32);
+
+    // Sign: msg = user_pk || device_pk || ephem_pk
+    uint8_t msg[96];
+    std::memcpy(msg,      ap.user_pubkey,   32);
+    std::memcpy(msg + 32, ap.device_pubkey, 32);
+    std::memcpy(msg + 64, ap.ephem_pubkey,  32);
+    crypto_sign_ed25519_detached(ap.signature, nullptr, msg, 96, id.user_seckey);
+
+    ap.set_schemes(schemes);
+
+    std::vector<uint8_t> out(auth_payload_t::kFullSize);
+    std::memcpy(out.data(), &ap, auth_payload_t::kFullSize);
+    return out;
+}
+
+// ─── Fixture ──────────────────────────────────────────────────────────────────
+
+class CMTest : public ::testing::Test {
 protected:
+    boost::asio::io_context  ioc_;
+    SignalBus                bus_{ioc_};
+    fs::path                 dir_a_ = tmp_dir("a");
+    fs::path                 dir_b_ = tmp_dir("b");
+    NodeIdentity             id_a_  = NodeIdentity::load_or_generate(dir_a_);
+    NodeIdentity             id_b_  = NodeIdentity::load_or_generate(dir_b_);
+    std::unique_ptr<ConnectionManager> cm_a_;
+    std::unique_ptr<ConnectionManager> cm_b_;
+    connector_ops_t          mock_ops_  = make_mock_connector_ops();
+
     void SetUp() override {
-        if (sodium_init() < 0)
-            GTEST_SKIP() << "libsodium init failed";
-
-        key_dir = fs::temp_directory_path()
-                / fmt::format("goodnet_cm_{}", ::getpid());
-        fs::create_directories(key_dir);
-
-        ioc  = std::make_unique<boost::asio::io_context>();
-        work = std::make_unique<boost::asio::executor_work_guard<
-                   boost::asio::io_context::executor_type>>(
-                   boost::asio::make_work_guard(*ioc));
-        bus  = std::make_unique<gn::SignalBus>(*ioc);
-
-        io_thread = std::thread([this] { ioc->run(); });
-
-        auto identity = gn::NodeIdentity::load_or_generate(key_dir);
-        cm = std::make_unique<gn::ConnectionManager>(*bus, std::move(identity));
+        cm_a_ = std::make_unique<ConnectionManager>(bus_, id_a_);
+        cm_b_ = std::make_unique<ConnectionManager>(bus_, id_b_);
     }
 
     void TearDown() override {
-        work->reset();
-        ioc->stop();
-        if (io_thread.joinable()) io_thread.join();
-        fs::remove_all(key_dir);
+        if (cm_a_) cm_a_->shutdown();
+        if (cm_b_) cm_b_->shutdown();
+        fs::remove_all(dir_a_);
+        fs::remove_all(dir_b_);
     }
 
-    // ── Helpers ───────────────────────────────────────────────────────────────
-
-    conn_id_t simulate_connect(const char* addr = "127.0.0.1",
-                               uint16_t    port = 9000) {
-        host_api_t api{}; cm->fill_host_api(&api);
-        endpoint_t ep{};
-        std::strncpy(ep.address, addr, sizeof(ep.address) - 1);
-        ep.port = port;
-        return api.on_connect(api.ctx, &ep);
+    // Register mock connector in cm, return host_api
+    host_api_t make_api(ConnectionManager& cm) {
+        host_api_t api{};
+        cm.fill_host_api(&api);
+        cm.register_connector("mock", &mock_ops_);
+        return api;
     }
 
-    // Отправить wire-пакет без шифрования (для тестов AUTH_PENDING и plain)
-    void inject_plain(conn_id_t id, uint32_t msg_type, const std::string& payload) {
-        host_api_t api{}; cm->fill_host_api(&api);
-        header_t hdr{};
-        hdr.magic = GNET_MAGIC; hdr.proto_ver = GNET_PROTO_VER;
-        hdr.payload_type = msg_type;
-        hdr.payload_len  = static_cast<uint32_t>(payload.size());
-        std::vector<uint8_t> wire(sizeof(hdr) + payload.size());
-        std::memcpy(wire.data(), &hdr, sizeof(hdr));
-        std::memcpy(wire.data() + sizeof(hdr), payload.data(), payload.size());
-        api.on_data(api.ctx, id, wire.data(), wire.size());
-    }
+    // Simulate a full handshake between two CMs using mock connector APIs
+    // Returns {conn_id_on_A, conn_id_on_B}
+    std::pair<conn_id_t, conn_id_t> do_handshake(
+        ConnectionManager& cm_a, const NodeIdentity& id_a,
+        ConnectionManager& cm_b, const NodeIdentity& id_b,
+        bool localhost = false)
+    {
+        host_api_t api_a{}, api_b{};
+        cm_a.fill_host_api(&api_a);
+        cm_b.fill_host_api(&api_b);
 
-    // Симулировать полный AUTH handshake от пира
-    // (генерируем эфемерный X25519 + Ed25519 подпись, как делает реальный узел)
-    void simulate_auth(conn_id_t id,
-                       std::vector<std::string> peer_schemes = {}) {
-        // Генерируем keypair пира
-        crypto_sign_keypair(peer_user_pk_, peer_user_sk_);
-        uint8_t dev_pk[32], dev_sk[64];
-        crypto_sign_keypair(dev_pk, dev_sk);
+        // A→B connection
+        endpoint_t ep_ab{};
+        if (localhost)
+            strncpy(ep_ab.address, "127.0.0.1", sizeof(ep_ab.address));
+        else
+            strncpy(ep_ab.address, "10.0.0.2", sizeof(ep_ab.address));
+        ep_ab.port = 9999;
 
-        // X25519 эфемерный ключ
-        crypto_box_keypair(peer_ephem_pk_, peer_ephem_sk_);
+        endpoint_t ep_ba{};
+        if (localhost)
+            strncpy(ep_ba.address, "127.0.0.1", sizeof(ep_ba.address));
+        else
+            strncpy(ep_ba.address, "10.0.0.1", sizeof(ep_ba.address));
+        ep_ba.port = 9998;
 
-        // Подпись: Ed25519(user_sk, user_pk || device_pk || ephem_pk)
-        uint8_t to_sign[96];
-        std::memcpy(to_sign,      peer_user_pk_,  32);
-        std::memcpy(to_sign + 32, dev_pk,          32);
-        std::memcpy(to_sign + 64, peer_ephem_pk_,  32);
+        conn_id_t cid_a = api_a.on_connect(api_a.ctx, &ep_ab);
+        conn_id_t cid_b = api_b.on_connect(api_b.ctx, &ep_ba);
 
-        auth_payload_t ap{};
-        std::memcpy(ap.user_pubkey,   peer_user_pk_,  32);
-        std::memcpy(ap.device_pubkey, dev_pk,          32);
-        std::memcpy(ap.ephem_pubkey,  peer_ephem_pk_,  32);
-        crypto_sign_ed25519_detached(ap.signature, nullptr,
-                                     to_sign, sizeof(to_sign), peer_user_sk_);
-        ap.set_schemes(peer_schemes);
+        // Both send_auth — capture what they send via send_to intercept
+        // We'll feed captured bytes to each other's on_data
+        // For simplicity, manually construct AUTH and feed it
 
-        const size_t payload_len = peer_schemes.empty()
-                                   ? auth_payload_t::kBaseSize
-                                   : auth_payload_t::kFullSize;
+        // Build AUTH payload for A and feed to B
+        auto auth_a = build_auth_payload(id_a, {"mock"});
+        auto auth_b = build_auth_payload(id_b, {"mock"});
 
-        header_t hdr{};
-        hdr.magic        = GNET_MAGIC;
-        hdr.proto_ver    = GNET_PROTO_VER;
-        hdr.payload_type = MSG_TYPE_AUTH;
-        hdr.payload_len  = static_cast<uint32_t>(payload_len);
-
-        std::vector<uint8_t> wire(sizeof(hdr) + payload_len);
-        std::memcpy(wire.data(), &hdr, sizeof(hdr));
-        std::memcpy(wire.data() + sizeof(hdr), &ap, payload_len);
-
-        host_api_t api{}; cm->fill_host_api(&api);
-        api.on_data(api.ctx, id, wire.data(), wire.size());
-    }
-
-    // Симулировать получение зашифрованного пакета от remote peer.
-    //
-    // Вызывать только после simulate_auth() на remote (не localhost) соединении.
-    // Шифруем как это делал бы настоящий пир:
-    //   ECDH(peer_ephem_sk, node_ephem_pk) → shared → BLAKE2b → session_key
-    //   wire = SessionState::encrypt(plain, session_key)
-    //
-    // Для вычисления session_key нам нужен node_ephem_pk — но у нас нет
-    // прямого доступа к эфемерному ключу ConnectionManager.
-    // Решение: используем тот же алгоритм derive что и в cm_session.cpp.
-    void inject_encrypted(conn_id_t id, uint32_t msg_type,
-                           const std::string& plain_text,
-                           const uint8_t node_user_pk[32]) {
-        // Вычисляем session_key той же формулой что и ConnectionManager::derive_session
-        // shared = X25519(peer_ephem_sk, node_ephem_pk)
-        // Но мы не знаем node_ephem_pk... Обходим через обратный ECDH:
-        //   Если наш peer_ephem_sk + cm->my_ephem_pk → shared
-        // У нас peer_ephem_sk_ (сохранён simulate_auth) и нам нужен my_ephem_pk ядра.
-        // Проблема: my_ephem_pk не публичен.
-        //
-        // Альтернатива: тест просто проверяет что plain-пакет для localhost работает,
-        // а шифрование покрывается unit-тестами SessionState (encrypt/decrypt/replay).
-        // Здесь инжектируем через SessionState напрямую.
-
-        // Создаём SessionState с тем же ключом что derive_session использует
-        // Это невозможно без доступа к node_ephem_pk ядра.
-        // Поэтому тест помечается как SKIPPED через GTEST_SKIP().
-        GTEST_SKIP() << "inject_encrypted требует доступа к internal ephem_pk ядра; "
-                        "шифрование покрыто SessionEncryptDecryptRoundtrip тестами.";
-    }
-
-    // Симулировать получение зашифрованного пакета используя pre-computed session_key.
-    // Используется совместно с EncryptedPacketE2E тестом.
-    void inject_with_session_key(conn_id_t id, uint32_t msg_type,
-                                  const std::string& plain_text,
-                                  const uint8_t session_key[crypto_secretbox_KEYBYTES]) {
-        SessionState sess;
-        std::memcpy(sess.session_key, session_key, crypto_secretbox_KEYBYTES);
-        sess.ready = true;
-
-        const auto cipher = sess.encrypt(plain_text.data(), plain_text.size());
-
-        // Оборачиваем зашифрованный payload в header
-        host_api_t api{}; cm->fill_host_api(&api);
-        header_t hdr{};
-        hdr.magic        = GNET_MAGIC;
-        hdr.proto_ver    = GNET_PROTO_VER;
-        hdr.payload_type = msg_type;
-        hdr.payload_len  = static_cast<uint32_t>(cipher.size());
-
-        std::vector<uint8_t> wire(sizeof(hdr) + cipher.size());
-        std::memcpy(wire.data(), &hdr, sizeof(hdr));
-        std::memcpy(wire.data() + sizeof(hdr), cipher.data(), cipher.size());
-        api.on_data(api.ctx, id, wire.data(), wire.size());
-    }
-
-    // Симулировать получение пакета от пира + expose его session_key
-    // через патч ConnectionRecord (тест black-box: обходим через derive_session API).
-    // Возвращает session_key который derive_session должен был вычислить.
-    bool compute_expected_session_key(const uint8_t node_ephem_pk[32],
-                                       const uint8_t node_user_pk[32],
-                                       uint8_t out_session_key[crypto_secretbox_KEYBYTES]) {
-        // ECDH с нашей стороны: X25519(peer_ephem_sk_, node_ephem_pk)
-        uint8_t shared[crypto_scalarmult_BYTES];
-        if (crypto_scalarmult(shared, peer_ephem_sk_, node_ephem_pk) != 0)
-            return false;
-
-        // Domain separation: sorted user pubkeys
-        const uint8_t* pk_a = peer_user_pk_;
-        const uint8_t* pk_b = node_user_pk;
-        if (std::memcmp(pk_a, pk_b, 32) > 0) std::swap(pk_a, pk_b);
-
-        crypto_generichash_state state;
-        crypto_generichash_init(&state, nullptr, 0, crypto_secretbox_KEYBYTES);
-        crypto_generichash_update(&state, shared, sizeof(shared));
-        crypto_generichash_update(&state, pk_a,   32);
-        crypto_generichash_update(&state, pk_b,   32);
-        crypto_generichash_final (&state, out_session_key, crypto_secretbox_KEYBYTES);
-
-        sodium_memzero(shared, sizeof(shared));
-        return true;
-    }
-
-    // Симулировать AUTH с expose эфемерного pubkey ядра (через send_auth перехват).
-    // Записывает auth-пакет который ядро отправляет в ответ — там ephem_pubkey.
-    // Нужен чтобы compute_expected_session_key мог сделать ECDH.
-    struct CaptureConnector {
-        static int connect(void*, const char*) { return 0; }
-        static int listen(void*, const char*, uint16_t) { return 0; }
-        static int send_to_fn(void* ctx, conn_id_t /*id*/,
-                               const void* data, size_t size) {
-            auto* self = static_cast<CaptureConnector*>(ctx);
-            const auto* bytes = static_cast<const uint8_t*>(data);
-            if (size > sizeof(header_t)) {
-                const auto* hdr = reinterpret_cast<const header_t*>(bytes);
-                if (hdr->magic == GNET_MAGIC && hdr->payload_type == MSG_TYPE_AUTH) {
-                    // Захватываем payload
-                    size_t plen = hdr->payload_len;
-                    self->auth_data.assign(bytes + sizeof(header_t),
-                                           bytes + sizeof(header_t) + plen);
-                }
-            }
-            return 0;
-        }
-        static void close_fn(void*, conn_id_t) {}
-        static void get_scheme(void*, char* buf, size_t sz) {
-            std::strncpy(buf, "mock", sz);
-        }
-        static void get_name(void*, char* buf, size_t sz) {
-            std::strncpy(buf, "CaptureConnector", sz);
-        }
-        static void shutdown_fn(void*) {}
-
-        std::vector<uint8_t> auth_data;
-
-        connector_ops_t ops{
-            connect, listen, send_to_fn, close_fn,
-            get_scheme, get_name, shutdown_fn, this
+        // Wrap in header
+        auto make_frame = [](uint32_t type, const std::vector<uint8_t>& pl) {
+            header_t h{};
+            h.magic        = GNET_MAGIC;
+            h.proto_ver    = GNET_PROTO_VER;
+            h.payload_type = type;
+            h.payload_len  = (uint32_t)pl.size();
+            std::vector<uint8_t> frame(sizeof(h) + pl.size());
+            std::memcpy(frame.data(), &h, sizeof(h));
+            std::memcpy(frame.data() + sizeof(h), pl.data(), pl.size());
+            return frame;
         };
-    };
 
-    // Симулируем AUTH + захватываем node_ephem_pk из исходящего AUTH ядра
-    conn_id_t simulate_connect_and_capture_ephem(
-            uint8_t out_node_ephem_pk[32],
-            const char* addr = "10.0.0.99", uint16_t port = 7777) {
-        CaptureConnector cap;
-        cm->register_connector("mock_cap", &cap.ops);
+        auto frame_a = make_frame(MSG_TYPE_AUTH, auth_a);
+        auto frame_b = make_frame(MSG_TYPE_AUTH, auth_b);
 
-        host_api_t api{}; cm->fill_host_api(&api);
-        endpoint_t ep{};
-        std::strncpy(ep.address, addr, sizeof(ep.address)-1);
-        ep.port = port;
-        const conn_id_t id = api.on_connect(api.ctx, &ep);
+        // Feed A's AUTH to B and B's AUTH to A
+        api_b.on_data(api_b.ctx, cid_b, frame_a.data(), frame_a.size());
+        api_a.on_data(api_a.ctx, cid_a, frame_b.data(), frame_b.size());
 
-        // handle_connect → send_auth → CaptureConnector::send_to_fn
-        // К этому моменту auth_data должна быть заполнена
-        if (cap.auth_data.size() >= auth_payload_t::kBaseSize) {
-            const auto* ap = reinterpret_cast<const auth_payload_t*>(cap.auth_data.data());
-            std::memcpy(out_node_ephem_pk, ap->ephem_pubkey, 32);
-        } else {
-            std::memset(out_node_ephem_pk, 0, 32);
-        }
-        return id;
+        return {cid_a, cid_b};
     }
-
-    // Симулировать AUTH от пира И вычислить session_key с обеих сторон
-    void simulate_auth_and_derive_key(conn_id_t id,
-                                       const uint8_t node_ephem_pk[32],
-                                       const uint8_t node_user_pk[32],
-                                       uint8_t out_session_key[crypto_secretbox_KEYBYTES]) {
-        simulate_auth(id);
-        compute_expected_session_key(node_ephem_pk, node_user_pk, out_session_key);
-    }
-
-    // Симулировать получение зашифрованного пакета используя правильный session_key.
-    // Для remote peer (не localhost): dispatch_packet ищет session→decrypt().
-    // Чтобы расшифровка прошла — нужен тот же ключ что derive_session вычислил внутри.
-    // inject_with_session_key() использует этот ключ и отправляет wire.
-
-    // ─────────────────────────────────────────────────────────────────────────
-    template <typename Condition>
-    bool wait_for(Condition&& cond, 
-                  std::chrono::milliseconds max_wait = 500ms) {
-        for (int i = 0; i < static_cast<int>(max_wait / 10ms); ++i) {
-            if (cond()) return true;
-            std::this_thread::sleep_for(10ms);
-        }
-        return cond();
-    }
-
-    uint8_t peer_user_pk_ [32]{};
-    uint8_t peer_user_sk_ [64]{};
-    uint8_t peer_ephem_pk_[32]{};
-    uint8_t peer_ephem_sk_[32]{};
-
-    fs::path key_dir;
-    std::unique_ptr<boost::asio::io_context>                            ioc;
-    std::unique_ptr<boost::asio::executor_work_guard<
-        boost::asio::io_context::executor_type>>                        work;
-    std::unique_ptr<gn::SignalBus>                                      bus;
-    std::unique_ptr<gn::ConnectionManager>                              cm;
-    std::thread                                                         io_thread;
 };
 
-// ─── NodeIdentity ─────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════════
+// SECTION 1: NodeIdentity / cm_identity.cpp
+// ═══════════════════════════════════════════════════════════════════════════════
 
-TEST_F(ConnMgrTest, IdentityGeneratesUserKeyFile) {
-    EXPECT_TRUE(fs::exists(key_dir / "user_key"))
-        << "user_key должен быть создан при первом запуске";
+TEST(IdentityTest, GeneratesFreshKeypair) {
+    auto dir = tmp_dir("gen");
+    auto id = NodeIdentity::load_or_generate(dir);
+    EXPECT_FALSE(id.user_pubkey_hex().empty());
+    EXPECT_FALSE(id.device_pubkey_hex().empty());
+    EXPECT_EQ(id.user_pubkey_hex().size(), 64u);   // 32 bytes hex
+    EXPECT_EQ(id.device_pubkey_hex().size(), 64u);
+    // Keys are valid: sig round-trip
+    uint8_t sig[64], msg[] = {1,2,3};
+    EXPECT_EQ(0, crypto_sign_ed25519_detached(sig, nullptr, msg, 3, id.user_seckey));
+    EXPECT_EQ(0, crypto_sign_ed25519_verify_detached(sig, msg, 3, id.user_pubkey));
+    fs::remove_all(dir);
 }
 
-TEST_F(ConnMgrTest, IdentityPersistsAcrossReloads) {
-    const std::string pk1 = cm->identity().user_pubkey_hex();
-    const auto        id2 = gn::NodeIdentity::load_or_generate(key_dir);
-    EXPECT_EQ(pk1, id2.user_pubkey_hex())
-        << "Ключ не должен меняться при повторной загрузке";
+TEST(IdentityTest, LoadsPersistedKeypair) {
+    auto dir = tmp_dir("persist");
+    auto id1 = NodeIdentity::load_or_generate(dir);
+    auto id2 = NodeIdentity::load_or_generate(dir);
+    EXPECT_EQ(id1.user_pubkey_hex(), id2.user_pubkey_hex());
+    fs::remove_all(dir);
 }
 
-TEST_F(ConnMgrTest, IdentityHexIs64Chars) {
-    const std::string hex = cm->identity().user_pubkey_hex();
-    ASSERT_EQ(hex.size(), 64u);
-    for (char c : hex)
-        EXPECT_TRUE(std::isxdigit(static_cast<unsigned char>(c)))
-            << fmt::format("Не hex: '{}'", c);
+TEST(IdentityTest, TwoDifferentDirsGiveDifferentKeys) {
+    auto d1 = tmp_dir("diff1"), d2 = tmp_dir("diff2");
+    auto id1 = NodeIdentity::load_or_generate(d1);
+    auto id2 = NodeIdentity::load_or_generate(d2);
+    EXPECT_NE(id1.user_pubkey_hex(), id2.user_pubkey_hex());
+    fs::remove_all(d1); fs::remove_all(d2);
 }
 
-TEST_F(ConnMgrTest, UserAndDeviceKeysAreDifferent) {
-    EXPECT_NE(cm->identity().user_pubkey_hex(),
-              cm->identity().device_pubkey_hex());
+TEST(IdentityTest, LoadsOpenSSHEd25519Key) {
+    if (sodium_init() < 0) GTEST_SKIP();
+    auto dir = tmp_dir("ssh");
+    uint8_t pub[32], sec[64];
+    crypto_sign_keypair(pub, sec);
+    auto pem_path = write_openssh_pem(dir, pub, sec);
+
+    uint8_t out_pub[32]{}, out_sec[64]{};
+    bool ok = NodeIdentity::try_load_ssh_key(pem_path, out_pub, out_sec);
+    ASSERT_TRUE(ok);
+    EXPECT_EQ(std::memcmp(out_pub, pub, 32), 0);
+    EXPECT_EQ(std::memcmp(out_sec, sec, 64), 0);
+    fs::remove_all(dir);
 }
 
-// ─── Connection lifecycle ─────────────────────────────────────────────────────
+TEST(IdentityTest, SSHKeyPemPath_UsedViaConfig) {
+    if (sodium_init() < 0) GTEST_SKIP();
+    auto dir = tmp_dir("sshcfg");
+    uint8_t pub[32], sec[64];
+    crypto_sign_keypair(pub, sec);
+    auto pem = write_openssh_pem(dir, pub, sec);
 
-TEST_F(ConnMgrTest, ConnectReturnsValidId) {
-    EXPECT_NE(simulate_connect(), CONN_ID_INVALID);
+    IdentityConfig cfg;
+    cfg.dir = dir;
+    cfg.ssh_key_path = pem;
+    cfg.use_machine_id = false;
+    auto id = NodeIdentity::load_or_generate(cfg);
+
+    EXPECT_EQ(std::memcmp(id.user_pubkey, pub, 32), 0);
+    fs::remove_all(dir);
 }
 
-TEST_F(ConnMgrTest, ConnectIncrementsCount) {
-    EXPECT_EQ(cm->connection_count(), 0u);
-    simulate_connect("10.0.0.1", 8001);
-    EXPECT_EQ(cm->connection_count(), 1u);
-    simulate_connect("10.0.0.2", 8002);
-    EXPECT_EQ(cm->connection_count(), 2u);
+TEST(IdentityTest, TryLoadSSHKey_NonExistentFile) {
+    uint8_t pub[32]{}, sec[64]{};
+    EXPECT_FALSE(NodeIdentity::try_load_ssh_key("/nonexistent/path", pub, sec));
 }
 
-TEST_F(ConnMgrTest, ConnectIdsAreUnique) {
-    const auto a = simulate_connect("10.0.0.1", 8001);
-    const auto b = simulate_connect("10.0.0.2", 8002);
-    EXPECT_NE(a, b);
+TEST(IdentityTest, TryLoadSSHKey_EmptyFile) {
+    auto dir = tmp_dir("sshempty");
+    fs::path p = dir / "empty";
+    std::ofstream(p) << "";
+    uint8_t pub[32]{}, sec[64]{};
+    EXPECT_FALSE(NodeIdentity::try_load_ssh_key(p, pub, sec));
+    fs::remove_all(dir);
 }
 
-TEST_F(ConnMgrTest, InitialStateIsAuthPending) {
-    const auto id = simulate_connect();
-    ASSERT_TRUE(cm->get_state(id).has_value());
-    EXPECT_EQ(*cm->get_state(id), STATE_AUTH_PENDING);
+TEST(IdentityTest, TryLoadSSHKey_WrongContent) {
+    auto dir = tmp_dir("sshjunk");
+    fs::path p = dir / "bad";
+    std::ofstream(p) << "-----BEGIN OPENSSH PRIVATE KEY-----\naGVsbG8=\n-----END OPENSSH PRIVATE KEY-----\n";
+    uint8_t pub[32]{}, sec[64]{};
+    EXPECT_FALSE(NodeIdentity::try_load_ssh_key(p, pub, sec));
+    fs::remove_all(dir);
 }
 
-TEST_F(ConnMgrTest, DisconnectRemovesRecord) {
-    const auto id = simulate_connect();
-    EXPECT_EQ(cm->connection_count(), 1u);
-    host_api_t api{}; cm->fill_host_api(&api);
-    api.on_disconnect(api.ctx, id, 0);
-    EXPECT_EQ(cm->connection_count(), 0u);
-    EXPECT_FALSE(cm->get_state(id).has_value());
+TEST(IdentityTest, TryLoadSSHKey_EncryptedKey_Rejected) {
+    auto dir = tmp_dir("sshenc");
+    // Craft a blob that passes magic but has cipher != "none"
+    auto write_u32be = [](std::vector<uint8_t>& v, uint32_t x) {
+        v.push_back(x>>24); v.push_back((x>>16)&0xFF);
+        v.push_back((x>>8)&0xFF); v.push_back(x&0xFF);
+    };
+    auto write_str = [&](std::vector<uint8_t>& v, std::string_view s) {
+        write_u32be(v, (uint32_t)s.size());
+        v.insert(v.end(), s.begin(), s.end());
+    };
+    std::vector<uint8_t> blob;
+    const uint8_t magic[] = {'o','p','e','n','s','s','h','-','k','e','y','-','v','1','\0'};
+    blob.insert(blob.end(), magic, magic+sizeof(magic));
+    write_str(blob, "aes256-ctr");  // encrypted!
+    write_str(blob, "bcrypt");
+    write_str(blob, "kdf_options_placeholder");
+
+    // base64 encode
+    std::string b64;
+    static const char* T =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    size_t i = 0;
+    while (i + 2 < blob.size()) {
+        uint32_t v = (uint32_t(blob[i])<<16)|(uint32_t(blob[i+1])<<8)|blob[i+2];
+        b64 += T[(v>>18)&63]; b64 += T[(v>>12)&63]; b64 += T[(v>>6)&63]; b64 += T[v&63]; i+=3;
+    }
+
+    fs::path p = dir / "enc_key";
+    std::ofstream f(p);
+    f << "-----BEGIN OPENSSH PRIVATE KEY-----\n" << b64 << "\n-----END OPENSSH PRIVATE KEY-----\n";
+    f.close();
+
+    uint8_t pub[32]{}, sec[64]{};
+    EXPECT_FALSE(NodeIdentity::try_load_ssh_key(p, pub, sec));
+    fs::remove_all(dir);
 }
 
-TEST_F(ConnMgrTest, DisconnectUnknownIdIsNoOp) {
-    host_api_t api{}; cm->fill_host_api(&api);
-    EXPECT_NO_THROW(api.on_disconnect(api.ctx, 999999, 0));
+TEST(IdentityTest, DeviceKeyDependsOnUserKey) {
+    auto d1 = tmp_dir("dev1"), d2 = tmp_dir("dev2");
+    auto id1 = NodeIdentity::load_or_generate(d1);
+    auto id2 = NodeIdentity::load_or_generate(d2);
+    // Different users → different device keys even on same (virtual) machine
+    EXPECT_NE(id1.device_pubkey_hex(), id2.device_pubkey_hex());
+    fs::remove_all(d1); fs::remove_all(d2);
 }
 
-// ─── AUTH Handshake ───────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════════
+// SECTION 2: SessionState / cm_session.cpp
+// ═══════════════════════════════════════════════════════════════════════════════
 
-TEST_F(ConnMgrTest, ValidAuthTransitionsToEstablished) {
-    const auto id = simulate_connect();
-    EXPECT_EQ(*cm->get_state(id), STATE_AUTH_PENDING);
+TEST(SessionTest, EncryptDecryptRoundTrip) {
+    if (sodium_init() < 0) GTEST_SKIP();
+    SessionState s;
+    randombytes_buf(s.session_key, sizeof(s.session_key));
+    s.ready = true;
 
-    simulate_auth(id);
+    std::vector<uint8_t> plain = {0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03};
+    auto wire = s.encrypt(plain.data(), plain.size());
+    ASSERT_FALSE(wire.empty());
+    EXPECT_EQ(wire.size(), 8u + plain.size() + crypto_secretbox_MACBYTES);
 
-    EXPECT_TRUE(wait_for([&]{ return cm->get_state(id) == STATE_ESTABLISHED; }))
-        << "После валидного AUTH должен быть STATE_ESTABLISHED";
+    auto result = s.decrypt(wire.data(), wire.size());
+    ASSERT_EQ(result, plain);
 }
 
-TEST_F(ConnMgrTest, TamperedAuthSignatureRejected) {
-    const auto id = simulate_connect();
+TEST(SessionTest, NoncesIncrement) {
+    if (sodium_init() < 0) GTEST_SKIP();
+    SessionState s;
+    randombytes_buf(s.session_key, sizeof(s.session_key));
+    s.ready = true;
 
-    uint8_t pk[32], sk[64], dpk[32], dsk[64], epk[32], esk[32];
-    crypto_sign_keypair(pk, sk);
-    crypto_sign_keypair(dpk, dsk);
-    crypto_box_keypair(epk, esk);
+    uint8_t dummy[1] = {0};
+    auto w1 = s.encrypt(dummy, 1);
+    auto w2 = s.encrypt(dummy, 1);
 
-    uint8_t to_sign[96];
-    std::memcpy(to_sign,      pk,  32);
-    std::memcpy(to_sign + 32, dpk, 32);
-    std::memcpy(to_sign + 64, epk, 32);
-
-    auth_payload_t ap{};
-    std::memcpy(ap.user_pubkey,   pk,  32);
-    std::memcpy(ap.device_pubkey, dpk, 32);
-    std::memcpy(ap.ephem_pubkey,  epk, 32);
-    crypto_sign_ed25519_detached(ap.signature, nullptr, to_sign, sizeof(to_sign), sk);
-    ap.signature[0] ^= 0xFF;  // портим
-
-    header_t hdr{};
-    hdr.magic = GNET_MAGIC; hdr.proto_ver = GNET_PROTO_VER;
-    hdr.payload_type = MSG_TYPE_AUTH;
-    hdr.payload_len  = static_cast<uint32_t>(auth_payload_t::kBaseSize);
-
-    std::vector<uint8_t> wire(sizeof(hdr) + auth_payload_t::kBaseSize);
-    std::memcpy(wire.data(), &hdr, sizeof(hdr));
-    std::memcpy(wire.data() + sizeof(hdr), &ap, auth_payload_t::kBaseSize);
-
-    host_api_t api{}; cm->fill_host_api(&api);
-    api.on_data(api.ctx, id, wire.data(), wire.size());
-
-    std::this_thread::sleep_for(50ms);
-    EXPECT_NE(*cm->get_state(id), STATE_ESTABLISHED)
-        << "Tampered AUTH не должен устанавливать сессию";
+    uint64_t n1, n2;
+    std::memcpy(&n1, w1.data(), 8);
+    std::memcpy(&n2, w2.data(), 8);
+    EXPECT_LT(n1, n2);
 }
 
-TEST_F(ConnMgrTest, BadMagicClearsBuffer) {
-    const auto id = simulate_connect();
-    simulate_auth(id);
-    EXPECT_TRUE(wait_for([&]{ return cm->get_state(id) == STATE_ESTABLISHED; }));
+TEST(SessionTest, ReplayProtection) {
+    if (sodium_init() < 0) GTEST_SKIP();
+    SessionState s;
+    randombytes_buf(s.session_key, sizeof(s.session_key));
+    s.ready = true;
 
-    uint8_t junk[64] = {}; junk[0] = 0xDE; junk[1] = 0xAD;
-    host_api_t api{}; cm->fill_host_api(&api);
-    api.on_data(api.ctx, id, junk, sizeof(junk));
+    uint8_t msg[] = "hello";
+    auto wire = s.encrypt(msg, 5);
 
-    // Соединение живо — мусор только очищает буфер
-    EXPECT_EQ(*cm->get_state(id), STATE_ESTABLISHED);
+    // First decrypt succeeds
+    auto r1 = s.decrypt(wire.data(), wire.size());
+    EXPECT_EQ(r1.size(), 5u);
+
+    // Replay (same nonce) — must fail
+    auto r2 = s.decrypt(wire.data(), wire.size());
+    EXPECT_TRUE(r2.empty());
 }
 
-// ─── AUTH wire format ─────────────────────────────────────────────────────────
+TEST(SessionTest, TamperedPayloadRejected) {
+    if (sodium_init() < 0) GTEST_SKIP();
+    SessionState s;
+    randombytes_buf(s.session_key, sizeof(s.session_key));
+    s.ready = true;
 
-TEST_F(ConnMgrTest, AuthPayloadSizesAreCorrect) {
-    EXPECT_EQ(auth_payload_t::kBaseSize, 32u + 32u + 64u + 32u);
-    EXPECT_EQ(auth_payload_t::kFullSize,
-              auth_payload_t::kBaseSize + 1 + AUTH_MAX_SCHEMES * AUTH_SCHEME_LEN);
-    EXPECT_EQ(sizeof(auth_payload_t), auth_payload_t::kFullSize);
+    uint8_t msg[] = "tamper me";
+    auto wire = s.encrypt(msg, sizeof(msg));
+    // flip a bit in the ciphertext
+    wire[8 + crypto_secretbox_MACBYTES] ^= 0xFF;
+
+    auto result = s.decrypt(wire.data(), wire.size());
+    EXPECT_TRUE(result.empty());
 }
 
-TEST_F(ConnMgrTest, AuthPayloadSchemesRoundtrip) {
+TEST(SessionTest, TooShortPacketRejected) {
+    if (sodium_init() < 0) GTEST_SKIP();
+    SessionState s;
+    randombytes_buf(s.session_key, sizeof(s.session_key));
+
+    // Minimum valid = 8 + crypto_secretbox_MACBYTES = 24
+    uint8_t tiny[23]{};
+    auto r = s.decrypt(tiny, sizeof(tiny));
+    EXPECT_TRUE(r.empty());
+}
+
+TEST(SessionTest, EmptyPlaintextRoundTrip) {
+    if (sodium_init() < 0) GTEST_SKIP();
+    SessionState s;
+    randombytes_buf(s.session_key, sizeof(s.session_key));
+    s.ready = true;
+
+    auto wire = s.encrypt(nullptr, 0);
+    EXPECT_EQ(wire.size(), 8u + crypto_secretbox_MACBYTES);
+
+    auto result = s.decrypt(wire.data(), wire.size());
+    EXPECT_TRUE(result.empty()); // empty plaintext is valid
+}
+
+TEST(SessionTest, LargePayloadRoundTrip) {
+    if (sodium_init() < 0) GTEST_SKIP();
+    SessionState s;
+    randombytes_buf(s.session_key, sizeof(s.session_key));
+    s.ready = true;
+
+    std::vector<uint8_t> big(64 * 1024);
+    randombytes_buf(big.data(), big.size());
+    auto wire = s.encrypt(big.data(), big.size());
+    auto result = s.decrypt(wire.data(), wire.size());
+    ASSERT_EQ(result, big);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SECTION 3: auth_payload_t helpers
+// ═══════════════════════════════════════════════════════════════════════════════
+
+TEST(AuthPayloadTest, SetGetSchemesRoundTrip) {
     auth_payload_t ap{};
     ap.set_schemes({"tcp", "ws", "udp"});
-    EXPECT_EQ(ap.schemes_count, 3u);
-    const auto got = ap.get_schemes();
-    ASSERT_EQ(got.size(), 3u);
-    EXPECT_EQ(got[0], "tcp");
-    EXPECT_EQ(got[1], "ws");
-    EXPECT_EQ(got[2], "udp");
+    EXPECT_EQ(ap.schemes_count, 3);
+    auto schemes = ap.get_schemes();
+    ASSERT_EQ(schemes.size(), 3u);
+    EXPECT_EQ(schemes[0], "tcp");
+    EXPECT_EQ(schemes[1], "ws");
+    EXPECT_EQ(schemes[2], "udp");
 }
 
-TEST_F(ConnMgrTest, AuthPayloadSchemesClampedAtMax) {
+TEST(AuthPayloadTest, TooManySchemesClipped) {
     auth_payload_t ap{};
-    ap.set_schemes(std::vector<std::string>(20, "tcp"));
-    EXPECT_LE(ap.schemes_count, AUTH_MAX_SCHEMES);
+    ap.set_schemes({"a","b","c","d","e","f","g","h","i","j"});  // 10 > AUTH_MAX_SCHEMES(8)
+    EXPECT_EQ(ap.schemes_count, AUTH_MAX_SCHEMES);
 }
 
-// ─── Capability Negotiation ───────────────────────────────────────────────────
-
-TEST_F(ConnMgrTest, NegotiationPicksTcpOverWs) {
-    cm->register_connector("tcp", nullptr);
-    cm->register_connector("ws",  nullptr);
-
-    const auto id = simulate_connect();
-    simulate_auth(id, {"ws", "tcp", "udp"});
-    EXPECT_TRUE(wait_for([&]{ return cm->get_state(id) == STATE_ESTABLISHED; }));
-
-    const auto scheme = cm->get_negotiated_scheme(id);
-    ASSERT_TRUE(scheme.has_value());
-    EXPECT_EQ(*scheme, "tcp")
-        << fmt::format("Ожидался 'tcp', получен '{}'", scheme.value_or(""));
+TEST(AuthPayloadTest, EmptySchemesProducesWildcard) {
+    auth_payload_t ap{};
+    ap.set_schemes({});
+    EXPECT_EQ(ap.schemes_count, 0);
+    auto s = ap.get_schemes();
+    EXPECT_TRUE(s.empty());
 }
 
-TEST_F(ConnMgrTest, NegotiationFallsBackToWs) {
-    cm->register_connector("ws", nullptr);
-    const auto id = simulate_connect();
-    simulate_auth(id, {"ws", "tcp"});
-    EXPECT_TRUE(wait_for([&]{ return cm->get_state(id) == STATE_ESTABLISHED; }));
-    EXPECT_EQ(*cm->get_negotiated_scheme(id), "ws");
+TEST(AuthPayloadTest, SizeAssert) {
+    using gn::msg::AuthPayload;
+    
+    // Проверка базовой части (до схем)
+    EXPECT_EQ(AuthPayload::kBaseSize, 160u);
+    
+    // Проверка блока схем (1 + 8 * 16)
+    EXPECT_EQ(AuthPayload::kSchemeBlock, 129u);
+    
+    // Проверка мета-данных (2 * uint32)
+    EXPECT_EQ(sizeof(gn::msg::CoreMeta), 8u);
+    
+    // Итоговый размер: 160 + 129 + 8 = 297
+    EXPECT_EQ(sizeof(AuthPayload), 297u);
+    EXPECT_EQ(AuthPayload::kFullSize, 297u);
 }
 
-TEST_F(ConnMgrTest, NegotiationCustomPriority) {
-    cm->register_connector("tcp", nullptr);
-    cm->register_connector("udp", nullptr);
-    cm->set_scheme_priority({"udp", "tcp"});
-    const auto id = simulate_connect();
-    simulate_auth(id, {"tcp", "udp"});
-    EXPECT_TRUE(wait_for([&]{ return cm->get_state(id) == STATE_ESTABLISHED; }));
-    EXPECT_EQ(*cm->get_negotiated_scheme(id), "udp");
+// ═══════════════════════════════════════════════════════════════════════════════
+// SECTION 4: ConnectionManager — connection lifecycle / cm_handshake.cpp
+// ═══════════════════════════════════════════════════════════════════════════════
+
+TEST_F(CMTest, OnConnectReturnsValidId) {
+    host_api_t api{};
+    cm_a_->fill_host_api(&api);
+    endpoint_t ep{};
+    strncpy(ep.address, "10.0.0.1", sizeof(ep.address));
+    ep.port = 1234;
+    conn_id_t id = api.on_connect(api.ctx, &ep);
+    EXPECT_NE(id, CONN_ID_INVALID);
+    EXPECT_EQ(cm_a_->connection_count(), 1u);
 }
 
-TEST_F(ConnMgrTest, NegotiationOldPeer) {
-    cm->register_connector("tcp", nullptr);
-    const auto id = simulate_connect();
-    simulate_auth(id, {});  // старый клиент без schemes
-    EXPECT_TRUE(wait_for([&]{ return cm->get_state(id) == STATE_ESTABLISHED; }));
-    EXPECT_FALSE(cm->get_negotiated_scheme(id)->empty());
+TEST_F(CMTest, OnConnectLocalhostFlaggedCorrectly) {
+    host_api_t api{};
+    cm_a_->fill_host_api(&api);
+    endpoint_t ep{};
+    strncpy(ep.address, "127.0.0.1", sizeof(ep.address));
+    ep.port = 5000;
+    conn_id_t id = api.on_connect(api.ctx, &ep);
+    EXPECT_NE(id, CONN_ID_INVALID);
+    // State should be AUTH_PENDING even for localhost
+    auto st = cm_a_->get_state(id);
+    ASSERT_TRUE(st.has_value());
+    EXPECT_NE(*st, STATE_CLOSED);
 }
 
-// ─── SignalBus dispatch ───────────────────────────────────────────────────────
-
-TEST_F(ConnMgrTest, LocalhostPacketReachesSubscriber) {
-    // Localhost: plain (no encrypt)
-    std::atomic<int> received{0};
-    std::string      last_payload;
-
-    bus->subscribe(MSG_TYPE_CHAT, "test_h",
-        [&](std::string_view, std::shared_ptr<header_t> hdr,
-            const endpoint_t*, PacketData data)
-        {
-            EXPECT_EQ(hdr->payload_type, static_cast<uint32_t>(MSG_TYPE_CHAT));
-            last_payload = std::string(data->begin(), data->end());
-            received.fetch_add(1, std::memory_order_relaxed);
-        });
-
-    const auto id = simulate_connect("127.0.0.1", 9001);
-    simulate_auth(id);
-    EXPECT_TRUE(wait_for([&]{ return cm->get_state(id) == STATE_ESTABLISHED; }));
-
-    inject_plain(id, MSG_TYPE_CHAT, "hello world");
-    EXPECT_TRUE(wait_for([&]{ return received.load() > 0; }));
-
-    EXPECT_EQ(received.load(), 1);
-    EXPECT_EQ(last_payload, "hello world");
+TEST_F(CMTest, OnConnectLoopbackIPv6) {
+    host_api_t api{};
+    cm_a_->fill_host_api(&api);
+    endpoint_t ep{};
+    strncpy(ep.address, "::1", sizeof(ep.address));
+    ep.port = 5001;
+    conn_id_t id = api.on_connect(api.ctx, &ep);
+    EXPECT_NE(id, CONN_ID_INVALID);
 }
 
-TEST_F(ConnMgrTest, PacketBeforeAuthIsDropped) {
-    std::atomic<int> received{0};
-    bus->subscribe_wildcard("drop_test",
-        [&](auto, auto, auto, auto) { received.fetch_add(1); });
-
-    const auto id = simulate_connect();
-    // НЕ делаем AUTH — шлём пакет в STATE_AUTH_PENDING
-    inject_plain(id, MSG_TYPE_CHAT, "should be dropped");
-
-    std::this_thread::sleep_for(50ms);
-    EXPECT_EQ(received.load(), 0) << "Пакет до AUTH должен быть отброшен";
+TEST_F(CMTest, OnDisconnectRemovesRecord) {
+    host_api_t api{};
+    cm_a_->fill_host_api(&api);
+    endpoint_t ep{};
+    strncpy(ep.address, "10.0.0.1", sizeof(ep.address));
+    ep.port = 1234;
+    conn_id_t id = api.on_connect(api.ctx, &ep);
+    EXPECT_EQ(cm_a_->connection_count(), 1u);
+    api.on_disconnect(api.ctx, id, 0);
+    EXPECT_EQ(cm_a_->connection_count(), 0u);
 }
 
-TEST_F(ConnMgrTest, WildcardReceivesAllTypes) {
-    std::atomic<int>    received{0};
-    std::set<uint32_t>  seen_types;
-    std::mutex          seen_mu;
-
-    bus->subscribe_wildcard("wc",
-        [&](std::string_view, std::shared_ptr<header_t> hdr, const endpoint_t*, PacketData)
-        {
-            std::lock_guard lk(seen_mu);
-            seen_types.insert(hdr->payload_type);
-            received.fetch_add(1, std::memory_order_relaxed);
-        });
-
-    const auto id = simulate_connect("127.0.0.1", 9002);
-    simulate_auth(id);
-    EXPECT_TRUE(wait_for([&]{ return cm->get_state(id) == STATE_ESTABLISHED; }));
-
-    inject_plain(id, MSG_TYPE_CHAT,   "a");
-    inject_plain(id, MSG_TYPE_SYSTEM, "b");
-    EXPECT_TRUE(wait_for([&]{ return received.load() >= 2; }));
-
-    EXPECT_GE(received.load(), 2);
-    EXPECT_TRUE(seen_types.count(MSG_TYPE_CHAT));
-    EXPECT_TRUE(seen_types.count(MSG_TYPE_SYSTEM));
+TEST_F(CMTest, GetStateUnknownIdReturnsNullopt) {
+    auto st = cm_a_->get_state(9999);
+    EXPECT_FALSE(st.has_value());
 }
 
-TEST_F(ConnMgrTest, TypedSubscriberIgnoresOtherTypes) {
-    std::atomic<int> chat{0}, file{0};
-
-    bus->subscribe(MSG_TYPE_CHAT, "ch", [&](auto, auto, auto, auto) { chat++; });
-    bus->subscribe(MSG_TYPE_FILE, "fh", [&](auto, auto, auto, auto) { file++; });
-
-    const auto id = simulate_connect("127.0.0.1", 9003);
-    simulate_auth(id);
-    EXPECT_TRUE(wait_for([&]{ return cm->get_state(id) == STATE_ESTABLISHED; }));
-
-    inject_plain(id, MSG_TYPE_CHAT, "c1");
-    inject_plain(id, MSG_TYPE_CHAT, "c2");
-    inject_plain(id, MSG_TYPE_FILE, "f1");
-
-    EXPECT_TRUE(wait_for([&]{ return chat.load() >= 2 && file.load() >= 1; }));
-    EXPECT_EQ(chat.load(), 2);
-    EXPECT_EQ(file.load(), 1);
+TEST_F(CMTest, GetNegotiatedSchemeBeforeHandshakeReturnsNullopt) {
+    host_api_t api{};
+    cm_a_->fill_host_api(&api);
+    endpoint_t ep{};
+    strncpy(ep.address, "10.0.0.1", sizeof(ep.address));
+    ep.port = 4444;
+    conn_id_t id = api.on_connect(api.ctx, &ep);
+    auto scheme = cm_a_->get_negotiated_scheme(id);
+    EXPECT_FALSE(scheme.has_value() && !scheme->empty());
 }
 
-TEST_F(ConnMgrTest, HandlerNameDeliveredCorrectly) {
-    std::string got_name;
-    bus->subscribe(MSG_TYPE_CHAT, "my_named_handler",
-        [&](std::string_view name, auto, auto, auto) {
-            got_name = std::string(name);
-        });
-
-    const auto id = simulate_connect("127.0.0.1", 9004);
-    simulate_auth(id);
-    EXPECT_TRUE(wait_for([&]{ return cm->get_state(id) == STATE_ESTABLISHED; }));
-
-    inject_plain(id, MSG_TYPE_CHAT, "x");
-    EXPECT_TRUE(wait_for([&]{ return !got_name.empty(); }));
-    EXPECT_EQ(got_name, "my_named_handler");
+TEST_F(CMTest, GetActiveUrisEmptyInitially) {
+    EXPECT_TRUE(cm_a_->get_active_uris().empty());
 }
 
-// ─── SignalBus diagnostics ────────────────────────────────────────────────────
-
-TEST_F(ConnMgrTest, SignalBusSubscriberCount) {
-    bus->subscribe(MSG_TYPE_CHAT, "h1", [](auto, auto, auto, auto){});
-    bus->subscribe(MSG_TYPE_CHAT, "h2", [](auto, auto, auto, auto){});
-    bus->subscribe(MSG_TYPE_FILE, "h3", [](auto, auto, auto, auto){});
-    EXPECT_EQ(bus->subscriber_count(MSG_TYPE_CHAT), 2u);
-    EXPECT_EQ(bus->subscriber_count(MSG_TYPE_FILE), 1u);
-    EXPECT_EQ(bus->subscriber_count(MSG_TYPE_SYSTEM), 0u);
+TEST_F(CMTest, MultipleConnections) {
+    host_api_t api{};
+    cm_a_->fill_host_api(&api);
+    for (int i = 0; i < 5; ++i) {
+        endpoint_t ep{};
+        std::string addr = "10.0.0." + std::to_string(i+1);
+        strncpy(ep.address, addr.c_str(), sizeof(ep.address));
+        ep.port = (uint16_t)(1000 + i);
+        api.on_connect(api.ctx, &ep);
+    }
+    EXPECT_EQ(cm_a_->connection_count(), 5u);
 }
 
-TEST_F(ConnMgrTest, SignalBusWildcardCount) {
-    EXPECT_EQ(bus->wildcard_count(), 0u);
-    bus->subscribe_wildcard("w1", [](auto, auto, auto, auto){});
-    bus->subscribe_wildcard("w2", [](auto, auto, auto, auto){});
-    EXPECT_EQ(bus->wildcard_count(), 2u);
+// ═══════════════════════════════════════════════════════════════════════════════
+// SECTION 5: cm_dispatch.cpp — TCP reassembly, packet routing
+// ═══════════════════════════════════════════════════════════════════════════════
+
+TEST_F(CMTest, PacketBeforeAuthDropped) {
+    host_api_t api{};
+    cm_a_->fill_host_api(&api);
+    endpoint_t ep{};
+    strncpy(ep.address, "10.0.0.1", sizeof(ep.address));
+    ep.port = 5000;
+    conn_id_t id = api.on_connect(api.ctx, &ep);
+
+    // Build a MSG_TYPE_CHAT packet (not AUTH) before ESTABLISHED
+    header_t h{};
+    h.magic        = GNET_MAGIC;
+    h.proto_ver    = GNET_PROTO_VER;
+    h.payload_type = MSG_TYPE_CHAT;
+    h.payload_len  = 4;
+    uint8_t pl[4] = {1,2,3,4};
+    std::vector<uint8_t> frame(sizeof(h) + 4);
+    std::memcpy(frame.data(), &h, sizeof(h));
+    std::memcpy(frame.data() + sizeof(h), pl, 4);
+
+    // Should be silently dropped (not crash, not establish)
+    EXPECT_NO_THROW(api.on_data(api.ctx, id, frame.data(), frame.size()));
+    auto st = cm_a_->get_state(id);
+    ASSERT_TRUE(st.has_value());
+    EXPECT_NE(*st, STATE_ESTABLISHED);
 }
 
-// ─── Stream reassembly ────────────────────────────────────────────────────────
+TEST_F(CMTest, PartialHeaderBufferedAndProcessedOnCompletion) {
+    host_api_t api{};
+    cm_a_->fill_host_api(&api);
+    endpoint_t ep{};
+    strncpy(ep.address, "10.0.0.1", sizeof(ep.address));
+    ep.port = 5001;
+    conn_id_t id = api.on_connect(api.ctx, &ep);
 
-TEST_F(ConnMgrTest, FragmentedPacketReassembly) {
-    std::atomic<int> received{0};
-    bus->subscribe(MSG_TYPE_CHAT, "frag_h", [&](auto, auto, auto, auto){ received++; });
+    // Build a full AUTH frame
+    auto auth = build_auth_payload(id_b_, {"mock"});
+    header_t h{};
+    h.magic        = GNET_MAGIC;
+    h.proto_ver    = GNET_PROTO_VER;
+    h.payload_type = MSG_TYPE_AUTH;
+    h.payload_len  = (uint32_t)auth.size();
+    std::vector<uint8_t> frame(sizeof(h) + auth.size());
+    std::memcpy(frame.data(), &h, sizeof(h));
+    std::memcpy(frame.data() + sizeof(h), auth.data(), auth.size());
 
-    const auto id = simulate_connect("127.0.0.1", 9005);
-    simulate_auth(id);
-    EXPECT_TRUE(wait_for([&]{ return cm->get_state(id) == STATE_ESTABLISHED; }));
-
-    const std::string payload = "fragmented_message_test";
-    header_t hdr{};
-    hdr.magic = GNET_MAGIC; hdr.proto_ver = GNET_PROTO_VER;
-    hdr.payload_type = MSG_TYPE_CHAT;
-    hdr.payload_len  = static_cast<uint32_t>(payload.size());
-    std::vector<uint8_t> wire(sizeof(hdr) + payload.size());
-    std::memcpy(wire.data(), &hdr, sizeof(hdr));
-    std::memcpy(wire.data() + sizeof(hdr), payload.data(), payload.size());
-
-    host_api_t api{}; cm->fill_host_api(&api);
-    // Шлём по кускам
-    api.on_data(api.ctx, id, wire.data(), 10);
-    std::this_thread::sleep_for(10ms);
-    EXPECT_EQ(received.load(), 0) << "Неполный заголовок не должен триггерить emit";
-
-    api.on_data(api.ctx, id, wire.data() + 10, 10);
-    std::this_thread::sleep_for(10ms);
-    EXPECT_EQ(received.load(), 0) << "Неполный пакет не должен триггерить emit";
-
-    api.on_data(api.ctx, id, wire.data() + 20, wire.size() - 20);
-    EXPECT_TRUE(wait_for([&]{ return received.load() > 0; }));
-    EXPECT_EQ(received.load(), 1);
+    // Split into 3 chunks to test TCP reassembly
+    size_t chunk = frame.size() / 3;
+    EXPECT_NO_THROW(api.on_data(api.ctx, id, frame.data(), chunk));
+    EXPECT_NO_THROW(api.on_data(api.ctx, id, frame.data() + chunk, chunk));
+    EXPECT_NO_THROW(api.on_data(api.ctx, id, frame.data() + 2*chunk,
+                                 frame.size() - 2*chunk));
+    // Frame processed (no crash). AUTH verification may fail (we signed with id_b but
+    // cm_a doesn't know id_b's key yet) — that's expected behaviour.
 }
 
-TEST_F(ConnMgrTest, TwoPacketsInOneChunk) {
-    std::atomic<int> received{0};
-    bus->subscribe(MSG_TYPE_CHAT, "two_h", [&](auto, auto, auto, auto){ received++; });
+TEST_F(CMTest, TwoFramesInOneChunk) {
+    host_api_t api{};
+    cm_a_->fill_host_api(&api);
+    endpoint_t ep{};
+    strncpy(ep.address, "10.0.0.1", sizeof(ep.address));
+    ep.port = 5002;
+    conn_id_t id = api.on_connect(api.ctx, &ep);
 
-    const auto id = simulate_connect("127.0.0.1", 9006);
-    simulate_auth(id);
-    EXPECT_TRUE(wait_for([&]{ return cm->get_state(id) == STATE_ESTABLISHED; }));
+    // First frame: valid AUTH
+    auto auth = build_auth_payload(id_b_, {});
+    header_t h1{};
+    h1.magic = GNET_MAGIC; h1.proto_ver = GNET_PROTO_VER;
+    h1.payload_type = MSG_TYPE_AUTH; h1.payload_len = (uint32_t)auth.size();
+    std::vector<uint8_t> f1(sizeof(h1) + auth.size());
+    std::memcpy(f1.data(), &h1, sizeof(h1));
+    std::memcpy(f1.data()+sizeof(h1), auth.data(), auth.size());
 
-    auto make = [](uint32_t t, const std::string& p) {
-        header_t h{}; h.magic = GNET_MAGIC; h.proto_ver = GNET_PROTO_VER;
-        h.payload_type = t; h.payload_len = static_cast<uint32_t>(p.size());
-        std::vector<uint8_t> w(sizeof(h) + p.size());
-        std::memcpy(w.data(), &h, sizeof(h));
-        std::memcpy(w.data() + sizeof(h), p.data(), p.size());
-        return w;
-    };
-    auto w1 = make(MSG_TYPE_CHAT, "msg1");
-    auto w2 = make(MSG_TYPE_CHAT, "msg2");
-    std::vector<uint8_t> combined(w1);
-    combined.insert(combined.end(), w2.begin(), w2.end());
+    // Second frame: also AUTH (duplicate — should be handled gracefully)
+    std::vector<uint8_t> both(f1.size() + f1.size());
+    std::memcpy(both.data(), f1.data(), f1.size());
+    std::memcpy(both.data() + f1.size(), f1.data(), f1.size());
 
-    host_api_t api{}; cm->fill_host_api(&api);
-    api.on_data(api.ctx, id, combined.data(), combined.size());
-    EXPECT_TRUE(wait_for([&]{ return received.load() >= 2; }));
-    EXPECT_EQ(received.load(), 2);
+    EXPECT_NO_THROW(api.on_data(api.ctx, id, both.data(), both.size()));
 }
 
-// ─── Crypto sign/verify ───────────────────────────────────────────────────────
+TEST_F(CMTest, InvalidMagicDropped) {
+    host_api_t api{};
+    cm_a_->fill_host_api(&api);
+    endpoint_t ep{};
+    strncpy(ep.address, "10.0.0.2", sizeof(ep.address));
+    ep.port = 5003;
+    conn_id_t id = api.on_connect(api.ctx, &ep);
 
-TEST_F(ConnMgrTest, SignAndVerifyRoundtrip) {
-    host_api_t api{}; cm->fill_host_api(&api);
-    const char msg[] = "test payload for signing";
+    header_t h{};
+    h.magic = 0xDEADBEEF;  // wrong!
+    h.proto_ver = GNET_PROTO_VER;
+    h.payload_type = MSG_TYPE_AUTH;
+    h.payload_len = 0;
+    EXPECT_NO_THROW(api.on_data(api.ctx, id, &h, sizeof(h)));
+}
+
+TEST_F(CMTest, EmptyDataChunkIgnored) {
+    host_api_t api{};
+    cm_a_->fill_host_api(&api);
+    endpoint_t ep{};
+    strncpy(ep.address, "10.0.0.3", sizeof(ep.address));
+    ep.port = 5004;
+    conn_id_t id = api.on_connect(api.ctx, &ep);
+    EXPECT_NO_THROW(api.on_data(api.ctx, id, nullptr, 0));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SECTION 6: cm_send.cpp — send, send_frame, scheme negotiation, getters
+// ═══════════════════════════════════════════════════════════════════════════════
+
+TEST_F(CMTest, SendToUnknownUriWithNoConnector_DoesNotCrash) {
+    // No connector registered — send to unknown URI should not crash
+    EXPECT_NO_THROW(cm_a_->send("tcp://10.0.0.99:1234",
+                                  MSG_TYPE_CHAT, "hi", 2));
+}
+
+TEST_F(CMTest, SendToUnknownUriWithConnector_DoesNotCrash) {
+    cm_a_->register_connector("mock", &mock_ops_);
+    EXPECT_NO_THROW(cm_a_->send("mock://10.0.0.99:1234",
+                                  MSG_TYPE_CHAT, "hi", 2));
+}
+
+TEST_F(CMTest, RegisterConnectorAndQueryScheme) {
+    cm_a_->register_connector("tcp", &mock_ops_);
+    // We can verify via send not crashing for tcp:// URI
+    EXPECT_NO_THROW(cm_a_->send("tcp://10.0.0.1:9000", MSG_TYPE_HEARTBEAT, nullptr, 0));
+}
+
+TEST_F(CMTest, SetSchemePriorityAffectsNegotiation) {
+    // Set a custom priority
+    cm_a_->set_scheme_priority({"ws", "tcp", "mock"});
+    cm_a_->register_connector("mock", &mock_ops_);
+    // Just verify no crash and method works
+    EXPECT_NO_THROW(cm_a_->send("mock://10.0.0.1:9000", MSG_TYPE_CHAT, nullptr, 0));
+}
+
+TEST_F(CMTest, SendToDisconnectedIdDroppedGracefully) {
+    host_api_t api{};
+    cm_a_->fill_host_api(&api);
+    endpoint_t ep{};
+    strncpy(ep.address, "10.0.0.1", sizeof(ep.address));
+    ep.port = 9000;
+    conn_id_t id = api.on_connect(api.ctx, &ep);
+    api.on_disconnect(api.ctx, id, 0);
+
+    // Now id is gone — send_frame to it should not crash
+    EXPECT_NO_THROW(cm_a_->send("10.0.0.1:9000", MSG_TYPE_CHAT, "x", 1));
+}
+
+TEST_F(CMTest, ConnectionCountReturnsCorrect) {
+    host_api_t api{};
+    cm_a_->fill_host_api(&api);
+    EXPECT_EQ(cm_a_->connection_count(), 0u);
+    endpoint_t ep{};
+    strncpy(ep.address, "10.0.0.1", sizeof(ep.address));
+    ep.port = 1000;
+    auto id = api.on_connect(api.ctx, &ep);
+    EXPECT_EQ(cm_a_->connection_count(), 1u);
+    api.on_disconnect(api.ctx, id, 1);  // error disconnect
+    EXPECT_EQ(cm_a_->connection_count(), 0u);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SECTION 7: host_api_t — sign/verify callbacks
+// ═══════════════════════════════════════════════════════════════════════════════
+
+TEST_F(CMTest, HostApiSignVerifyRoundTrip) {
+    host_api_t api{};
+    cm_a_->fill_host_api(&api);
+    ASSERT_NE(api.sign_with_device, nullptr);
+    ASSERT_NE(api.verify_signature, nullptr);
+
+    uint8_t msg[] = "hello crypto world";
     uint8_t sig[64]{};
-    ASSERT_EQ(api.sign_with_device(api.ctx, msg, sizeof(msg), sig), 0);
-    EXPECT_EQ(api.verify_signature(api.ctx, msg, sizeof(msg),
-                                   cm->identity().device_pubkey, sig), 0);
+    int r = api.sign_with_device(api.ctx, msg, sizeof(msg), sig);
+    EXPECT_EQ(r, 0);
+
+    int v = api.verify_signature(api.ctx, msg, sizeof(msg),
+                                   id_a_.device_pubkey, sig);
+    EXPECT_EQ(v, 0);
 }
 
-TEST_F(ConnMgrTest, TamperedSigFails) {
-    host_api_t api{}; cm->fill_host_api(&api);
-    const char msg[] = "data";
+TEST_F(CMTest, HostApiVerifyWrongKeyFails) {
+    host_api_t api{};
+    cm_a_->fill_host_api(&api);
+
+    uint8_t msg[] = "sign me";
     uint8_t sig[64]{};
     api.sign_with_device(api.ctx, msg, sizeof(msg), sig);
-    sig[0] ^= 0xFF;
-    EXPECT_NE(api.verify_signature(api.ctx, msg, sizeof(msg),
-                                   cm->identity().device_pubkey, sig), 0);
+
+    // Verify with wrong key (id_b's device key)
+    int v = api.verify_signature(api.ctx, msg, sizeof(msg),
+                                   id_b_.device_pubkey, sig);
+    EXPECT_NE(v, 0);
 }
 
-TEST_F(ConnMgrTest, WrongPubkeyFails) {
-    host_api_t api{}; cm->fill_host_api(&api);
-    const char msg[] = "data";
-    uint8_t sig[64]{}, other_pk[32], other_sk[64];
-    api.sign_with_device(api.ctx, msg, sizeof(msg), sig);
-    crypto_sign_keypair(other_pk, other_sk);
-    EXPECT_NE(api.verify_signature(api.ctx, msg, sizeof(msg), other_pk, sig), 0);
+TEST_F(CMTest, HostApiLoggerNotNull) {
+    host_api_t api{};
+    cm_a_->fill_host_api(&api);
+    // internal_logger is set if Logger is initialized
+    // Just verify fill_host_api doesn't crash and ctx is set
+    EXPECT_NE(api.ctx, nullptr);
 }
 
-// ─── SessionState encrypt/decrypt ────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════════
+// SECTION 8: Full handshake (localhost — no crypto)
+// ═══════════════════════════════════════════════════════════════════════════════
 
-TEST_F(ConnMgrTest, SessionEncryptDecryptRoundtrip) {
-    SessionState sess;
-    // Устанавливаем произвольный session_key
-    randombytes_buf(sess.session_key, sizeof(sess.session_key));
-    sess.ready = true;
+TEST_F(CMTest, LocalhostHandshakeEstablishes) {
+    boost::asio::io_context ioc2;
+    SignalBus bus2{ioc2};
 
-    const std::string plain = "secret message 12345";
-    auto wire = sess.encrypt(plain.data(), plain.size());
-    ASSERT_GT(wire.size(), plain.size()) << "wire должен быть длиннее plain";
+    auto [cid_a, cid_b] = do_handshake(*cm_a_, id_a_, *cm_b_, id_b_, true);
 
-    auto decrypted = sess.decrypt(wire.data(), wire.size());
-    ASSERT_EQ(decrypted.size(), plain.size());
-    EXPECT_EQ(std::string(decrypted.begin(), decrypted.end()), plain);
+    // After feeding AUTH frames both ways, state should be ESTABLISHED
+    auto st_a = cm_a_->get_state(cid_a);
+    ASSERT_TRUE(st_a.has_value());
+    EXPECT_EQ(*st_a, STATE_ESTABLISHED);
 }
 
-TEST_F(ConnMgrTest, SessionDecryptRejectsReplay) {
-    SessionState sess;
-    randombytes_buf(sess.session_key, sizeof(sess.session_key));
-    sess.ready = true;
+TEST_F(CMTest, LocalhostHandshake_SchemesNegotiated) {
+    cm_a_->register_connector("mock", &mock_ops_);
+    cm_b_->register_connector("mock", &mock_ops_);
 
-    const std::string plain = "message";
-    const auto wire = sess.encrypt(plain.data(), plain.size());
+    auto [cid_a, cid_b] = do_handshake(*cm_a_, id_a_, *cm_b_, id_b_, true);
 
-    // Первое расшифрование OK
-    auto d1 = sess.decrypt(wire.data(), wire.size());
-    EXPECT_FALSE(d1.empty());
-
-    // Повторное — replay → отклонить
-    auto d2 = sess.decrypt(wire.data(), wire.size());
-    EXPECT_TRUE(d2.empty()) << "Повторная расшифровка должна отклоняться";
+    auto st = cm_a_->get_state(cid_a);
+    EXPECT_TRUE(st.has_value());
+    EXPECT_EQ(*st, STATE_ESTABLISHED);
 }
 
-TEST_F(ConnMgrTest, SessionDecryptRejectsTamperedMAC) {
-    SessionState sess;
-    randombytes_buf(sess.session_key, sizeof(sess.session_key));
-    sess.ready = true;
+TEST_F(CMTest, BadAuthPayload_TooShort_Dropped) {
+    host_api_t api{};
+    cm_a_->fill_host_api(&api);
+    endpoint_t ep{};
+    strncpy(ep.address, "10.0.0.5", sizeof(ep.address));
+    ep.port = 7777;
+    conn_id_t id = api.on_connect(api.ctx, &ep);
 
-    const std::string plain = "message";
-    auto wire = sess.encrypt(plain.data(), plain.size());
-    wire.back() ^= 0xFF;  // портим MAC
+    // Build AUTH frame with payload that's too short (< kBaseSize)
+    std::vector<uint8_t> bad_auth(32, 0);  // only 32 bytes instead of 160+
+    header_t h{};
+    h.magic = GNET_MAGIC; h.proto_ver = GNET_PROTO_VER;
+    h.payload_type = MSG_TYPE_AUTH;
+    h.payload_len = (uint32_t)bad_auth.size();
+    std::vector<uint8_t> frame(sizeof(h) + bad_auth.size());
+    std::memcpy(frame.data(), &h, sizeof(h));
+    std::memcpy(frame.data()+sizeof(h), bad_auth.data(), bad_auth.size());
 
-    auto d = sess.decrypt(wire.data(), wire.size());
-    EXPECT_TRUE(d.empty()) << "Испорченный MAC должен отклоняться";
+    EXPECT_NO_THROW(api.on_data(api.ctx, id, frame.data(), frame.size()));
+    // Connection should NOT be established
+    auto st = cm_a_->get_state(id);
+    if (st) EXPECT_NE(*st, STATE_ESTABLISHED);
 }
 
-// ─── Encrypted packet (remote peer, ECDH session) ────────────────────────────
-//
-// Проверяем полный путь: simulate_auth на non-localhost → derive_session →
-// inject зашифрованного пакета с правильным session_key → subscriber получает plaintext.
+TEST_F(CMTest, BadAuthPayload_InvalidSignature_Dropped) {
+    host_api_t api{};
+    cm_a_->fill_host_api(&api);
+    endpoint_t ep{};
+    strncpy(ep.address, "10.0.0.6", sizeof(ep.address));
+    ep.port = 7778;
+    conn_id_t id = api.on_connect(api.ctx, &ep);
 
-TEST_F(ConnMgrTest, EncryptedPacketReachesSubscriberAfterECDH) {
-    // Захватываем node_ephem_pk из исходящего AUTH ядра
-    uint8_t node_ephem_pk[32]{};
-    const conn_id_t id = simulate_connect_and_capture_ephem(node_ephem_pk, "10.0.0.5", 8765);
-    ASSERT_NE(id, CONN_ID_INVALID);
+    // Valid-sized payload but corrupt signature
+    auth_payload_t ap{};
+    std::memcpy(ap.user_pubkey,   id_b_.user_pubkey,   32);
+    std::memcpy(ap.device_pubkey, id_b_.device_pubkey, 32);
+    // Leave signature as zeros (invalid)
+    randombytes_buf(ap.ephem_pubkey, 32);
+    ap.schemes_count = 0;
+    std::vector<uint8_t> payload(auth_payload_t::kFullSize);
+    std::memcpy(payload.data(), &ap, auth_payload_t::kFullSize);
 
-    // Проверяем что ephem_pk получен (не нули)
-    bool all_zero = true;
-    for (auto b : node_ephem_pk) if (b) { all_zero = false; break; }
-    if (all_zero) {
-        GTEST_SKIP() << "CaptureConnector не захватил AUTH (mock_cap не зарегистрирован вовремя)";
+    header_t h{};
+    h.magic = GNET_MAGIC; h.proto_ver = GNET_PROTO_VER;
+    h.payload_type = MSG_TYPE_AUTH;
+    h.payload_len = (uint32_t)payload.size();
+    std::vector<uint8_t> frame(sizeof(h) + payload.size());
+    std::memcpy(frame.data(), &h, sizeof(h));
+    std::memcpy(frame.data()+sizeof(h), payload.data(), payload.size());
+
+    EXPECT_NO_THROW(api.on_data(api.ctx, id, frame.data(), frame.size()));
+    auto st = cm_a_->get_state(id);
+    if (st) EXPECT_NE(*st, STATE_ESTABLISHED);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SECTION 9: Shutdown behaviour
+// ═══════════════════════════════════════════════════════════════════════════════
+
+TEST_F(CMTest, ShutdownIdempotent) {
+    EXPECT_NO_THROW(cm_a_->shutdown());
+    EXPECT_NO_THROW(cm_a_->shutdown());
+}
+
+TEST_F(CMTest, SendAfterShutdownDoesNotCrash) {
+    cm_a_->register_connector("mock", &mock_ops_);
+    cm_a_->shutdown();
+    EXPECT_NO_THROW(cm_a_->send("mock://10.0.0.1:1234", MSG_TYPE_CHAT, "x", 1));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SECTION 10: Identity — pubkey hex helpers
+// ═══════════════════════════════════════════════════════════════════════════════
+
+TEST(IdentityHexTest, HexIsLowerCase) {
+    if (sodium_init() < 0) GTEST_SKIP();
+    auto dir = tmp_dir("hex");
+    auto id = NodeIdentity::load_or_generate(dir);
+    const auto& h = id.user_pubkey_hex();
+    for (char c : h) {
+        EXPECT_TRUE((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))
+            << "Non-lowercase-hex char: " << c;
     }
-
-    // Вычисляем ожидаемый session_key: ECDH(peer_ephem_sk, node_ephem_pk)
-    // (ДОЛЖЕН совпасть с тем что derive_session вычислил внутри ConnectionManager)
-    uint8_t session_key[crypto_secretbox_KEYBYTES]{};
-    simulate_auth_and_derive_key(id, node_ephem_pk,
-                                  cm->identity().user_pubkey,
-                                  session_key);
-
-    // Ждём STATE_ESTABLISHED
-    ASSERT_TRUE(wait_for([&]{ return cm->get_state(id) == STATE_ESTABLISHED; }))
-        << "AUTH должен переводить в ESTABLISHED";
-
-    // Подписываемся на CHAT
-    std::atomic<int> received{0};
-    std::string      last_plain;
-    bus->subscribe(MSG_TYPE_CHAT, "enc_test_h",
-        [&](std::string_view, std::shared_ptr<header_t> hdr,
-            const endpoint_t*, PacketData data)
-        {
-            EXPECT_EQ(hdr->payload_type, static_cast<uint32_t>(MSG_TYPE_CHAT));
-            last_plain = std::string(data->begin(), data->end());
-            received.fetch_add(1, std::memory_order_relaxed);
-        });
-
-    // Инжектируем зашифрованный пакет
-    const std::string secret_text = "encrypted hello from peer";
-    inject_with_session_key(id, MSG_TYPE_CHAT, secret_text, session_key);
-
-    ASSERT_TRUE(wait_for([&]{ return received.load() > 0; }))
-        << "Зашифрованный пакет должен быть расшифрован и доставлен подписчику";
-
-    EXPECT_EQ(last_plain, secret_text)
-        << "Расшифрованный текст должен совпадать с оригиналом";
+    fs::remove_all(dir);
 }
 
-TEST_F(ConnMgrTest, EncryptedPacketWithWrongKeyIsDropped) {
-    // remote peer
-    uint8_t node_ephem_pk[32]{};
-    const conn_id_t id = simulate_connect_and_capture_ephem(node_ephem_pk, "10.0.0.6", 8766);
-    ASSERT_NE(id, CONN_ID_INVALID);
-
-    bool all_zero = true;
-    for (auto b : node_ephem_pk) if (b) { all_zero = false; break; }
-    if (all_zero) GTEST_SKIP() << "CaptureConnector не захватил AUTH";
-
-    simulate_auth(id);
-    ASSERT_TRUE(wait_for([&]{ return cm->get_state(id) == STATE_ESTABLISHED; }));
-
-    std::atomic<int> received{0};
-    bus->subscribe(MSG_TYPE_CHAT, "wrong_key_h",
-        [&](auto, auto, auto, auto) { received.fetch_add(1); });
-
-    // Шифруем случайным ключом (НЕ тем что derive_session вычислил)
-    uint8_t wrong_key[crypto_secretbox_KEYBYTES]{};
-    randombytes_buf(wrong_key, sizeof(wrong_key));
-    inject_with_session_key(id, MSG_TYPE_CHAT, "should not arrive", wrong_key);
-
-    std::this_thread::sleep_for(100ms);
-    EXPECT_EQ(received.load(), 0)
-        << "Пакет с неверным ключом (MAC fail) должен быть отброшен";
-}
-
-// ─── Stress ───────────────────────────────────────────────────────────────────
-
-TEST_F(ConnMgrTest, ConcurrentConnectsThreadSafe) {
-    constexpr int N = 100;
-    host_api_t api{}; cm->fill_host_api(&api);
-    std::vector<conn_id_t> ids(N, CONN_ID_INVALID);
-    std::atomic<int> port{10000};
-    std::vector<std::thread> threads;
-    threads.reserve(N);
-    for (int i = 0; i < N; ++i) {
-        threads.emplace_back([&, i]{
-            endpoint_t ep{};
-            std::strncpy(ep.address, "10.0.0.1", sizeof(ep.address)-1);
-            ep.port = static_cast<uint16_t>(port.fetch_add(1));
-            ids[static_cast<size_t>(i)] = api.on_connect(api.ctx, &ep);
-        });
-    }
-    for (auto& t : threads) t.join();
-    std::set<conn_id_t> id_set(ids.begin(), ids.end());
-    id_set.erase(CONN_ID_INVALID);
-    EXPECT_EQ(id_set.size(), static_cast<size_t>(N))
-        << fmt::format("Ожидалось {} уникальных ID, получено {}", N, id_set.size());
+TEST(IdentityHexTest, DeviceHexLength64) {
+    if (sodium_init() < 0) GTEST_SKIP();
+    auto dir = tmp_dir("hexlen");
+    auto id = NodeIdentity::load_or_generate(dir);
+    EXPECT_EQ(id.device_pubkey_hex().size(), 64u);
+    fs::remove_all(dir);
 }

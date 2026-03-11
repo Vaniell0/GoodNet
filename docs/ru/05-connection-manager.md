@@ -2,7 +2,7 @@
 
 `core/connectionManager.hpp` · `core/cm_*.cpp`
 
-Центральный класс. Управляет полным жизненным циклом соединений от TCP accept до доставки расшифрованного payload в SignalBus.
+Центральный класс. Управляет полным жизненным циклом соединений: от TCP accept до доставки расшифрованного payload в SignalBus с цепочкой ответственности хендлеров.
 
 ---
 
@@ -12,21 +12,51 @@
 on_connect() вызван коннектором
         │
         ▼
- ┌──────────────┐     AUTH + ECDH OK
- │ AUTH_PENDING │ ──────────────────────▶ ┌─────────────┐
- └──────────────┘                          │ ESTABLISHED │ ◀─ весь трафик
-        │                                  └──────┬──────┘
-        │ on_disconnect()                         │ on_disconnect()
-        ▼                                         ▼
-   ┌─────────┐                               ┌─────────┐
-   │ CLOSED  │                               │ CLOSED  │
-   └─────────┘                               └─────────┘
-
-STATE_CONNECTING   — устанавливается коннектором до вызова api->on_connect()
-STATE_KEY_EXCHANGE — зарезервировано (не используется)
-STATE_CLOSING      — graceful close (TODO beta)
-STATE_BLOCKED      — заблокировано политикой (TODO)
+ ┌──────────────┐   AUTH + ECDH OK
+ │ AUTH_PENDING │ ─────────────────────▶ ┌─────────────┐
+ └──────────────┘                         │ ESTABLISHED │ ◀─ весь трафик
+        │                                 └──────┬──────┘
+        │ on_disconnect()                        │ on_disconnect()
+        ▼                                        ▼
+   ┌─────────┐                              ┌─────────┐
+   │ CLOSED  │                              │ CLOSED  │
+   └─────────┘                              └─────────┘
 ```
+
+---
+
+## StatsCollector
+
+Lock-free счётчики производительности. Считываются CLI-командой `stats` и тестами.
+
+```cpp
+struct StatsCollector {
+    // Трафик
+    std::atomic<uint64_t> rx_bytes    {0};
+    std::atomic<uint64_t> tx_bytes    {0};
+    std::atomic<uint64_t> rx_packets  {0};
+    std::atomic<uint64_t> tx_packets  {0};
+
+    // Handshake
+    std::atomic<uint64_t> auth_ok     {0};
+    std::atomic<uint64_t> auth_fail   {0};
+    std::atomic<uint64_t> decrypt_fail{0};
+
+    // Backpressure
+    std::atomic<uint64_t> dropped_bp  {0};  // дропы из-за MAX_IN_FLIGHT
+
+    // Цепочка ответственности
+    std::atomic<uint64_t> consumed    {0};  // PROPAGATION_CONSUMED счётчик
+    std::atomic<uint64_t> rejected    {0};  // PROPAGATION_REJECT счётчик
+
+    // Соединения
+    std::atomic<uint32_t> connections {0};  // текущие
+    std::atomic<uint32_t> total_conn  {0};  // всего установлено
+    std::atomic<uint32_t> total_disc  {0};  // всего закрыто
+};
+```
+
+Доступ: `cm.stats().rx_bytes.load()` или `core.cm().stats()`.
 
 ---
 
@@ -35,109 +65,216 @@ STATE_BLOCKED      — заблокировано политикой (TODO)
 ```cpp
 struct ConnectionRecord {
     conn_id_t    id;
-    conn_state_t state = STATE_AUTH_PENDING;
+    conn_state_t state       = STATE_AUTH_PENDING;
+    endpoint_t   remote;
+    std::string  local_scheme;
 
-    endpoint_t   remote;               // IP:port + peer_pubkey (после AUTH)
-    std::string  local_scheme;         // схема, по которой пришло соединение
-    std::string  negotiated_scheme;    // выбранная после capability negotiation
-
-    std::vector<std::string> peer_schemes;   // объявлено пиром в AUTH
+    std::vector<std::string> peer_schemes;
+    std::string              negotiated_scheme;
 
     uint8_t peer_user_pubkey  [32]{};
     uint8_t peer_device_pubkey[32]{};
     bool    peer_authenticated = false;
-    bool    is_localhost       = false;   // пропускать крипто
+    bool    is_localhost       = false;
 
-    std::unique_ptr<SessionState> session; // nullptr до ECDH
-    std::vector<uint8_t>          recv_buf; // TCP reassembly buffer
+    core_meta_t peer_core_meta{};      // возможности пира из AUTH CoreMeta
+    std::string affinity_plugin;       // имя плагина, пинированного первым CONSUMED
+
+    std::unique_ptr<SessionState> session;
+    std::vector<uint8_t>          recv_buf;   // TCP reassembly
 };
 ```
 
+### Session affinity
+
+После первого `PROPAGATION_CONSUMED` в цепочке dispatch имя хендлера сохраняется в `affinity_plugin` и логируется. Последующие пакеты этого соединения по-прежнему проходят полную цепочку — affinity сейчас только диагностика и счётчик `stats_.consumed`. В beta: hint для оптимизации порядка.
+
 ---
 
-## Индексы
+## HandlerEntry
 
 ```cpp
-// Основное хранилище
-std::unordered_map<conn_id_t, ConnectionRecord> records_;
-mutable std::shared_mutex records_mu_;
+struct HandlerEntry {
+    std::string           name;
+    handler_t*            handler  = nullptr;
+    uint8_t               priority = 128;
+    std::vector<uint32_t> subscribed_types;
+};
+```
 
-// URI → conn_id  (для send(uri, ...))
+Хранится в `handler_entries_[name]`. Заполняется в `register_handler()` после вызова `bus_.subscribe()`.
+
+---
+
+## Индексы и мьютексы
+
+```cpp
+// Соединения
+mutable std::shared_mutex records_mu_;
+std::unordered_map<conn_id_t, ConnectionRecord> records_;
+std::atomic<conn_id_t> next_id_{1};
+
+// Коннекторы
+mutable std::shared_mutex connectors_mu_;
+std::unordered_map<std::string, connector_ops_t*> connectors_;
+
+// Хендлеры (для диагностики, не для dispatch)
+mutable std::shared_mutex handlers_mu_;
+std::unordered_map<std::string, HandlerEntry> handler_entries_;
+
+// URI → conn_id
 std::unordered_map<std::string, conn_id_t> uri_index_;
 mutable std::shared_mutex uri_mu_;
 
-// hex(user_pubkey) → conn_id  (для поиска пира по ключу)
+// hex(user_pubkey) → conn_id
 std::unordered_map<std::string, conn_id_t> pk_index_;
 mutable std::shared_mutex pk_mu_;
+
+// Ключи идентификации (ротируются без перезапуска)
+mutable std::shared_mutex identity_mu_;
+NodeIdentity identity_;
 ```
 
-Три отдельных mutex — чтение из `uri_index_` не блокирует запись в `records_`.
+`identity_mu_` — отдельный мьютекс от `records_mu_`. `send_auth()` держит `shared_lock` на оба в правильном порядке. `rotate_identity_keys()` берёт `unique_lock` только на `identity_mu_` — не прерывает обработку пакетов.
+
+---
+
+## Backpressure
+
+```cpp
+std::atomic<size_t> pending_bytes_{0};
+static constexpr size_t MAX_IN_FLIGHT_BYTES = 512UL * 1024 * 1024;  // 512 МБ
+static constexpr size_t CHUNK_SIZE          = 1UL  * 1024 * 1024;   // 1 МБ чанк
+```
+
+Логика в `send_on_conn()`:
+
+```cpp
+if (pending_bytes_.load() + size > MAX_IN_FLIGHT_BYTES) {
+    LOG_WARN("Backpressure: queue full, dropping");
+    stats_.dropped_bp.fetch_add(1, std::memory_order_relaxed);
+    return;
+}
+pending_bytes_.fetch_add(size);
+
+if (size > CHUNK_SIZE * 2) {
+    // Большие буферы режем на 1 МБ чанки
+    while (offset < size) {
+        size_t chunk = std::min(CHUNK_SIZE, size - offset);
+        send_frame(conn_id, msg_type, ptr + offset, chunk);
+        offset += chunk;
+    }
+} else {
+    send_frame(conn_id, msg_type, payload, size);
+}
+pending_bytes_.fetch_sub(size);
+```
+
+`get_pending_bytes()` доступен для мониторинга через CLI.
+
+---
+
+## Публичный API
+
+```cpp
+// Регистрация
+void register_connector(const std::string& scheme, connector_ops_t* ops);
+void register_handler(handler_t* h);
+
+// Отправка
+void send(const char* uri, uint32_t msg_type, const void* payload, size_t size);
+void send_on_conn(conn_id_t id, uint32_t msg_type,                   // прямой ответ
+                  const void* payload, size_t size);
+
+// Идентификация (thread-safe, без рестарта)
+void rotate_identity_keys(const IdentityConfig& cfg);
+static core_meta_t local_core_meta();
+
+// Поиск
+conn_id_t find_conn_by_pubkey(const char* pubkey_hex) const;         // 64-char hex
+std::optional<conn_state_t> get_state(conn_id_t id) const;
+std::optional<std::string>  get_negotiated_scheme(conn_id_t id) const;
+std::vector<std::string>    get_active_uris() const;
+size_t                      connection_count() const;
+
+// Мониторинг
+size_t get_pending_bytes() const;
+const StatsCollector& stats() const;
+StatsCollector&       stats();
+
+// Настройка
+void set_scheme_priority(std::vector<std::string> p);
+void fill_host_api(host_api_t* api);
+void shutdown();
+```
+
+### rotate_identity_keys()
+
+```cpp
+// cm_handshake.cpp
+void ConnectionManager::rotate_identity_keys(const IdentityConfig& cfg) {
+    NodeIdentity next = NodeIdentity::load_or_generate(cfg);
+    {
+        std::unique_lock lk(identity_mu_);
+        identity_ = std::move(next);
+    }
+    LOG_INFO("Identity keys rotated — new user_pk={}",
+             identity_.user_pubkey_hex().substr(0, 12));
+}
+```
+
+Существующие сессии не прерываются — они используют уже установленный `session_key`. Новые соединения (после ротации) получат новые ключи в AUTH.
+
+### send_on_conn() vs send()
+
+```cpp
+// send() — поиск conn_id по URI, потом вызов send_on_conn:
+void send(const char* uri, uint32_t type, const void* payload, size_t size) {
+    auto id = resolve_uri(uri);
+    if (!id) { /* initiate connect */ return; }
+    send_on_conn(*id, type, payload, size);
+}
+
+// send_on_conn() — прямая отправка по conn_id (без URI lookup):
+// Вызывается из host_api_t::send_response через s_send_response
+```
 
 ---
 
 ## Thread safety
 
 ```
-records_mu_    → shared_lock для read, unique_lock для write
-uri_mu_        → shared_lock / unique_lock
-pk_mu_         → shared_lock / unique_lock
+records_mu_     shared_lock / unique_lock
+connectors_mu_  shared_lock / unique_lock
+handlers_mu_    shared_lock / unique_lock
+uri_mu_         shared_lock / unique_lock
+pk_mu_          shared_lock / unique_lock
+identity_mu_    shared_lock (send_auth, send_frame) / unique_lock (rotate)
 ```
 
 **Критический момент в `dispatch_packet`:**
 
 ```cpp
-// records_mu_ держится во время decrypt:
-std::vector<uint8_t> plain;
+// records_mu_ held during decrypt:
 {
     std::unique_lock lk(records_mu_);
     // ... decrypt ...
-    plain = sess.decrypt(cipher, len);
+    plaintext = sess.decrypt(...);
+    affinity_hint = rec.affinity_plugin;
 }
 // ← lk освобождён
 
-// emit вызывается БЕЗ records_mu_:
-bus_.emit(type, hdr_ptr, &remote, make_shared<vector>(plain));
-// Хендлер может вызвать api->send() → records_mu_ снова
+// dispatch вызывается БЕЗ records_mu_:
+auto result = bus_.dispatch_packet(type, hdr_ptr, &remote, data_ptr);
+// Хендлер может вызвать api->send_response() → send_on_conn() → records_mu_
 // Без unlock была бы deadlock
+
+// Возврат в records_mu_ для записи affinity:
+if (result.result == PROPAGATION_CONSUMED && affinity_hint.empty()) {
+    std::unique_lock lk(records_mu_);
+    records_[id].affinity_plugin = result.consumed_by;
+}
 ```
-
----
-
-## Разбивка по файлам
-
-### `cm_identity.cpp`
-- `bytes_to_hex()` — форматирование raw bytes → hex string
-- `NodeIdentity::load_or_generate()` — главная точка входа
-- `try_load_ssh_key()` — парсер OpenSSH Ed25519 (с `sodium_base642bin`)
-- `load_or_gen_keypair()` — загрузка / генерация Ed25519 keypair + `chmod 0600`
-- `save_key()` — запись ключа на диск
-
-### `cm_session.cpp`
-- `SessionState::encrypt()` — XSalsa20-Poly1305 + атомарный nonce
-- `SessionState::decrypt()` — replay check + расшифровка + MAC verify
-- `ConnectionManager::derive_session()` — X25519 ECDH + BLAKE2b-256 KDF
-
-### `cm_handshake.cpp`
-- `ConnectionManager()` конструктор, деструктор, `shutdown()`
-- `fill_host_api()` — заполнение C-структуры коллбэков для плагинов
-- `register_connector()` / `register_handler()`
-- `handle_connect()` — новое соединение: запись в records_, генерация ephem_keypair, `send_auth()`
-- `send_auth()` — формирование и отправка `MSG_TYPE_AUTH`
-- `process_auth()` — верификация Ed25519, ECDH, `STATE_ESTABLISHED`, capability negotiation
-- `handle_disconnect()` — очистка индексов, уведомление хендлеров через `handle_conn_state()`
-- C-ABI адаптеры: `s_on_connect`, `s_on_data`, `s_on_disconnect`, `s_send`, `s_sign`, `s_verify`
-
-### `cm_dispatch.cpp`
-- `handle_data()` — TCP reassembly: накапливает `recv_buf`, вырезает полные пакеты
-- `dispatch_packet()` — AUTH → `process_auth()`, остальное → decrypt → `bus_.emit()`
-
-### `cm_send.cpp`
-- `send()` — public API для хендлеров через `api->send()`
-- `send_frame()` — encrypt → sign header → build frame → `connector->send_to()`
-- `negotiate_scheme()` — выбор оптимального транспорта
-- `resolve_uri()` — поиск `conn_id` по URI строке
-- `local_schemes()` — список зарегистрированных коннекторов
-- Геттеры: `connection_count()`, `get_active_uris()`, `get_state()`, `get_negotiated_scheme()`
 
 ---
 
@@ -147,58 +284,41 @@ bus_.emit(type, hdr_ptr, &remote, make_shared<vector>(plain));
 // cm_dispatch.cpp: handle_data()
 {
     std::unique_lock lk(records_mu_);
-    auto& rec = find_record(id); // throws if not found
-
+    auto& rec = records_.at(id);
     rec.recv_buf.insert(rec.recv_buf.end(), data, data + size);
 
     while (rec.recv_buf.size() >= sizeof(header_t)) {
-        const auto* hdr =
-            reinterpret_cast<const header_t*>(rec.recv_buf.data());
+        const auto* hdr = reinterpret_cast<const header_t*>(rec.recv_buf.data());
 
         if (hdr->magic != GNET_MAGIC) {
-            LOG_WARN("conn #{}: bad magic, clearing recv_buf", id);
-            rec.recv_buf.clear();
-            break;
+            rec.recv_buf.clear(); break;
         }
-
         const size_t total = sizeof(header_t) + hdr->payload_len;
-        if (rec.recv_buf.size() < total) break; // ждём остаток
+        if (rec.recv_buf.size() < total) break;
 
         // Вырезаем полный пакет
-        std::vector<uint8_t> pkt(
-            rec.recv_buf.begin(),
-            rec.recv_buf.begin() + total);
-        rec.recv_buf.erase(
-            rec.recv_buf.begin(),
-            rec.recv_buf.begin() + total);
-
         lk.unlock();
-        dispatch_packet(id, pkt);
+        dispatch_packet(id, hdr, rec.recv_buf.data() + sizeof(header_t),
+                         hdr->payload_len);
         lk.lock();
-
-        if (records_.find(id) == records_.end()) break; // соединение закрыто
+        if (records_.find(id) == records_.end()) break;
+        rec.recv_buf.erase(rec.recv_buf.begin(),
+                           rec.recv_buf.begin() + total);
     }
 }
 ```
 
 ---
 
-## host_api_t: как заполняется
+## Разбивка по файлам
 
-```cpp
-// cm_handshake.cpp: fill_host_api()
-api->ctx              = this;
-api->on_connect       = s_on_connect;    // static → handle_connect(ctx, ep)
-api->on_data          = s_on_data;       // static → handle_data(ctx, id, raw, sz)
-api->on_disconnect    = s_on_disconnect; // static → handle_disconnect(ctx, id, err)
-api->send             = s_send;          // static → send(ctx, uri, type, data, sz)
-api->sign_with_device = s_sign;          // static → Ed25519(device_seckey, data)
-api->verify_signature = s_verify;        // static → Ed25519 verify
-api->internal_logger  = get_logger_ptr();
-api->plugin_type      = PLUGIN_TYPE_UNKNOWN; // PluginManager выставит перед init
-```
-
-Статические методы используются для совместимости с C function pointer (`void* ctx` как первый аргумент вместо `this`).
+| Файл | Что внутри |
+|---|---|
+| `cm_identity.cpp` | `NodeIdentity::load_or_generate`, OpenSSH Ed25519 parser |
+| `cm_session.cpp` | `SessionState::encrypt/decrypt` (XSalsa20-Poly1305 + Zstd), `derive_session` |
+| `cm_handshake.cpp` | Конструктор CM, `fill_host_api`, `register_*`, `handle_connect`, `send_auth`, `process_auth`, `handle_disconnect`, `rotate_identity_keys`, `local_core_meta`, C-ABI статики |
+| `cm_dispatch.cpp` | `handle_data` (TCP reassembly), `dispatch_packet`, `send_on_conn` |
+| `cm_send.cpp` | `send`, `send_on_conn`, `send_frame`, `negotiate_scheme`, `resolve_uri`, геттеры |
 
 ---
 

@@ -17,7 +17,7 @@
         mkCppPlugin = import ./nix/mkCppPlugin.nix { inherit pkgs buildPlugin; };
 
         # ── Общие зависимости ─────────────────────────────────────────────────
-        coreBuildInputs = with pkgs; [ boost spdlog fmt nlohmann_json libsodium ];
+        coreBuildInputs = with pkgs; [ boost spdlog fmt nlohmann_json libsodium zstd ftxui ];
         coreNative      = with pkgs; [ cmake ninja pkg-config include-what-you-use ];
 
         # ── Функция сборки core ───────────────────────────────────────────────
@@ -31,8 +31,8 @@
             src     = ./.;
 
             nativeBuildInputs = coreNative ++ [ pkgs.gtest ] ++ (lib.optional isDebug pkgs.lcov);
-            buildInputs = with pkgs; [ nlohmann_json libsodium boost gtest ];
-            propagatedBuildInputs  = with pkgs; [ spdlog fmt ];
+            buildInputs = with pkgs; [ fmt ftxui nlohmann_json libsodium zstd boost gtest ];
+            propagatedBuildInputs  = with pkgs; [ spdlog ];
 
             # Убираем дефолтный билд-тайп Nix, чтобы наш точно прошел первым
             forceNoRelease = isDebug; 
@@ -190,15 +190,45 @@
           '';
         });
 
+      dockerImage = pkgs.dockerTools.buildLayeredImage {
+        name = "goodnet-docker";
+        tag = "latest";
+        
+        # Копируем наше приложение со всеми либами и плагинами
+        contents = [ fullApp pkgs.cacert pkgs.bashInteractive pkgs.coreutils ];
+
+        config = {
+          # Используем Entrypoint, чтобы аргументы прокидывались в бинарник
+          Entrypoint = [ "${fullApp}/bin/goodnet" ];
+          
+          # Cmd теперь пустой или содержит дефолтные аргументы
+          Cmd = [ ]; 
+
+          WorkingDir = "/data";
+          Env = [
+            "GOODNET_PLUGINS_DIR=${fullApp}/plugins"
+            "LD_LIBRARY_PATH=${lib.makeLibraryPath ([ fullApp ] ++ coreBuildInputs)}"
+          ];
+          Volumes = { "/data" = {}; };
+        };
+      };
+
       in {
         packages = {
           default = fullApp;
           debug   = fullAppDebug;
           core    = goodnet-core;
           plugins = pluginsTree;
-          bundle  = pluginsBundle;
+          docker  = dockerImage;
         };
 
+        apps.docker-load = {
+          type = "app";
+          program = "${pkgs.writeShellScriptBin "docker-load" ''
+            ${pkgs.docker}/bin/docker load < ${dockerImage}
+          ''}/bin/docker-load";
+        };
+        
         # ── Dev shell ─────────────────────────────────────────────────────────
         #
         # nix develop  →  среда разработки с cmake, ninja, gdb, ccache
