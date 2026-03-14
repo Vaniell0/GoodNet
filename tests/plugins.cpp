@@ -198,3 +198,67 @@ TEST_F(PMTest, ConcurrentQueryWhileLoading_NoDataRace) {
     stop = true;
     reader.join();
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SECTION 9: Enable/Disable, Unload, Verify
+// ═══════════════════════════════════════════════════════════════════════════════
+
+TEST_F(PMTest, EnableDisable_StateToggle) {
+    pm_.load_plugin(handler_path());
+    EXPECT_EQ(pm_.get_enabled_handler_count(), 1u);
+
+    EXPECT_TRUE(pm_.disable_handler("mock_handler"));
+    EXPECT_EQ(pm_.get_enabled_handler_count(), 0u);
+
+    // find_handler_by_name returns nullopt for disabled handler
+    EXPECT_FALSE(pm_.find_handler_by_name("mock_handler").has_value());
+
+    EXPECT_TRUE(pm_.enable_handler("mock_handler"));
+    EXPECT_EQ(pm_.get_enabled_handler_count(), 1u);
+    EXPECT_TRUE(pm_.find_handler_by_name("mock_handler").has_value());
+}
+
+TEST_F(PMTest, UnloadHandler_Removes) {
+    pm_.load_plugin(handler_path());
+    EXPECT_EQ(pm_.get_enabled_handler_count(), 1u);
+
+    EXPECT_TRUE(pm_.unload_handler("mock_handler"));
+    EXPECT_EQ(pm_.get_enabled_handler_count(), 0u);
+
+    // After unload, find should return nullopt
+    EXPECT_FALSE(pm_.find_handler_by_name("mock_handler").has_value());
+}
+
+TEST_F(PMTest, VerifyMetadata_WrongHash) {
+    auto p = handler_path();
+    // Corrupt the manifest hash
+    auto manifest_path = p.string() + ".json";
+    nlohmann::json manifest;
+    {
+        std::ifstream f(manifest_path);
+        manifest = nlohmann::json::parse(f);
+    }
+    manifest["integrity"]["hash"] = "0000000000000000000000000000000000000000000000000000000000000000";
+    {
+        std::ofstream f(manifest_path);
+        f << manifest.dump(2);
+    }
+
+    auto result = pm_.load_plugin(p);
+    EXPECT_FALSE(result.has_value());
+}
+
+TEST_F(PMTest, MissingManifest_Reject) {
+    auto p = handler_path();
+    // Remove the manifest file
+    fs::remove(p.string() + ".json");
+
+    auto result = pm_.load_plugin(p);
+    EXPECT_FALSE(result.has_value());
+}
+
+TEST_F(PMTest, EnableDisable_NonExistent_ReturnsFalse) {
+    EXPECT_FALSE(pm_.enable_handler("nonexistent"));
+    EXPECT_FALSE(pm_.disable_handler("nonexistent"));
+    EXPECT_FALSE(pm_.unload_handler("nonexistent"));
+}

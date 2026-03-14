@@ -43,7 +43,7 @@ struct StatsCollector {
     std::atomic<uint64_t> decrypt_fail{0};
 
     // Backpressure
-    std::atomic<uint64_t> dropped_bp  {0};  // дропы из-за MAX_IN_FLIGHT
+    std::atomic<uint64_t> backpressure  {0};  // дропы из-за MAX_IN_FLIGHT
 
     // Цепочка ответственности
     std::atomic<uint64_t> consumed    {0};  // PROPAGATION_CONSUMED счётчик
@@ -77,8 +77,10 @@ struct ConnectionRecord {
     bool    peer_authenticated = false;
     bool    is_localhost       = false;
 
-    core_meta_t peer_core_meta{};      // возможности пира из AUTH CoreMeta
+    gn::msg::CoreMeta peer_core_meta{};      // возможности пира из AUTH CoreMeta
     std::string affinity_plugin;       // имя плагина, пинированного первым CONSUMED
+
+    std::atomic<uint64_t> send_packet_id{0}; // монотонный счётчик пакетов
 
     std::unique_ptr<SessionState> session;
     std::vector<uint8_t>          recv_buf;   // TCP reassembly
@@ -152,7 +154,7 @@ static constexpr size_t CHUNK_SIZE          = 1UL  * 1024 * 1024;   // 1 МБ ч
 ```cpp
 if (pending_bytes_.load() + size > MAX_IN_FLIGHT_BYTES) {
     LOG_WARN("Backpressure: queue full, dropping");
-    stats_.dropped_bp.fetch_add(1, std::memory_order_relaxed);
+    stats_.backpressure.fetch_add(1, std::memory_order_relaxed);
     return;
 }
 pending_bytes_.fetch_add(size);
@@ -188,7 +190,7 @@ void send_on_conn(conn_id_t id, uint32_t msg_type,                   // прям
 
 // Идентификация (thread-safe, без рестарта)
 void rotate_identity_keys(const IdentityConfig& cfg);
-static core_meta_t local_core_meta();
+static gn::msg::CoreMeta local_core_meta();
 
 // Поиск
 conn_id_t find_conn_by_pubkey(const char* pubkey_hex) const;         // 64-char hex
@@ -278,35 +280,28 @@ if (result.result == PROPAGATION_CONSUMED && affinity_hint.empty()) {
 
 ---
 
-## TCP Reassembly
+## TCP Reassembly + Fast Path
 
 ```cpp
 // cm_dispatch.cpp: handle_data()
-{
-    std::unique_lock lk(records_mu_);
-    auto& rec = records_.at(id);
-    rec.recv_buf.insert(rec.recv_buf.end(), data, data + size);
 
-    while (rec.recv_buf.size() >= sizeof(header_t)) {
-        const auto* hdr = reinterpret_cast<const header_t*>(rec.recv_buf.data());
-
-        if (hdr->magic != GNET_MAGIC) {
-            rec.recv_buf.clear(); break;
-        }
-        const size_t total = sizeof(header_t) + hdr->payload_len;
-        if (rec.recv_buf.size() < total) break;
-
-        // Вырезаем полный пакет
-        lk.unlock();
-        dispatch_packet(id, hdr, rec.recv_buf.data() + sizeof(header_t),
-                         hdr->payload_len);
-        lk.lock();
-        if (records_.find(id) == records_.end()) break;
-        rec.recv_buf.erase(rec.recv_buf.begin(),
-                           rec.recv_buf.begin() + total);
+// Fast path: полный фрейм, recv_buf пуст — zero-copy dispatch.
+if (rec->recv_buf.empty() && size >= sizeof(header_t)) {
+    const auto* hdr = reinterpret_cast<const header_t*>(raw);
+    const size_t total = sizeof(header_t) + hdr->payload_len;
+    if (size == total && hdr->magic == GNET_MAGIC
+        && hdr->proto_ver == GNET_PROTO_VER) {
+        dispatch_packet(id, hdr, payload, recv_ts);
+        return;
     }
 }
+
+// Slow path: частичные данные или несколько фреймов
+rec->recv_buf.insert(rec->recv_buf.end(), data, data + size);
+// ... цикл reassembly без изменений ...
 ```
+
+TCP-коннектор отправляет ровно один полный фрейм за вызов `notify_data()`. Когда `recv_buf` пуст (нет остатков от предыдущих вызовов), fast path диспетчеризирует напрямую из входящего указателя — минуя все копирования буферов.
 
 ---
 

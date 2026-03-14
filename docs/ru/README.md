@@ -1,6 +1,6 @@
 # GoodNet — Документация
 
-> Версия: **0.1.0-alpha** · C++23 · Nix Flakes · libsodium · Boost.Asio · zstd · ftxui
+> Версия: **0.1.0-alpha** · C++23 · Nix Flakes · libsodium · Boost.Asio · zstd
 
 ---
 
@@ -20,7 +20,7 @@
 | [10-config.md](10-config.md) | variant map, иерархические ключи, JSON IO |
 | [11-sdk-c.md](11-sdk-c.md) | types.h, propagation_t, plugin_info_t, host_api_t, handler_t |
 | [12-sdk-cpp.md](12-sdk-cpp.md) | IHandler, on_result, send_response, IConnector, PodData\<T\> |
-| [13-build.md](13-build.md) | Nix Flakes, CMake, ftxui, src/core.cpp, ccache |
+| [13-build.md](13-build.md) | Nix Flakes, CMake, src/core.cpp, ccache |
 | [14-testing.md](14-testing.md) | GTest, tests/core.cpp, coverage, mock-объекты |
 | [15-security.md](15-security.md) | Модель угроз, XSalsa20-Poly1305, CoreMeta backcompat |
 | [16-roadmap.md](16-roadmap.md) | Beta и v1.0 |

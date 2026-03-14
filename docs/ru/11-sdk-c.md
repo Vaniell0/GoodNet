@@ -12,7 +12,7 @@ C SDK — единственный интерфейс, который долже
 
 ```c
 #define GNET_MAGIC      0x474E4554U  // ASCII 'GNET' — маркер фрейма
-#define GNET_PROTO_VER  1U           // версия header_t; меняется крайне редко
+#define GNET_PROTO_VER  2U           // версия header_t
 
 typedef uint64_t conn_id_t;
 #define CONN_ID_INVALID 0ULL
@@ -45,21 +45,19 @@ typedef enum {
 } conn_state_t;
 ```
 
-### header_t (98 байт, #pragma pack(push,1))
+### header_t v2 (44 байта, #pragma pack(push,1))
 
 ```
 Offset  Size  Поле           Описание
 ────────────────────────────────────────────────────────────────────
 0       4     magic          GNET_MAGIC
-4       1     proto_ver      GNET_PROTO_VER
+4       1     proto_ver      GNET_PROTO_VER (2)
 5       1     flags          зарезервировано, 0
-6       2     reserved       зарезервировано, 0
-8       8     packet_id      монотонный счётчик пакетов соединения
-16      8     timestamp      время отправки, unix microseconds
-24      4     payload_type   MSG_TYPE_*
-28      2     status         STATUS_OK(0) / STATUS_ERROR(1)
-30      4     payload_len    байты после заголовка
-34      64    signature      Ed25519(device_sk, header[0..33]); 0 до AUTH
+6       2     payload_type   MSG_TYPE_* (uint16_t)
+8       4     payload_len    байты после заголовка
+12      8     packet_id      монотонный счётчик пакетов соединения
+20      8     timestamp      время отправки, unix microseconds
+28      16    sender_id      первые 16 байт device_pubkey отправителя
 ```
 
 ### endpoint_t

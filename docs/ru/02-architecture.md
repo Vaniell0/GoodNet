@@ -33,8 +33,8 @@
 │  │       on_connection_state → EventSignal                          │
 │  │                                                                  │
 │  └── PluginManager                                                  │
-│      handlers_[name]    → HandlerInfo { DynLib, handler_t*, api_c } │
-│      connectors_[scheme]→ ConnectorInfo { DynLib, ops_t*, api_c }   │
+│      handlers_[name]    → HandlerInfo { DynLib, handler_t*, api }   │
+│      connectors_[scheme]→ ConnectorInfo { DynLib, ops_t*, api }     │
 │      SHA-256 verify ДО dlopen(RTLD_NOW|RTLD_LOCAL)                  │
 │      priority из plugin_info_t → порядок в PipelineSignal           │
 └─────────────────────────────────────────────────────────────────────┘
@@ -51,7 +51,9 @@ TCP/UDP/WS bytes
 api->on_data(conn_id, raw, size)
        │
        ▼  [ConnectionManager::handle_data()]
-  recv_buf += raw
+  fast path: recv_buf пуст && полный фрейм?
+    └── ДА → dispatch напрямую (zero-copy)
+  slow path: recv_buf += raw
   loop: buf >= sizeof(header_t) + payload_len?
     ├── magic != GNET_MAGIC  → clear buf, break
     ├── buf < total          → wait for more bytes
@@ -100,10 +102,9 @@ handler или core.send():
   is_localhost?
     ├── YES → plain header + raw payload
     └── NO  → nonce[8] ‖ XSalsa20-Poly1305-secretbox(payload)
-  build header_t
-  is_localhost?
-    ├── YES → skip signature
-    └── NO  → Ed25519(device_seckey, header[0..sizeof_without_sig])
+  build header_t: magic, proto_ver, type, payload_len,
+                  packet_id (монотонный), timestamp (realtime),
+                  sender_id[16] (префикс device_pubkey)
   frame = header_bytes ‖ [encrypted/compressed] payload
        │
        ▼  connector_ops_t::send_to(conn_id, frame)
@@ -119,12 +120,6 @@ GoodNet/
 ├── cmake/
 │   ├── GoodNetConfig.cmake.in
 │   └── pch.cmake
-│
-├── cli/                         # Interactive terminal UI (ftxui)
-│   ├── app.cpp
-│   ├── cli.hpp
-│   ├── commands.cpp             # connect, send, stats, plugins, …
-│   └── views.cpp                # TUI виджеты: таблица соединений, лог
 │
 ├── core/                        # → libgoodnet_core.so
 │   ├── connectionManager.hpp
@@ -192,7 +187,7 @@ GoodNet/
 ```
                ┌──────────────────────────────────┐
                │   main.cpp + cli/*.cpp           │
-               │   (ftxui, boost_program_options) │
+               │   (boost_program_options)        │
                └──────────────┬───────────────────┘
                               │ links
         ┌─────────────────────▼──────────────────────┐

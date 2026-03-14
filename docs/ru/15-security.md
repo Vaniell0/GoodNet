@@ -16,7 +16,7 @@
 | Утечка ephemeral ключей | `sodium_memzero` сразу после `derive_session()` |
 | Утечка session_key | `sodium_memzero` в `~SessionState()` |
 | Pre-auth flood | Пакеты до STATE_ESTABLISHED отбрасываются (кроме AUTH) |
-| OOM из очереди отправки | Backpressure: `pending_bytes > 512 МБ` → drop + `stats_.dropped_bp` |
+| OOM из очереди отправки | Backpressure: `pending_bytes > 512 МБ` → drop + `stats_.backpressure` |
 | Символьные конфликты между плагинами | `RTLD_LOCAL` изолирует каждый `.so` |
 | Символьный конфликт имён хендлеров | `PROPAGATION_REJECT` + `stats_.rejected` |
 

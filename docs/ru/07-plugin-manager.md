@@ -74,10 +74,10 @@ load_plugin(path.so)
     ├─ 5a. symbol("handler_init") найден?
     │       HandlerInfo info;
     │       info.lib   = move(lib);
-    │       info.api_c = *host_api_;        ← КОПИЯ, не указатель
-    │       info.api_c.plugin_info = &info.static_info;
-    │       info.api_c.plugin_type = PLUGIN_TYPE_HANDLER; // deprecated, но заполняем
-    │       (*handler_init)(&info.api_c, &info.handler);
+    │       info.api = *host_api_;        ← КОПИЯ, не указатель
+    │       info.api.plugin_info = &info.static_info;
+    │       info.api.plugin_type = PLUGIN_TYPE_HANDLER; // deprecated, но заполняем
+    │       (*handler_init)(&info.api, &info.handler);
     │       // Регистрируем в SignalBus с приоритетом из plugin_info
     │       bus_.subscribe(type, name, cb, info.handler->info->priority);
     │       handlers_[info.handler->name] = move(info);
@@ -85,8 +85,8 @@ load_plugin(path.so)
     │
     └─ 5b. symbol("connector_init") найден?
             ConnectorInfo info;
-            info.api_c.plugin_type = PLUGIN_TYPE_CONNECTOR;
-            (*connector_init)(&info.api_c, &info.ops);
+            info.api.plugin_type = PLUGIN_TYPE_CONNECTOR;
+            (*connector_init)(&info.api, &info.ops);
             info.ops->get_scheme(buf, sizeof(buf)) → scheme;
             connectors_[scheme] = move(info);
             return {}  (success)
@@ -104,7 +104,7 @@ struct HandlerInfo {
     fs::path     path;
     std::string  name;
     bool         enabled = true;
-    host_api_t   api_c;   // СОБСТВЕННАЯ копия API
+    host_api_t   api;   // СОБСТВЕННАЯ копия API
 
     ~HandlerInfo() {
         if (handler && handler->shutdown)
@@ -114,7 +114,7 @@ struct HandlerInfo {
 };
 ```
 
-**Почему `api_c` — копия, а не указатель?** Плагин хранит `&info.api_c` на всё время жизни. При rehash `unordered_map` указатель стал бы невалидным. Копия в `HandlerInfo` живёт ровно столько, сколько запись в map.
+**Почему `api` — копия, а не указатель?** Плагин хранит `&info.api` на всё время жизни. При rehash `unordered_map` указатель стал бы невалидным. Копия в `HandlerInfo` живёт ровно столько, сколько запись в map.
 
 **Порядок деструкции:**
 1. `HandlerInfo::~HandlerInfo()` → `handler->shutdown()` → плагин освобождает ресурсы

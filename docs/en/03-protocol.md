@@ -19,7 +19,7 @@ GoodNet uses a simplified **Noise_XX** variant — mutual authentication without
 
 Immediately after TCP connect, **both** nodes send `MSG_TYPE_AUTH`. Order does not matter — the exchange is symmetric.
 
-### Wire format `auth_payload_t`
+### Wire format `gn::msg::AuthPayload`
 
 ```
 Offset  Size  Field          Description
@@ -34,7 +34,7 @@ kBaseSize = 160 bytes   ← old clients without capability negotiation
 160     1     schemes_count  Number of schemes (0–8)
 161     128   schemes[8][16] Schemes: "tcp\0", "ws\0", … (8 slots × 16 bytes)
 ──────────────────────────────────────────────────────────────
-kFullSize = 289 bytes
+kFullSize = 297 bytes
 ```
 
 ### What is signed
@@ -111,16 +111,9 @@ overhead = 8 (nonce prefix) + 16 (Poly1305 MAC) = 24 bytes/packet
 `send_nonce` is atomically incremented on each send (`fetch_add`, `memory_order_relaxed`).
 `recv_nonce_expected` is monotonically increasing — `nonce < expected` → drop (replay attack).
 
-### Header signing
+### Sender identification
 
-```cpp
-// cm_send.cpp: send_frame(), only for non-localhost ESTABLISHED
-const size_t body = offsetof(header_t, signature);
-crypto_sign_ed25519_detached(
-    hdr.signature, nullptr,
-    reinterpret_cast<const uint8_t*>(&hdr), body,
-    identity_.device_seckey);
-```
+The `sender_id[16]` field carries the first 16 bytes of the sender's `device_pubkey`. This allows fast peer identification without a full public key lookup. No per-packet header signature is computed — the AEAD cipher (XSalsa20-Poly1305) already authenticates all data packets, and AUTH/KEY_EXCHANGE have their own payload-level signatures.
 
 ---
 
@@ -157,30 +150,26 @@ Addresses `127.x.x.x`, `::1`, `localhost` → `is_localhost = true`.
 | AUTH | Fully executed |
 | ECDH | Fully executed |
 | Payload encryption | **Skipped** |
-| Header signature | **Skipped** |
 
 Goal: zero crypto overhead when using GoodNet as an IPC bus between processes on the same machine.
 
 ---
 
-## `header_t` Wire Format
+## `header_t` Wire Format (v2)
 
 ```
 Offset  Size  Field           Description
 ────────────────────────────────────────────────────────────────────
 0       4     magic           0x474E4554 ('GNET') — garbage guard
-4       1     proto_ver       Protocol version (current: 1)
+4       1     proto_ver       Protocol version (current: 2)
 5       1     flags           Reserved, always 0
-6       2     reserved        Reserved, always 0
-8       8     packet_id       Monotonic per-connection counter
-16      8     timestamp       Send time, unix microseconds
-24      4     payload_type    MSG_TYPE_* constant
-28      2     status          STATUS_OK(0) / STATUS_ERROR(1)
-30      4     payload_len     Payload byte length after header
-34      64    signature       Ed25519(device_sk, header[0..33])
-                              Zero bytes until STATE_ESTABLISHED
+6       2     payload_type    MSG_TYPE_* constant (uint16_t)
+8       4     payload_len     Payload byte length after header
+12      8     packet_id       Monotonic per-connection counter
+20      8     timestamp       Send time, unix microseconds
+28      16    sender_id       First 16 bytes of sender's device_pubkey
 ────────────────────────────────────────────────────────────────────
-Total: 98 bytes (#pragma pack(push,1), no padding)
+Total: 44 bytes (#pragma pack(push,1), no padding)
 ```
 
 ### Message types
@@ -219,7 +208,7 @@ Node A                          Wire                       Node B
   │ sodium_memzero(ephem keys)          sodium_memzero(...)   │
   │                                                           │
   │── MSG_TYPE_CHAT ─────────────────────────────────────────▶│
-  │   header[signed] ‖ nonce[8] ‖ secretbox(payload)         │
+  │   header ‖ nonce[8] ‖ secretbox(payload)                 │
 ```
 
 ---

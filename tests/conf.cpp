@@ -18,7 +18,7 @@ static fs::path tmp_config(const std::string& content) {
 // ─── Basic get/set ─────────────────────────────────────────────────────────────
 
 TEST(ConfigTest, DefaultsPopulatedOnConstruction) {
-    Config cfg;
+    Config cfg(true);  // defaults_only — skip loading config.json from CWD
     // Core defaults
     EXPECT_EQ(cfg.get_or<std::string>("core.listen_address",  "MISSING"),
               Config::Core::LISTEN_ADDRESS);

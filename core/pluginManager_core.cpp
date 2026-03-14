@@ -4,12 +4,12 @@
 
 namespace gn {
 
-PluginManager::HandlerInfo::~HandlerInfo() {
+HandlerInfo::~HandlerInfo() {
     if (handler && handler->shutdown)
         handler->shutdown(handler->user_data);
 }
 
-PluginManager::ConnectorInfo::~ConnectorInfo() {
+ConnectorInfo::~ConnectorInfo() {
     if (ops && ops->shutdown)
         ops->shutdown(ops->connector_ctx);
 }
@@ -46,12 +46,12 @@ std::expected<void, std::string> PluginManager::load_plugin(const fs::path& path
     if (h_sym) {
         auto info    = std::make_unique<HandlerInfo>();
         info->lib    = std::move(lib);
-        info->api_c  = *host_api_;
-        info->api_c.plugin_type      = PLUGIN_TYPE_HANDLER;
-        info->api_c.internal_logger  = host_api_->internal_logger;
+        info->api  = *host_api_;
+        info->api.plugin_type      = PLUGIN_TYPE_HANDLER;
+        info->api.internal_logger  = host_api_->internal_logger;
 
         handler_t* h = nullptr;
-        if ((*h_sym)(&info->api_c, &h) != 0 || !h)
+        if ((*h_sym)(&info->api, &h) != 0 || !h)
             return std::unexpected(
                 fmt::format("handler_init() failed: {}", path.filename().string()));
 
@@ -77,12 +77,12 @@ std::expected<void, std::string> PluginManager::load_plugin(const fs::path& path
     if (c_sym) {
         auto info   = std::make_unique<ConnectorInfo>();
         info->lib   = std::move(lib);
-        info->api_c = *host_api_;
-        info->api_c.plugin_type     = PLUGIN_TYPE_CONNECTOR;
-        info->api_c.internal_logger = host_api_->internal_logger;
+        info->api = *host_api_;
+        info->api.plugin_type     = PLUGIN_TYPE_CONNECTOR;
+        info->api.internal_logger = host_api_->internal_logger;
 
         connector_ops_t* ops = nullptr;
-        if ((*c_sym)(&info->api_c, &ops) != 0 || !ops)
+        if ((*c_sym)(&info->api, &ops) != 0 || !ops)
             return std::unexpected(
                 fmt::format("connector_init() failed: {}", path.filename().string()));
 

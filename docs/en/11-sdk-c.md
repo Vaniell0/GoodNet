@@ -10,7 +10,7 @@ The C SDK is the only interface a plugin needs to know — usable from any langu
 
 ```c
 #define GNET_MAGIC     0x474E4554U  // 'GNET'
-#define GNET_PROTO_VER 1U
+#define GNET_PROTO_VER 2U
 
 typedef uint64_t conn_id_t;
 #define CONN_ID_INVALID 0ULL
@@ -28,12 +28,12 @@ typedef enum {
     STATE_ESTABLISHED, STATE_CLOSING, STATE_BLOCKED, STATE_CLOSED
 } conn_state_t;
 
-// Packed header: 98 bytes, no padding
+// Packed header v2: 44 bytes, no padding
 typedef struct {
-    uint32_t magic; uint8_t proto_ver; uint8_t flags; uint16_t reserved;
+    uint32_t magic; uint8_t proto_ver; uint8_t flags;
+    uint16_t payload_type; uint32_t payload_len;
     uint64_t packet_id; uint64_t timestamp;
-    uint32_t payload_type; uint16_t status; uint32_t payload_len;
-    uint8_t  signature[64];
+    uint8_t  sender_id[16];
 } header_t;
 
 typedef struct {

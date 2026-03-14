@@ -69,10 +69,6 @@ struct handler_t {
 /// @brief Handler plugin entry point.
 typedef int (*handler_init_t)(host_api_t* api, handler_t** out_handler);
 
-/// @brief Optional metadata export called before handler_init().
-///        Export this symbol to let PluginManager read metadata without init.
-typedef const plugin_info_t* (*plugin_get_info_t)(void);
-
 #ifdef __cplusplus
 }
 #endif

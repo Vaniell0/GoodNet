@@ -1,0 +1,48 @@
+# docker-compose.yml — Two-node ICE inter-container test
+#
+# Prerequisites:
+#   nix build .#docker && nix run .#docker-load
+#
+# Usage:
+#   docker-compose up --abort-on-container-exit
+#
+# Phase 1 (TCP baseline): node-b connects to node-a via TCP, runs benchmark.
+# Phase 2 (ICE upgrade):  after ESTABLISHED, ICE negotiation over UDP.
+# Phase 3 (fallback):     block UDP with iptables, verify TCP continues.
+
+networks:
+  goodnet_test:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+
+services:
+  node-a:
+    image: goodnet-docker:latest
+    container_name: gn-node-a
+    networks:
+      goodnet_test:
+        ipv4_address: 172.20.0.10
+    command: ["--listen", "25565", "-j", "2"]
+    ports:
+      - "25565:25565"
+
+  node-b:
+    image: goodnet-docker:latest
+    container_name: gn-node-b
+    networks:
+      goodnet_test:
+        ipv4_address: 172.20.0.11
+    command:
+      - "--target"
+      - "tcp://172.20.0.10:25565"
+      - "--size"
+      - "1"
+      - "--count"
+      - "1000"
+      - "-j"
+      - "2"
+      - "--exit-code"
+    depends_on:
+      - node-a

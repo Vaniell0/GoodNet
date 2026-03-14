@@ -21,5 +21,10 @@
 !README.md
 !LISENCE
 
+!.github/
+!docker-compose.yml
+!docker-compose.ice.yml
+!ci/
+
 /plugins/**/libs
 /plugins/**/build

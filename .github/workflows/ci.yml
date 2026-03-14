@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [dev, main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: Build core + plugins
+        run: nix build --print-build-logs
+
+      - name: Build Docker image
+        run: nix build .#docker
+
+  docker-integration:
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: Build and load Docker image
+        run: nix build .#docker && nix run .#docker-load
+
+      - name: TCP integration test
+        run: >
+          docker compose up
+          --abort-on-container-exit
+          --exit-code-from node-b
+
+      - name: TCP cleanup
+        if: always()
+        run: docker compose down -v --remove-orphans
+
+      - name: ICE integration test
+        run: >
+          docker compose
+          -f docker-compose.yml
+          -f docker-compose.ice.yml
+          up --abort-on-container-exit
+          --exit-code-from node-b
+
+      - name: ICE cleanup
+        if: always()
+        run: >
+          docker compose
+          -f docker-compose.yml
+          -f docker-compose.ice.yml
+          down -v --remove-orphans

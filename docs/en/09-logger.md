@@ -76,7 +76,7 @@ LOG_SCOPED_TRACE();   // ">>> func" on entry, "<<< func" on exit
 
 ```cpp
 // PluginManager before calling *_init():
-info->api_c.internal_logger = Logger::get_raw_ptr();
+info->api.internal_logger = Logger::get_raw_ptr();
 
 // In plugin via sync_plugin_context(api):
 Logger::set_external_logger(

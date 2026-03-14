@@ -1,14 +1,14 @@
 # cmake/pch.cmake
 #
-# Precompiled Headers — ускоряют инкрементальную сборку в nix develop.
-# В Nix-деривациях (BUILD_TESTING=ON, чистая сборка) PCH не нужен:
-# каждый TU компилируется один раз, кеш деривации хранит весь вывод.
+# Precompiled Headers — speed up incremental builds in nix develop.
+# In Nix derivations (clean builds) PCH is unnecessary: each TU compiles
+# once and the derivation cache stores all output.
 #
-# Отключается переменной GOODNET_DISABLE_PCH (автоматически при Nix):
+# Disabled by GOODNET_DISABLE_PCH (set automatically in Nix derivations):
 #   cmake -DGOODNET_DISABLE_PCH=ON ...
 #
-# Включить явно для nix develop:
-#   cfgd  (алиас передаёт без этого флага → PCH активен)
+# Enabled implicitly in Debug builds within nix develop:
+#   cfgd  (alias passes Debug without the disable flag -> PCH active)
 
 option(GOODNET_DISABLE_PCH "Disable precompiled headers (set ON in CI/Nix builds)" OFF)
 

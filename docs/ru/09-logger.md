@@ -100,7 +100,7 @@ LOG_SCOPED_DEBUG();
 
 ```cpp
 // PluginManager перед вызовом *_init():
-info->api_c.internal_logger = Logger::get_raw_ptr();
+info->api.internal_logger = Logger::get_raw_ptr();
 
 // В плагине (через sdk/cpp/plugin.hpp):
 // sync_plugin_context(api) вызывает:

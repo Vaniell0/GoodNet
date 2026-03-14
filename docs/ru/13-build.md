@@ -44,7 +44,6 @@ nix build .#bundle     # bundle плагинов
 | zstd | Сжатие пакетов >512 байт |
 | spdlog + fmt | Логирование |
 | nlohmann_json | Config, манифесты плагинов |
-| **ftxui** | **CLI TUI (терминальный UI)** |
 | GTest | Тесты |
 
 ---
@@ -83,11 +82,6 @@ src/
 ├── logger.cpp        # spdlog включается ТОЛЬКО здесь
 └── signals.cpp       # EventSignalBase::Impl реализация
 
-cli/                  # TUI (ftxui), подключается только к исполняемому файлу
-├── app.cpp           # Точка входа TUI-приложения
-├── cli.hpp           # Типы, команды, интерфейс
-├── commands.cpp      # Обработчики: connect, disconnect, send, stats, plugins
-└── views.cpp         # Виджеты: таблица соединений, лог событий, stats panel
 ```
 
 `core.cpp` содержит единственный `#include <boost/asio.hpp>`. Все остальные TU подключают только `core.hpp` (Pimpl) или SDK-заголовки. Это принципиально: время компиляции downstream-кода не зависит от Boost.

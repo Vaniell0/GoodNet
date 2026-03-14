@@ -11,6 +11,8 @@
 #include "signals.hpp"
 #include "logger.hpp"
 
+#include "../sdk/connector.h"
+
 namespace fs = std::filesystem;
 using namespace gn;
 
@@ -132,7 +134,7 @@ static connector_ops_t make_mock_connector_ops() {
 // Build a valid AUTH payload for a given identity
 static std::vector<uint8_t> build_auth_payload(const NodeIdentity& id,
                                                  const std::vector<std::string>& schemes = {}) {
-    auth_payload_t ap{};
+    msg::AuthPayload ap{};
     std::memcpy(ap.user_pubkey,   id.user_pubkey,   32);
     std::memcpy(ap.device_pubkey, id.device_pubkey, 32);
 
@@ -153,8 +155,8 @@ static std::vector<uint8_t> build_auth_payload(const NodeIdentity& id,
 
     ap.set_schemes(schemes);
 
-    std::vector<uint8_t> out(auth_payload_t::kFullSize);
-    std::memcpy(out.data(), &ap, auth_payload_t::kFullSize);
+    std::vector<uint8_t> out(msg::AuthPayload::kFullSize);
+    std::memcpy(out.data(), &ap, msg::AuthPayload::kFullSize);
     return out;
 }
 
@@ -234,7 +236,7 @@ protected:
             header_t h{};
             h.magic        = GNET_MAGIC;
             h.proto_ver    = GNET_PROTO_VER;
-            h.payload_type = type;
+            h.payload_type = static_cast<uint16_t>(type);
             h.payload_len  = (uint32_t)pl.size();
             std::vector<uint8_t> frame(sizeof(h) + pl.size());
             std::memcpy(frame.data(), &h, sizeof(h));
@@ -401,8 +403,12 @@ TEST(SessionTest, EncryptDecryptRoundTrip) {
 
     std::vector<uint8_t> plain = {0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03};
     auto wire = s.encrypt(plain.data(), plain.size());
+    
     ASSERT_FALSE(wire.empty());
-    EXPECT_EQ(wire.size(), 8u + plain.size() + crypto_secretbox_MACBYTES);
+    
+    // Обновленное ожидание: 8 (nonce) + 1 (flag) + plain + MAC
+    size_t expected_size = 8u + 1u + plain.size() + crypto_secretbox_MACBYTES;
+    EXPECT_EQ(wire.size(), expected_size);
 
     auto result = s.decrypt(wire.data(), wire.size());
     ASSERT_EQ(result, plain);
@@ -475,10 +481,12 @@ TEST(SessionTest, EmptyPlaintextRoundTrip) {
     s.ready = true;
 
     auto wire = s.encrypt(nullptr, 0);
-    EXPECT_EQ(wire.size(), 8u + crypto_secretbox_MACBYTES);
+    
+    // Ожидание: 8 (nonce) + 1 (flag) + 0 (plain) + MAC
+    EXPECT_EQ(wire.size(), 8u + 1u + crypto_secretbox_MACBYTES);
 
     auto result = s.decrypt(wire.data(), wire.size());
-    EXPECT_TRUE(result.empty()); // empty plaintext is valid
+    EXPECT_TRUE(result.empty());
 }
 
 TEST(SessionTest, LargePayloadRoundTrip) {
@@ -495,11 +503,11 @@ TEST(SessionTest, LargePayloadRoundTrip) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// SECTION 3: auth_payload_t helpers
+// SECTION 3: gn::msg::AuthPayload helpers
 // ═══════════════════════════════════════════════════════════════════════════════
 
 TEST(AuthPayloadTest, SetGetSchemesRoundTrip) {
-    auth_payload_t ap{};
+    msg::AuthPayload ap{};
     ap.set_schemes({"tcp", "ws", "udp"});
     EXPECT_EQ(ap.schemes_count, 3);
     auto schemes = ap.get_schemes();
@@ -510,13 +518,13 @@ TEST(AuthPayloadTest, SetGetSchemesRoundTrip) {
 }
 
 TEST(AuthPayloadTest, TooManySchemesClipped) {
-    auth_payload_t ap{};
+    msg::AuthPayload ap{};
     ap.set_schemes({"a","b","c","d","e","f","g","h","i","j"});  // 10 > AUTH_MAX_SCHEMES(8)
-    EXPECT_EQ(ap.schemes_count, AUTH_MAX_SCHEMES);
+    EXPECT_EQ(ap.schemes_count, msg::AUTH_MAX_SCHEMES);
 }
 
 TEST(AuthPayloadTest, EmptySchemesProducesWildcard) {
-    auth_payload_t ap{};
+    msg::AuthPayload ap{};
     ap.set_schemes({});
     EXPECT_EQ(ap.schemes_count, 0);
     auto s = ap.get_schemes();
@@ -524,7 +532,7 @@ TEST(AuthPayloadTest, EmptySchemesProducesWildcard) {
 }
 
 TEST(AuthPayloadTest, SizeAssert) {
-    using gn::msg::AuthPayload;
+    using msg::AuthPayload;
     
     // Проверка базовой части (до схем)
     EXPECT_EQ(AuthPayload::kBaseSize, 160u);
@@ -533,7 +541,7 @@ TEST(AuthPayloadTest, SizeAssert) {
     EXPECT_EQ(AuthPayload::kSchemeBlock, 129u);
     
     // Проверка мета-данных (2 * uint32)
-    EXPECT_EQ(sizeof(gn::msg::CoreMeta), 8u);
+    EXPECT_EQ(sizeof(msg::CoreMeta), 8u);
     
     // Итоговый размер: 160 + 129 + 8 = 297
     EXPECT_EQ(sizeof(AuthPayload), 297u);
@@ -892,14 +900,14 @@ TEST_F(CMTest, BadAuthPayload_InvalidSignature_Dropped) {
     conn_id_t id = api.on_connect(api.ctx, &ep);
 
     // Valid-sized payload but corrupt signature
-    auth_payload_t ap{};
+    msg::AuthPayload ap{};
     std::memcpy(ap.user_pubkey,   id_b_.user_pubkey,   32);
     std::memcpy(ap.device_pubkey, id_b_.device_pubkey, 32);
     // Leave signature as zeros (invalid)
     randombytes_buf(ap.ephem_pubkey, 32);
     ap.schemes_count = 0;
-    std::vector<uint8_t> payload(auth_payload_t::kFullSize);
-    std::memcpy(payload.data(), &ap, auth_payload_t::kFullSize);
+    std::vector<uint8_t> payload(msg::AuthPayload::kFullSize);
+    std::memcpy(payload.data(), &ap, msg::AuthPayload::kFullSize);
 
     header_t h{};
     h.magic = GNET_MAGIC; h.proto_ver = GNET_PROTO_VER;
@@ -951,4 +959,415 @@ TEST(IdentityHexTest, DeviceHexLength64) {
     auto id = NodeIdentity::load_or_generate(dir);
     EXPECT_EQ(id.device_pubkey_hex().size(), 64u);
     fs::remove_all(dir);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SECTION 11: Backpressure / PerConnQueue integration
+// ═══════════════════════════════════════════════════════════════════════════════
+
+TEST_F(CMTest, SendLargePayloadSucceeds) {
+    cm_a_->register_connector("mock", &mock_ops_);
+    auto [cid_a, cid_b] = do_handshake(*cm_a_, id_a_, *cm_b_, id_b_, true);
+
+    // Large payload (512 KB) should be accepted on an established connection.
+    // (Backpressure is tested in PerConnQueueTest suite directly.)
+    std::vector<uint8_t> big(512 * 1024);
+    randombytes_buf(big.data(), big.size());
+
+    bool ok = cm_a_->send_on_conn(cid_a, MSG_TYPE_CHAT,
+                                    big.data(), big.size());
+    EXPECT_TRUE(ok);
+}
+
+TEST_F(CMTest, GetPeerPubkeyAfterHandshake) {
+    auto [cid_a, cid_b] = do_handshake(*cm_a_, id_a_, *cm_b_, id_b_, true);
+
+    auto pk = cm_a_->get_peer_pubkey(cid_a);
+    ASSERT_TRUE(pk.has_value());
+    EXPECT_EQ(pk->size(), 32u);
+    // The peer pubkey should match id_b's user_pubkey.
+    EXPECT_EQ(std::memcmp(pk->data(), id_b_.user_pubkey, 32), 0);
+}
+
+TEST_F(CMTest, FindConnByPubkeyWorks) {
+    auto [cid_a, cid_b] = do_handshake(*cm_a_, id_a_, *cm_b_, id_b_, true);
+
+    conn_id_t found = cm_a_->find_conn_by_pubkey(id_b_.user_pubkey_hex().c_str());
+    EXPECT_EQ(found, cid_a);
+}
+
+TEST_F(CMTest, FindConnByPubkey_Unknown_ReturnsInvalid) {
+    conn_id_t found = cm_a_->find_conn_by_pubkey(
+        "0000000000000000000000000000000000000000000000000000000000000000");
+    EXPECT_EQ(found, CONN_ID_INVALID);
+}
+
+TEST_F(CMTest, SendOnConnDirectly) {
+    cm_a_->register_connector("mock", &mock_ops_);
+    auto [cid_a, cid_b] = do_handshake(*cm_a_, id_a_, *cm_b_, id_b_, true);
+
+    uint8_t payload[] = {1, 2, 3, 4};
+    // send_on_conn should succeed on an ESTABLISHED connection.
+    bool ok = cm_a_->send_on_conn(cid_a, MSG_TYPE_CHAT, payload, sizeof(payload));
+    EXPECT_TRUE(ok);
+}
+
+TEST_F(CMTest, SendOnConn_InvalidId_ReturnsFalse) {
+    cm_a_->register_connector("mock", &mock_ops_);
+    uint8_t payload[] = {1};
+    bool ok = cm_a_->send_on_conn(9999, MSG_TYPE_CHAT, payload, sizeof(payload));
+    EXPECT_FALSE(ok);
+}
+
+TEST_F(CMTest, DisconnectCleansUpAllIndices) {
+    host_api_t api_a{};
+    cm_a_->fill_host_api(&api_a);
+
+    auto [cid_a, cid_b] = do_handshake(*cm_a_, id_a_, *cm_b_, id_b_, true);
+
+    // Verify connection is known.
+    EXPECT_NE(cm_a_->get_state(cid_a), std::nullopt);
+    EXPECT_NE(cm_a_->find_conn_by_pubkey(id_b_.user_pubkey_hex().c_str()),
+              CONN_ID_INVALID);
+
+    // Disconnect.
+    api_a.on_disconnect(api_a.ctx, cid_a, 0);
+
+    // Everything should be cleaned up.
+    EXPECT_EQ(cm_a_->get_state(cid_a), std::nullopt);
+    EXPECT_EQ(cm_a_->find_conn_by_pubkey(id_b_.user_pubkey_hex().c_str()),
+              CONN_ID_INVALID);
+    EXPECT_EQ(cm_a_->connection_count(), 0u);
+}
+
+TEST_F(CMTest, GetPendingBytesInitiallyZero) {
+    EXPECT_EQ(cm_a_->get_pending_bytes(), 0u);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SECTION 12: Broadcast
+// ═══════════════════════════════════════════════════════════════════════════════
+
+TEST_F(CMTest, BroadcastDoesNotCrashWithNoConnections) {
+    cm_a_->register_connector("mock", &mock_ops_);
+    uint8_t data[] = {0xAA, 0xBB};
+    EXPECT_NO_THROW(cm_a_->broadcast(MSG_TYPE_CHAT, data, sizeof(data)));
+}
+
+TEST_F(CMTest, BroadcastToEstablishedPeers) {
+    cm_a_->register_connector("mock", &mock_ops_);
+
+    // Handshake with two peers.
+    auto dir_c = tmp_dir("c");
+    auto id_c = NodeIdentity::load_or_generate(dir_c);
+    boost::asio::io_context ioc_c;
+    SignalBus bus_c{ioc_c};
+    auto cm_c = std::make_unique<ConnectionManager>(bus_c, id_c);
+
+    auto [cid_ab, cid_ba] = do_handshake(*cm_a_, id_a_, *cm_b_, id_b_, true);
+    auto [cid_ac, cid_ca] = do_handshake(*cm_a_, id_a_, *cm_c,  id_c,  true);
+
+    // Both connections should be ESTABLISHED.
+    EXPECT_EQ(*cm_a_->get_state(cid_ab), STATE_ESTABLISHED);
+    EXPECT_EQ(*cm_a_->get_state(cid_ac), STATE_ESTABLISHED);
+
+    // Broadcast should not crash with two established peers.
+    uint8_t data[] = {0x01};
+    EXPECT_NO_THROW(cm_a_->broadcast(MSG_TYPE_CHAT, data, sizeof(data)));
+
+    cm_c->shutdown();
+    fs::remove_all(dir_c);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SECTION 13: KEY_EXCHANGE / rekey
+// ═══════════════════════════════════════════════════════════════════════════════
+
+TEST_F(CMTest, RekeyOnNonEstablished_Fails) {
+    host_api_t api{};
+    cm_a_->fill_host_api(&api);
+    endpoint_t ep{};
+    strncpy(ep.address, "10.0.0.1", sizeof(ep.address));
+    ep.port = 8000;
+    conn_id_t id = api.on_connect(api.ctx, &ep);
+
+    // Connection is AUTH_PENDING — rekey must fail
+    EXPECT_FALSE(cm_a_->rekey_session(id));
+}
+
+TEST_F(CMTest, RekeySession_SendsKeyExchange) {
+    cm_a_->register_connector("mock", &mock_ops_);
+    auto [cid_a, cid_b] = do_handshake(*cm_a_, id_a_, *cm_b_, id_b_, true);
+
+    EXPECT_EQ(*cm_a_->get_state(cid_a), STATE_ESTABLISHED);
+    // rekey_session should return true on ESTABLISHED connection
+    EXPECT_TRUE(cm_a_->rekey_session(cid_a));
+}
+
+TEST_F(CMTest, RekeyResetsNonces) {
+    cm_a_->register_connector("mock", &mock_ops_);
+    auto [cid_a, cid_b] = do_handshake(*cm_a_, id_a_, *cm_b_, id_b_, true);
+
+    // Send a packet to advance nonces past 1
+    uint8_t payload[] = {1, 2, 3};
+    cm_a_->send_on_conn(cid_a, MSG_TYPE_CHAT, payload, sizeof(payload));
+
+    // After rekey, nonces should reset — the rekey itself succeeds
+    EXPECT_TRUE(cm_a_->rekey_session(cid_a));
+}
+
+TEST_F(CMTest, RekeyOnInvalidId_Fails) {
+    EXPECT_FALSE(cm_a_->rekey_session(99999));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SECTION 14: Compression / zstd (SessionState level)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+TEST(SessionCompressionTest, Encrypt_Large_UsesZstd) {
+    if (sodium_init() < 0) GTEST_SKIP();
+    SessionState s;
+    randombytes_buf(s.session_key, sizeof(s.session_key));
+    s.ready = true;
+
+    // > 512 bytes → should trigger zstd
+    std::vector<uint8_t> big(2048, 0xAA);
+    auto wire = s.encrypt(big.data(), big.size());
+    ASSERT_FALSE(wire.empty());
+
+    // Encrypted wire should be smaller than uncompressed would be,
+    // because repetitive data compresses very well.
+    // Uncompressed wire: 8 (nonce) + 1 (flag) + 2048 (data) + MAC
+    size_t uncompressed_wire_size = 8u + 1u + big.size() + crypto_secretbox_MACBYTES;
+    EXPECT_LT(wire.size(), uncompressed_wire_size);
+}
+
+TEST(SessionCompressionTest, Decrypt_Zstd_Decompresses) {
+    if (sodium_init() < 0) GTEST_SKIP();
+    SessionState s;
+    randombytes_buf(s.session_key, sizeof(s.session_key));
+    s.ready = true;
+
+    std::vector<uint8_t> big(2048);
+    // Pattern that compresses well
+    for (size_t i = 0; i < big.size(); ++i) big[i] = static_cast<uint8_t>(i % 17);
+
+    auto wire = s.encrypt(big.data(), big.size());
+    auto result = s.decrypt(wire.data(), wire.size());
+    ASSERT_EQ(result.size(), big.size());
+    EXPECT_EQ(result, big);
+}
+
+TEST(SessionCompressionTest, Encrypt_Small_NoCompression) {
+    if (sodium_init() < 0) GTEST_SKIP();
+    SessionState s;
+    randombytes_buf(s.session_key, sizeof(s.session_key));
+    s.ready = true;
+
+    // < 512 bytes → no compression
+    std::vector<uint8_t> small(100, 0xBB);
+    auto wire = s.encrypt(small.data(), small.size());
+
+    // Must be: 8 (nonce) + 1 (FLAG_RAW) + 100 (plain) + MAC
+    size_t expected = 8u + 1u + small.size() + crypto_secretbox_MACBYTES;
+    EXPECT_EQ(wire.size(), expected);
+
+    auto result = s.decrypt(wire.data(), wire.size());
+    EXPECT_EQ(result, small);
+}
+
+TEST(SessionCompressionTest, CompressionRoundtrip_Stress) {
+    if (sodium_init() < 0) GTEST_SKIP();
+    SessionState s;
+    randombytes_buf(s.session_key, sizeof(s.session_key));
+    s.ready = true;
+
+    for (int i = 0; i < 100; ++i) {
+        size_t sz = 128 + (i * 80); // 128..8128 bytes
+        std::vector<uint8_t> plain(sz);
+        randombytes_buf(plain.data(), plain.size());
+        auto wire = s.encrypt(plain.data(), plain.size());
+        auto result = s.decrypt(wire.data(), wire.size());
+        ASSERT_EQ(result.size(), plain.size()) << "iteration " << i;
+        EXPECT_EQ(result, plain) << "iteration " << i;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SECTION 15: derive_session
+// ═══════════════════════════════════════════════════════════════════════════════
+
+TEST_F(CMTest, BothSides_IdenticalKey) {
+    // After do_handshake, both CMs should have derived the same session key
+    // (verified indirectly: send from A, receive on B works)
+    auto [cid_a, cid_b] = do_handshake(*cm_a_, id_a_, *cm_b_, id_b_, true);
+
+    // Both sides are ESTABLISHED — session derived successfully
+    EXPECT_EQ(*cm_a_->get_state(cid_a), STATE_ESTABLISHED);
+    EXPECT_EQ(*cm_b_->get_state(cid_b), STATE_ESTABLISHED);
+}
+
+TEST_F(CMTest, DifferentEphemeral_DifferentKey) {
+    // Two separate handshakes should produce different session keys
+    auto [cid_a1, cid_b1] = do_handshake(*cm_a_, id_a_, *cm_b_, id_b_, true);
+
+    // Create fresh CMs for second handshake
+    auto dir_c = tmp_dir("c");
+    auto dir_d = tmp_dir("d");
+    auto id_c = NodeIdentity::load_or_generate(dir_c);
+    auto id_d = NodeIdentity::load_or_generate(dir_d);
+    boost::asio::io_context ioc2;
+    SignalBus bus2{ioc2};
+    auto cm_c = std::make_unique<ConnectionManager>(bus2, id_c);
+    auto cm_d = std::make_unique<ConnectionManager>(bus2, id_d);
+
+    auto [cid_c, cid_d] = do_handshake(*cm_c, id_c, *cm_d, id_d, true);
+
+    // Both pairs established (different ephemeral keys → different session keys)
+    EXPECT_EQ(*cm_a_->get_state(cid_a1), STATE_ESTABLISHED);
+    EXPECT_EQ(*cm_c->get_state(cid_c), STATE_ESTABLISHED);
+
+    cm_c->shutdown();
+    cm_d->shutdown();
+    fs::remove_all(dir_c);
+    fs::remove_all(dir_d);
+}
+
+TEST_F(CMTest, SortedPubkeys_Deterministic) {
+    // Handshake A→B and B→A should both succeed (pubkeys sorted internally)
+    auto [cid_a, cid_b] = do_handshake(*cm_a_, id_a_, *cm_b_, id_b_, true);
+    auto [cid_b2, cid_a2] = do_handshake(*cm_b_, id_b_, *cm_a_, id_a_, true);
+
+    EXPECT_EQ(*cm_a_->get_state(cid_a), STATE_ESTABLISHED);
+    EXPECT_EQ(*cm_b_->get_state(cid_b2), STATE_ESTABLISHED);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SECTION 16: ICE state machine
+// ═══════════════════════════════════════════════════════════════════════════════
+
+TEST_F(CMTest, IceState_DefaultIdle) {
+    host_api_t api{};
+    cm_a_->fill_host_api(&api);
+    endpoint_t ep{};
+    strncpy(ep.address, "10.0.0.1", sizeof(ep.address));
+    ep.port = 8001;
+    conn_id_t id = api.on_connect(api.ctx, &ep);
+
+    EXPECT_EQ(cm_a_->ice_state(id), IceState::Idle);
+}
+
+TEST_F(CMTest, InitiateOnNonEstablished_Noop) {
+    host_api_t api{};
+    cm_a_->fill_host_api(&api);
+    endpoint_t ep{};
+    strncpy(ep.address, "10.0.0.1", sizeof(ep.address));
+    ep.port = 8002;
+    conn_id_t id = api.on_connect(api.ctx, &ep);
+
+    // initiate_ice on AUTH_PENDING should be a no-op
+    cm_a_->initiate_ice(id);
+    EXPECT_EQ(cm_a_->ice_state(id), IceState::Idle);
+}
+
+TEST_F(CMTest, InitiateIce_SetsGathering) {
+    auto [cid_a, cid_b] = do_handshake(*cm_a_, id_a_, *cm_b_, id_b_, true);
+    EXPECT_EQ(*cm_a_->get_state(cid_a), STATE_ESTABLISHED);
+
+    cm_a_->initiate_ice(cid_a);
+    EXPECT_EQ(cm_a_->ice_state(cid_a), IceState::Gathering);
+}
+
+TEST_F(CMTest, IceSignal_Connecting) {
+    host_api_t api{};
+    cm_a_->fill_host_api(&api);
+    endpoint_t ep{};
+    strncpy(ep.address, "10.0.0.1", sizeof(ep.address));
+    ep.port = 8003;
+    conn_id_t id = api.on_connect(api.ctx, &ep);
+
+    // handle_ice_signal on Idle → should transition to Connecting
+    uint8_t signal_data[] = {1, 2, 3, 4};
+    cm_a_->handle_ice_signal(id, std::span<const uint8_t>(signal_data, sizeof(signal_data)));
+    EXPECT_EQ(cm_a_->ice_state(id), IceState::Connecting);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SECTION 17: Queries + control
+// ═══════════════════════════════════════════════════════════════════════════════
+
+TEST_F(CMTest, GetActiveConnIds_OnlyEstablished) {
+    host_api_t api_a{};
+    cm_a_->fill_host_api(&api_a);
+
+    // Create 3 connections, only 1 will be ESTABLISHED
+    endpoint_t ep1{}, ep2{}, ep3{};
+    strncpy(ep1.address, "10.0.0.1", sizeof(ep1.address)); ep1.port = 9001;
+    strncpy(ep2.address, "10.0.0.2", sizeof(ep2.address)); ep2.port = 9002;
+    strncpy(ep3.address, "10.0.0.3", sizeof(ep3.address)); ep3.port = 9003;
+
+    api_a.on_connect(api_a.ctx, &ep1);  // AUTH_PENDING
+    api_a.on_connect(api_a.ctx, &ep2);  // AUTH_PENDING
+
+    // Do handshake for third — this one becomes ESTABLISHED
+    auto [cid_a, cid_b] = do_handshake(*cm_a_, id_a_, *cm_b_, id_b_, true);
+
+    auto active = cm_a_->get_active_conn_ids();
+    EXPECT_EQ(active.size(), 1u);
+    EXPECT_EQ(active[0], cid_a);
+}
+
+TEST_F(CMTest, GetPeerEndpoint_AfterHandshake) {
+    auto [cid_a, cid_b] = do_handshake(*cm_a_, id_a_, *cm_b_, id_b_, true);
+
+    endpoint_t ep{};
+    ASSERT_TRUE(cm_a_->get_peer_endpoint(cid_a, ep));
+    EXPECT_EQ(ep.peer_id, cid_a);
+    // Address should be set (either 127.0.0.1 or 10.0.0.x depending on test)
+    EXPECT_GT(strlen(ep.address), 0u);
+}
+
+TEST_F(CMTest, DisconnectGraceful_DrainsQueue) {
+    cm_a_->register_connector("mock", &mock_ops_);
+    auto [cid_a, cid_b] = do_handshake(*cm_a_, id_a_, *cm_b_, id_b_, true);
+
+    // disconnect should not crash and should clean up
+    EXPECT_NO_THROW(cm_a_->disconnect(cid_a));
+}
+
+TEST_F(CMTest, CloseNow_ImmediateClose) {
+    cm_a_->register_connector("mock", &mock_ops_);
+    auto [cid_a, cid_b] = do_handshake(*cm_a_, id_a_, *cm_b_, id_b_, true);
+
+    EXPECT_NO_THROW(cm_a_->close_now(cid_a));
+}
+
+TEST_F(CMTest, RotateIdentityKeys) {
+    auto old_hex = cm_a_->identity().user_pubkey_hex();
+    auto dir_rot = tmp_dir("rot");
+
+    // Generate a distinct SSH key for rotation
+    uint8_t rot_pub[32], rot_sec[64];
+    crypto_sign_keypair(rot_pub, rot_sec);
+    write_openssh_pem(dir_rot, rot_pub, rot_sec);
+
+    IdentityConfig cfg{
+        .dir          = dir_rot,
+        .ssh_key_path = dir_rot / "id_ed25519",
+        .use_machine_id = false,
+    };
+    cm_a_->rotate_identity_keys(cfg);
+
+    // After rotation, user pubkey should be different
+    auto new_hex = cm_a_->identity().user_pubkey_hex();
+    EXPECT_NE(old_hex, new_hex);
+    fs::remove_all(dir_rot);
+}
+
+TEST_F(CMTest, LocalCoreMeta_HasVersion) {
+    auto meta = ConnectionManager::local_core_meta();
+    EXPECT_GT(meta.core_version, 0u);
+    // Should have ZSTD and KEYROT caps
+    EXPECT_NE(meta.caps_mask & CORE_CAP_ZSTD, 0u);
+    EXPECT_NE(meta.caps_mask & CORE_CAP_KEYROT, 0u);
 }

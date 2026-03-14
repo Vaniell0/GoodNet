@@ -4,31 +4,31 @@
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│                          GoodNet Node                                │
-│                                                                       │
-│  main.cpp ──▶ Config ──▶ Logger                                      │
-│      │                                                                │
-│      └──────────────▶  ConnectionManager                             │
-│                         │                                             │
-│                         ├── NodeIdentity                             │
-│                         │   user_key (Ed25519)                       │
-│                         │   device_key (Ed25519, hardware-bound)     │
-│                         │                                             │
-│                         ├── records_ : conn_id → ConnectionRecord    │
-│                         │   ├── SessionState (session_key, nonces)   │
-│                         │   ├── recv_buf (TCP reassembly)            │
-│                         │   └── peer_pubkeys, peer_schemes           │
-│                         │                                             │
-│                         └── SignalBus                                │
-│                             channels_[msg_type][handler_name]        │
-│                             wildcards_[handler_name]                 │
-│                             each channel has its own asio::strand    │
-│                                   │                                   │
+│                          GoodNet Node                               │
+│                                                                     │
+│  main.cpp ──▶ Config ──▶ Logger                                     │
+│      │                                                              │
+│      └──────────────▶  ConnectionManager                            │
+│                         │                                           │
+│                         ├── NodeIdentity                            │
+│                         │   user_key (Ed25519)                      │
+│                         │   device_key (Ed25519, hardware-bound)    │
+│                         │                                           │
+│                         ├── records_ : conn_id → ConnectionRecord   │
+│                         │   ├── SessionState (session_key, nonces)  │
+│                         │   ├── recv_buf (TCP reassembly)           │
+│                         │   └── peer_pubkeys, peer_schemes          │
+│                         │                                           │
+│                         └── SignalBus                               │
+│                             channels_[msg_type][handler_name]       │
+│                             wildcards_[handler_name]                │
+│                             each channel has its own asio::strand   │
+│                                   │                                 │
 │  ┌────────────────────────────────▼──────────────────────────────┐  │
-│  │                      PluginManager                             │  │
-│  │  handlers_[name]   → HandlerInfo { DynLib, handler_t*, api_c }│  │
-│  │  connectors_[scheme]→ ConnectorInfo{ DynLib, ops_t*,  api_c } │  │
-│  │  dlopen(RTLD_LOCAL) + SHA-256 verify before open             │  │
+│  │                      PluginManager                            │  │
+│  │  handlers_[name]   → HandlerInfo { DynLib, handler_t*, api }  │  │
+│  │  connectors_[scheme]→ ConnectorInfo{ DynLib, ops_t*,  api }   │  │
+│  │  dlopen(RTLD_LOCAL) + SHA-256 verify before open              │  │
 │  └───────────────────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────────────┘
 ```
@@ -44,7 +44,9 @@ TCP/UDP/WS bytes
 api->on_data(conn_id, raw, size)
        │
        ▼  [ConnectionManager::handle_data()]
-  recv_buf += raw
+  fast path: recv_buf empty && complete frame?
+    └── YES → dispatch directly (zero-copy)
+  slow path: recv_buf += raw
   loop: buf >= sizeof(header_t) + payload_len?
     ├── magic != GNET_MAGIC  → clear buf, break
     ├── buf < total          → wait for more bytes
@@ -86,11 +88,9 @@ Handler code:
   is_localhost?
     ├── YES → plain header + raw payload
     └── NO  → encrypt: nonce[8] ‖ secretbox(payload, nonce24, session_key)
-  build header_t: magic, proto_ver, type, payload_len
-  is_localhost?
-    ├── YES → skip signature
-    └── NO  → Ed25519(device_seckey, header[0..sizeof_without_sig])
-                 → header.signature[64]
+  build header_t: magic, proto_ver, type, payload_len,
+                  packet_id (monotonic), timestamp (realtime),
+                  sender_id[16] (device_pubkey prefix)
   frame = header_bytes ‖ [encrypted] payload
        │
        ▼  [connector_ops_t::send_to(conn_id, frame)]

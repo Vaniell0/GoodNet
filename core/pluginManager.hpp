@@ -1,25 +1,24 @@
 #pragma once
 
 /// @file core/pluginManager.hpp
-/// @brief Plugin loading, verification, lifecycle management.
+/// @brief Plugin loading, verification, and lifecycle management.
 ///
-/// Plugins are .so/.dylib/.dll files exporting either:
-///   handler_init(host_api_t*, handler_t**)     — message handlers
-///   connector_init(host_api_t*, connector_ops_t**) — transport connectors
+/// Each .so/.dylib/.dll exports one of:
+///   - handler_init(host_api_t*, handler_t**)
+///   - connector_init(host_api_t*, connector_ops_t**)
 ///
-/// Each plugin ships a companion <plugin>.so.json manifest with SHA-256 integrity hash.
-/// Plugins are isolated via RTLD_LOCAL; Logger is injected through api->internal_logger.
+/// A companion <name>.so.json manifest carries the SHA-256 integrity hash.
+/// Plugins are isolated via RTLD_LOCAL; logger is injected through api->internal_logger.
 
+#include <expected>
+#include <filesystem>
+#include <optional>
+#include <shared_mutex>
 #include <string_view>
 #include <unordered_map>
-#include <shared_mutex>
-#include <expected>
 #include <vector>
-#include <optional>
-#include "../sdk/connector.h"
-#include "../sdk/handler.h"
-#include "../sdk/plugin.h"
-#include "dynlib.hpp"
+
+#include "types/plugin.hpp"
 
 namespace gn {
 
@@ -27,36 +26,37 @@ namespace fs = std::filesystem;
 
 class PluginManager {
 public:
-    struct HandlerInfo {
-        DynLib      lib;
-        handler_t*  handler = nullptr;
-        fs::path    path;
-        std::string name;
-        bool        enabled = true;
-        host_api_t  api_c;
+    explicit PluginManager(host_api_t* api, fs::path plugins_base_dir = {});
+    ~PluginManager();
 
-        HandlerInfo()                              = default;
-        ~HandlerInfo();
-        HandlerInfo(const HandlerInfo&)            = delete;
-        HandlerInfo& operator=(const HandlerInfo&) = delete;
-        HandlerInfo(HandlerInfo&&) noexcept        = default;
-    };
+    // ── Loading ───────────────────────────────────────────────────────────────
 
-    struct ConnectorInfo {
-        DynLib           lib;
-        connector_ops_t* ops     = nullptr;
-        fs::path         path;
-        std::string      name;
-        std::string      scheme;
-        bool             enabled = true;
-        host_api_t       api_c;
+    std::expected<void, std::string> load_plugin   (const fs::path& path);
+    void                             load_all_plugins();
+    void                             unload_all();
 
-        ConnectorInfo()                              = default;
-        ~ConnectorInfo();
-        ConnectorInfo(const ConnectorInfo&)            = delete;
-        ConnectorInfo& operator=(const ConnectorInfo&) = delete;
-        ConnectorInfo(ConnectorInfo&&) noexcept        = default;
-    };
+    bool unload_handler (std::string_view name);
+    bool enable_handler (std::string_view name);
+    bool disable_handler(std::string_view name);
+
+    // ── Queries ───────────────────────────────────────────────────────────────
+
+    [[nodiscard]] std::optional<handler_t*>       find_handler_by_name    (std::string_view name)   const;
+    [[nodiscard]] std::optional<connector_ops_t*> find_connector_by_scheme(std::string_view scheme) const;
+
+    [[nodiscard]] std::vector<handler_t*>       get_active_handlers()        const;
+    [[nodiscard]] std::vector<connector_ops_t*> get_active_connectors()      const;
+    [[nodiscard]] std::vector<std::string>      get_enabled_handler_names()  const;
+
+    [[nodiscard]] size_t get_enabled_handler_count()   const;
+    [[nodiscard]] size_t get_enabled_connector_count() const;
+
+    void list_plugins() const;
+
+    // ── Integrity ─────────────────────────────────────────────────────────────
+
+    [[nodiscard]] static std::string               calculate_sha256(const fs::path& path);
+    [[nodiscard]] std::expected<void, std::string> verify_metadata(const fs::path& so_path) const;
 
 private:
     host_api_t* host_api_;
@@ -75,32 +75,6 @@ private:
                        StringHash, std::equal_to<>> handlers_;
     std::unordered_map<std::string, std::unique_ptr<ConnectorInfo>,
                        StringHash, std::equal_to<>> connectors_;
-
-public:
-    explicit PluginManager(host_api_t* api, fs::path plugins_base_dir = "");
-    ~PluginManager();
-
-    std::expected<void, std::string> load_plugin(const fs::path& path);
-    void load_all_plugins();
-
-    std::optional<handler_t*>       find_handler_by_name    (std::string_view name)   const;
-    std::optional<connector_ops_t*> find_connector_by_scheme(std::string_view scheme) const;
-
-    size_t get_enabled_handler_count()   const;
-    size_t get_enabled_connector_count() const;
-    void   list_plugins()                const;
-    std::vector<std::string> get_enabled_handler_names() const;
-
-    bool unload_handler (std::string_view name);
-    bool enable_handler (std::string_view name);
-    bool disable_handler(std::string_view name);
-    void unload_all();
-
-    std::vector<handler_t*>       get_active_handlers()   const;
-    std::vector<connector_ops_t*> get_active_connectors() const;
-
-    std::expected<void, std::string> verify_metadata(const fs::path& so_path) const;
-    static std::string               calculate_sha256(const fs::path& path);
 };
 
 } // namespace gn

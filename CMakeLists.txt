@@ -10,18 +10,24 @@ cmake_policy(SET CMP0167 NEW)
 option(INSTALL_DEVELOPMENT "Install SDK headers and cmake config" OFF)
 option(BUILD_TESTING "Build the testing suite" OFF)
 
-# ─── Зависимости ─────────────────────────────────────────────────────────────
+# ─── Dependencies ────────────────────────────────────────────────────────────
 
-find_package(Boost         REQUIRED COMPONENTS system filesystem)
+find_package(Boost REQUIRED COMPONENTS filesystem  program_options)
 find_package(nlohmann_json REQUIRED)
 find_package(spdlog        REQUIRED)
-find_package(ftxui         REQUIRED)
 find_package(fmt           REQUIRED)
 find_package(GTest QUIET)
 
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(SODIUM REQUIRED libsodium)
 pkg_check_modules(ZSTD REQUIRED libzstd)
+
+# ─── Coverage ────────────────────────────────────────────────────────────────
+option(GOODNET_COVERAGE "Enable code coverage instrumentation (gcov/lcov)" OFF)
+if(GOODNET_COVERAGE)
+    add_compile_options(--coverage)
+    add_link_options(--coverage)
+endif()
 
 # ─── PCH ─────────────────────────────────────────────────────────────────────
 include(cmake/pch.cmake)
@@ -35,14 +41,16 @@ set_target_properties(goodnet_sdk PROPERTIES EXPORT_NAME sdk)
 target_include_directories(goodnet_sdk INTERFACE
     $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/sdk>
     $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/sdk/cpp>
+    $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/core/data>
     $<INSTALL_INTERFACE:include/goodnet/sdk>
     $<INSTALL_INTERFACE:include/goodnet/sdk/cpp>
+    $<INSTALL_INTERFACE:include/goodnet/core/data>
 )
 
 # ─── 2. Core (SHARED) ────────────────────────────────────────────────────────
 #
-# SHARED обязателен: одна копия статических переменных (Logger, once_flag).
-# Плагин через dlopen(RTLD_GLOBAL) видит тот же Logger что и ядро.
+# SHARED is required: single copy of static variables (Logger, once_flag).
+# Plugins loaded via dlopen(RTLD_GLOBAL) see the same Logger as the core.
 
 add_library(goodnet_core SHARED
     src/capi.cpp
@@ -59,7 +67,10 @@ add_library(goodnet_core SHARED
     core/cm_session.cpp
     core/cm_identity.cpp
     core/cm_dispatch.cpp
-    core/cm_handshake.cpp
+    core/cm_lifecycle.cpp
+    core/cm_auth.cpp
+    core/cm_query.cpp
+    core/cm_capi.cpp
 
     core/data/machine_id.cpp
 )
@@ -69,7 +80,7 @@ set_target_properties(goodnet_core PROPERTIES
     EXPORT_NAME core
     VERSION     0.1.0
     SOVERSION   0
-    ENABLE_EXPORTS ON       # -rdynamic: плагины видят символы ядра
+    ENABLE_EXPORTS ON       # -rdynamic: plugins see core symbols
 )
 
 target_link_libraries(goodnet_core PUBLIC goodnet_sdk)
@@ -86,7 +97,6 @@ target_include_directories(goodnet_core
 target_link_libraries(goodnet_core
     PUBLIC  spdlog::spdlog
     PRIVATE nlohmann_json::nlohmann_json fmt::fmt
-            Boost::system
             ${ZSTD_LIBRARIES}
             ${SODIUM_LIBRARIES}
 )
@@ -94,6 +104,11 @@ target_link_libraries(goodnet_core
 target_compile_definitions(goodnet_core
     PUBLIC  SPDLOG_COMPILED_LIB
     PRIVATE GOODNET_PROJECT_ROOT="${CMAKE_SOURCE_DIR}/"
+)
+
+target_compile_definitions(goodnet_core PUBLIC 
+    $<$<CONFIG:Release>:_FORTIFY_SOURCE=2>
+    $<$<CONFIG:RelWithDebInfo>:_FORTIFY_SOURCE=2>
 )
 
 apply_pch(goodnet_core)
@@ -111,13 +126,12 @@ target_compile_definitions(goodnet PRIVATE
 )
 apply_pch(goodnet)
 
-# ─── 4. Установка ────────────────────────────────────────────────────────────
+# ─── 4. Installation ─────────────────────────────────────────────────────────
 
 if(INSTALL_DEVELOPMENT)
     install(DIRECTORY sdk/      DESTINATION include/goodnet/sdk)
-    install(DIRECTORY sdk/cpp/  DESTINATION include/goodnet/sdk/cpp)
     install(DIRECTORY include/  DESTINATION include/goodnet)
-    install(DIRECTORY core/     DESTINATION include/goodnet/core
+    install(DIRECTORY core/     DESTINATION include/goodnet/core/
             FILES_MATCHING PATTERN "*.hpp")
 
     install(FILES cmake/pch.cmake      DESTINATION lib/cmake/GoodNet)
@@ -143,7 +157,7 @@ endif()
 install(TARGETS goodnet      RUNTIME DESTINATION bin)
 install(TARGETS goodnet_core LIBRARY DESTINATION lib)
 
-# ─── 5. Тесты ────────────────────────────────────────────────────────────────
+# ─── 5. Tests ────────────────────────────────────────────────────────────────
 
 if(BUILD_TESTING AND GTest_FOUND)
     enable_testing()
@@ -159,6 +173,8 @@ if(BUILD_TESTING AND GTest_FOUND)
         tests/conf.cpp
         tests/plugins.cpp
         tests/connection_manager.cpp
+        tests/queue_stress.cpp
+        tests/signals.cpp
     )
 
     set_target_properties(unit_tests PROPERTIES

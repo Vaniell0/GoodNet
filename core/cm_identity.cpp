@@ -40,16 +40,16 @@ void NodeIdentity::save_key(const fs::path& path, const uint8_t* key, size_t siz
 }
 
 void NodeIdentity::load_or_gen_keypair(const fs::path& path,
-                                        uint8_t out_pub[crypto_sign_PUBLICKEYBYTES],
-                                        uint8_t out_sec[crypto_sign_SECRETKEYBYTES]) {
-    if (fs::exists(path) && fs::file_size(path) == crypto_sign_SECRETKEYBYTES) {
+                                        uint8_t out_pub[32],
+                                        uint8_t out_sec[64]) {
+    if (fs::exists(path) && fs::file_size(path) == 64) {
         std::ifstream f(path, std::ios::binary);
         if (f) {
-            f.read(reinterpret_cast<char*>(out_sec), crypto_sign_SECRETKEYBYTES);
-            if (static_cast<size_t>(f.gcount()) == crypto_sign_SECRETKEYBYTES) {
+            f.read(reinterpret_cast<char*>(out_sec), 64);
+            if (static_cast<size_t>(f.gcount()) == 64) {
                 std::memcpy(out_pub,
-                            out_sec + crypto_sign_SECRETKEYBYTES - crypto_sign_PUBLICKEYBYTES,
-                            crypto_sign_PUBLICKEYBYTES);
+                            out_sec + 64 - 32,
+                            32);
                 LOG_DEBUG("Loaded keypair from '{}'", path.string());
                 return;
             }
@@ -57,7 +57,7 @@ void NodeIdentity::load_or_gen_keypair(const fs::path& path,
         LOG_WARN("'{}' unreadable, regenerating", path.string());
     }
     crypto_sign_keypair(out_pub, out_sec);
-    save_key(path, out_sec, crypto_sign_SECRETKEYBYTES);
+    save_key(path, out_sec, 64);
     LOG_INFO("Generated keypair → '{}'", path.string());
 }
 
@@ -77,14 +77,14 @@ static std::vector<uint8_t> base64_decode(std::string_view in) {
 }
 
 bool NodeIdentity::try_load_ssh_key(const fs::path& path,
-                                     uint8_t out_pub[crypto_sign_PUBLICKEYBYTES],
-                                     uint8_t out_sec[crypto_sign_SECRETKEYBYTES]) {
+                                     uint8_t out_pub[32],
+                                     uint8_t out_sec[64]) {
     if (!fs::exists(path)) return false;
     std::ifstream f(path); if (!f) return false;
     std::string pem((std::istreambuf_iterator<char>(f)), {});
 
     static constexpr std::string_view BEGIN = "-----BEGIN OPENSSH PRIVATE KEY-----";
-    static constexpr std::string_view END   = "-----END OPENSSH PRIVATE KEY-----";
+    static constexpr std::string_view END   =  "-----END OPENSSH PRIVATE KEY-----";
     auto bp = pem.find(BEGIN), ep = pem.find(END);
     if (bp == std::string::npos || ep == std::string::npos) return false;
 

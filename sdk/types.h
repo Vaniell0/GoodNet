@@ -29,7 +29,7 @@ extern "C" {
 
 // ── Wire framing ──────────────────────────────────────────────────────────────
 #define GNET_MAGIC      0x474E4554U  ///< ASCII 'GNET' — frame validation only
-#define GNET_PROTO_VER  1U           ///< header_t layout version
+#define GNET_PROTO_VER  2U           ///< header_t layout version
 
 // ── Connection identifier ─────────────────────────────────────────────────────
 typedef uint64_t conn_id_t;
@@ -56,35 +56,37 @@ typedef enum {
     STATE_CLOSED
 } conn_state_t;
 
-// ── Wire header ───────────────────────────────────────────────────────────────
+// ── Wire header (v2) ──────────────────────────────────────────────────────────
 /// Fixed-size frame header preceding every payload on the wire.
 ///
 /// Offset | Field        | Size | Notes
 /// -------|--------------|------|----------------------------------------------
 ///      0 | magic        |    4 | GNET_MAGIC
-///      4 | proto_ver    |    1 | GNET_PROTO_VER
+///      4 | proto_ver    |    1 | GNET_PROTO_VER (2)
 ///      5 | flags        |    1 | reserved, 0
-///      6 | reserved     |    2 | reserved, 0
-///      8 | packet_id    |    8 | monotonic per-connection counter
-///     16 | timestamp    |    8 | sender unix microseconds
-///     24 | payload_type |    4 | MSG_TYPE_*
-///     28 | status       |    2 | STATUS_OK / STATUS_ERROR
-///     30 | payload_len  |    4 | bytes following this header
-///     34 | signature    |   64 | Ed25519(device_sk, header[0..33]); 0 pre-AUTH
+///      6 | payload_type |    2 | MSG_TYPE_* (uint16_t, max ~100)
+///      8 | payload_len  |    4 | bytes following this header
+///     12 | packet_id    |    8 | monotonic per-connection counter
+///     20 | timestamp    |    8 | sender unix microseconds
+///     28 | sender_id    |   16 | first 16 bytes of device_pubkey
 #pragma pack(push, 1)
 typedef struct {
     uint32_t magic;
     uint8_t  proto_ver;
     uint8_t  flags;
-    uint16_t reserved;
+    uint16_t payload_type;
+    uint32_t payload_len;
     uint64_t packet_id;
     uint64_t timestamp;
-    uint32_t payload_type;
-    uint16_t status;
-    uint32_t payload_len;
-    uint8_t  signature[64];
+    uint8_t  sender_id[16];
 } header_t;
 #pragma pack(pop)
+
+#ifdef __cplusplus
+static_assert(sizeof(header_t) == 44, "header_t must be exactly 44 bytes");
+#else
+_Static_assert(sizeof(header_t) == 44, "header_t must be exactly 44 bytes");
+#endif
 
 /// @brief Remote peer descriptor.
 ///

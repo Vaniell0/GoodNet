@@ -48,6 +48,8 @@ struct ConnectionRecord {
     bool    peer_authenticated = false;
     bool    is_localhost       = false;   // skip crypto
 
+    std::atomic<uint64_t> send_packet_id{0}; // monotonic per-conn counter
+
     std::unique_ptr<SessionState> session; // nullptr before ECDH
     std::vector<uint8_t>          recv_buf; // TCP reassembly buffer
 };
@@ -112,32 +114,28 @@ Constructor, destructor, `fill_host_api()`, `register_connector/handler()`, `han
 
 ---
 
-## TCP Reassembly
+## TCP Reassembly + Fast Path
 
 ```cpp
 // cm_dispatch.cpp: handle_data()
-rec.recv_buf.insert(rec.recv_buf.end(), data, data + size);
 
-while (rec.recv_buf.size() >= sizeof(header_t)) {
-    const auto* hdr = reinterpret_cast<const header_t*>(rec.recv_buf.data());
-
-    if (hdr->magic != GNET_MAGIC) {
-        LOG_WARN("conn #{}: bad magic, clearing recv_buf", id);
-        rec.recv_buf.clear(); break;
-    }
-
+// Fast path: complete frame, no buffered residue — zero-copy dispatch.
+if (rec->recv_buf.empty() && size >= sizeof(header_t)) {
+    const auto* hdr = reinterpret_cast<const header_t*>(raw);
     const size_t total = sizeof(header_t) + hdr->payload_len;
-    if (rec.recv_buf.size() < total) break;  // wait for more
-
-    std::vector<uint8_t> pkt(recv_buf.begin(), recv_buf.begin() + total);
-    recv_buf.erase(recv_buf.begin(), recv_buf.begin() + total);
-
-    lk.unlock();
-    dispatch_packet(id, pkt);
-    lk.lock();
-    if (records_.find(id) == records_.end()) break;
+    if (size == total && hdr->magic == GNET_MAGIC
+        && hdr->proto_ver == GNET_PROTO_VER) {
+        dispatch_packet(id, hdr, payload, recv_ts);
+        return;
+    }
 }
+
+// Slow path: partial data or multi-frame chunk
+rec->recv_buf.insert(rec->recv_buf.end(), data, data + size);
+// ... reassembly loop unchanged ...
 ```
+
+The TCP connector sends exactly one complete frame per `notify_data()` call. When `recv_buf` is empty (no partial data from previous calls), the fast path dispatches directly from the incoming pointer — bypassing all buffer copies.
 
 ---
 

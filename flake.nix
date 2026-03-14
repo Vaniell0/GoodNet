@@ -9,91 +9,61 @@
   outputs = { self, nixpkgs, flake-utils }:
     flake-utils.lib.eachDefaultSystem (system:
       let
-        pkgs = nixpkgs.legacyPackages.${system};
+        pkgs = import nixpkgs {
+          inherit system;
+          config.allowUnfree = true;
+        };
         lib  = pkgs.lib;
 
-        # ── Утилиты ───────────────────────────────────────────────────────────
         buildPlugin = import ./nix/buildPlugin.nix { inherit lib pkgs; };
         mkCppPlugin = import ./nix/mkCppPlugin.nix { inherit pkgs buildPlugin; };
 
-        # ── Общие зависимости ─────────────────────────────────────────────────
-        coreBuildInputs = with pkgs; [ boost spdlog fmt nlohmann_json libsodium zstd ftxui ];
-        coreNative      = with pkgs; [ cmake ninja pkg-config include-what-you-use ];
+        # Filter out build artifacts and editor state from source copies.
+        cleanSrc = lib.cleanSourceWith {
+          src = ./.;
+          filter = path: type:
+            let b = builtins.baseNameOf path; in
+            !(b == "build" || b == "result" || b == ".git" || b == ".direnv");
+        };
 
-        # ── Функция сборки core ───────────────────────────────────────────────
+        coreBuildInputs = with pkgs; [ boost spdlog fmt nlohmann_json libsodium zstd ];
+        coreNative      = with pkgs; [ cmake ninja pkg-config ];
+
+        # ── Core ──────────────────────────────────────────────────────────────
         makeCore = { buildType ? "Release", extraFlags ? [] }:
-          let
-            isDebug = buildType == "Debug";
-          in
           pkgs.stdenv.mkDerivation {
             pname   = "goodnet-core";
             version = "0.1.0-alpha";
-            src     = ./.;
+            src     = cleanSrc;
 
-            nativeBuildInputs = coreNative ++ [ pkgs.gtest ] ++ (lib.optional isDebug pkgs.lcov);
-            buildInputs = with pkgs; [ fmt ftxui nlohmann_json libsodium zstd boost gtest ];
-            propagatedBuildInputs  = with pkgs; [ spdlog ];
-
-            # Убираем дефолтный билд-тайп Nix, чтобы наш точно прошел первым
-            forceNoRelease = isDebug; 
+            nativeBuildInputs = coreNative ++ [ pkgs.gtest ];
+            buildInputs = with pkgs; [
+              fmt nlohmann_json libsodium zstd boost gtest
+            ];
+            propagatedBuildInputs = with pkgs; [ spdlog ];
 
             cmakeFlags = [
               "-DINSTALL_DEVELOPMENT=ON"
               "-DCMAKE_BUILD_TYPE=${buildType}"
               "-DBUILD_TESTING=ON"
               "-DGOODNET_DISABLE_PCH=ON"
-            ] ++ (lib.optionals isDebug [
-              "-DCMAKE_CXX_FLAGS=--coverage"
-              "-DCMAKE_EXE_LINKER_FLAGS=--coverage"
-            ]) ++ extraFlags;
+            ] ++ extraFlags;
 
             doCheck = true;
             checkPhase = ''
               export HOME=$TMPDIR
-              export TMPDIR=$TMPDIR   # уже установлен Nix sandbox
-
-              ${lib.optionalString isDebug ''
-                lcov --directory . --zerocounters
-              ''}
-
               ./bin/unit_tests --gtest_output="xml:test_results.xml"
-
-              ${lib.optionalString isDebug ''
-                # Собираем данные, игнорируя несоответствия GCC 15
-                lcov --directory . \
-                     --capture \
-                     --output-file coverage.info \
-                     --ignore-errors inconsistent,unused,mismatch \
-                     --rc geninfo_unexecuted_blocks=1
-
-                # Чистим от системного мусора
-                lcov --remove coverage.info '/nix/store/*' '*/tests/*' '*/_deps/*' \
-                     --output-file coverage_cleaned.info \
-                     --ignore-errors inconsistent,unused,mismatch
-
-                # Просто выводим в консоль для информации
-                lcov --list coverage_cleaned.info --ignore-errors inconsistent,unused,mismatch
-              ''}
             '';
 
             postInstall = ''
               mkdir -p $out/share/test-results
               cp test_results.xml $out/share/test-results/
-              
-              ${lib.optionalString isDebug ''
-                mkdir -p $out/share/coverage
-                genhtml coverage_cleaned.info \
-                        --output-directory $out/share/coverage \
-                        --ignore-errors inconsistent,unused,mismatch
-              ''}
             '';
           };
 
-        goodnet-core       = makeCore {};
-        goodnet-core-debug = makeCore { buildType = "Debug"; };
+        goodnet-core = makeCore {};
 
-        # ── Плагины ───────────────────────────────────────────────────────────
-
+        # ── Plugins ──────────────────────────────────────────────────────────
         mapPlugins = sdk: type:
           let dir = ./plugins/${type}; in
           if lib.pathExists dir then
@@ -112,17 +82,13 @@
             (lib.mapAttrsToList (n: v: { name = n; path = v; }) attrs)
           ) // attrs;
 
-        handlersMap     = mapPlugins goodnet-core "handlers";
-        connectorsMap   = mapPlugins goodnet-core "connectors";
-        handlersMapDbg  = mapPlugins goodnet-core-debug "handlers";
-        connectorsMapDbg= mapPlugins goodnet-core-debug "connectors";
+        handlersMap   = mapPlugins goodnet-core "handlers";
+        connectorsMap = mapPlugins goodnet-core "connectors";
 
         pluginsTree = makeGroup "plugins-all" {
           handlers   = makeGroup "handlers"   handlersMap;
           connectors = makeGroup "connectors" connectorsMap;
         };
-
-        # ── Bundle плагинов ───────────────────────────────────────────────────
 
         makeBundle = hmap: cmap:
           pkgs.runCommand "goodnet-plugins-bundle" {} ''
@@ -140,11 +106,9 @@
             '') cmap)}
           '';
 
-        pluginsBundle      = makeBundle handlersMap   connectorsMap;
-        pluginsBundleDebug = makeBundle handlersMapDbg connectorsMapDbg;
+        pluginsBundle = makeBundle handlersMap connectorsMap;
 
-        # ── Функция финального приложения ────────────────────────────────────
-
+        # ── Full App ──────────────────────────────────────────────────────────
         makeApp = { core, bundle }:
           pkgs.stdenv.mkDerivation {
             pname   = core.pname;
@@ -154,121 +118,179 @@
             nativeBuildInputs = [ pkgs.makeWrapper ];
             installPhase = ''
               mkdir -p $out/bin $out/plugins
-              cp ${core}/bin/goodnet     $out/bin/goodnet
-              cp -r ${bundle}/plugins/*  $out/plugins/
-              if [ -d "${core}/share" ]; then
-                cp -r ${core}/share $out/share
-              fi
+              cp ${core}/bin/goodnet    $out/bin/goodnet
+              cp -r ${bundle}/plugins/* $out/plugins/
+              if [ -d "${core}/share" ]; then cp -r ${core}/share $out/share; fi
               wrapProgram $out/bin/goodnet \
-                --set LD_LIBRARY_PATH "${lib.makeLibraryPath ([ core ] ++ coreBuildInputs)}" \
+                --set LD_LIBRARY_PATH \
+                    "${lib.makeLibraryPath ([ core ] ++ coreBuildInputs)}" \
                 --set GOODNET_PLUGINS_DIR "$out/plugins"
             '';
           };
 
-        # ── Release ───────────────────────────────────────────────────────────
         fullApp = makeApp { core = goodnet-core; bundle = pluginsBundle; };
 
-        # ── Debug ─────────────────────────────────────────────────────────────
-        #
-        # nix build .#debug
-        #
-        fullAppDebug = (makeApp {
-          core   = goodnet-core-debug;
-          bundle = pluginsBundleDebug;
-        }).overrideAttrs (old: {
-          pname    = "goodnet-debug";
-          dontStrip = true;
-
-          # Обертка, чтобы gcov не пытался писать по путям сборки
-          nativeBuildInputs = (old.nativeBuildInputs or []) ++ [ pkgs.makeWrapper ];
-          
-          postFixup = ''
-            wrapProgram $out/bin/goodnet \
-              --set GCOV_ERROR_FILE /dev/null \
-              --set GCOV_PREFIX /tmp/goodnet-coverage \
-              --set GCOV_PREFIX_STRIP 10
-          '';
-        });
-
-      dockerImage = pkgs.dockerTools.buildLayeredImage {
-        name = "goodnet-docker";
-        tag = "latest";
-        
-        # Копируем наше приложение со всеми либами и плагинами
-        contents = [ fullApp pkgs.cacert pkgs.bashInteractive pkgs.coreutils ];
-
-        config = {
-          # Используем Entrypoint, чтобы аргументы прокидывались в бинарник
-          Entrypoint = [ "${fullApp}/bin/goodnet" ];
-          
-          # Cmd теперь пустой или содержит дефолтные аргументы
-          Cmd = [ ]; 
-
-          WorkingDir = "/data";
-          Env = [
-            "GOODNET_PLUGINS_DIR=${fullApp}/plugins"
-            "LD_LIBRARY_PATH=${lib.makeLibraryPath ([ fullApp ] ++ coreBuildInputs)}"
-          ];
-          Volumes = { "/data" = {}; };
+        # ── Docker ────────────────────────────────────────────────────────────
+        dockerImage = pkgs.dockerTools.buildLayeredImage {
+          name     = "goodnet-docker";
+          tag      = "latest";
+          contents = [ fullApp pkgs.cacert pkgs.bashInteractive pkgs.coreutils ];
+          config   = {
+            Entrypoint = [ "${fullApp}/bin/goodnet" ];
+            WorkingDir = "/data";
+            Env = [
+              "GOODNET_PLUGINS_DIR=${fullApp}/plugins"
+              "LD_LIBRARY_PATH=${lib.makeLibraryPath ([ fullApp ] ++ coreBuildInputs)}"
+            ];
+            Volumes = { "/data" = {}; };
+          };
         };
-      };
+
+        # ── Local development scripts (nix run) ──────────────────────────────
+        # These scripts build in the project directory (not /nix/store) with
+        # PCH enabled (Debug mode, GOODNET_DISABLE_PCH=OFF by default).
+
+        devBuildInputs = coreNative ++ coreBuildInputs ++ [ pkgs.gtest ];
+
+        gn-dev = pkgs.writeShellApplication {
+          name = "gn-dev";
+          runtimeInputs = devBuildInputs;
+          text = ''
+            BUILD_DIR="build"
+            if [ ! -f "$BUILD_DIR/CMakeCache.txt" ]; then
+              echo ">>> Configuring Debug build (PCH enabled)..."
+              cmake -B "$BUILD_DIR" \
+                -DCMAKE_BUILD_TYPE=Debug \
+                -G Ninja \
+                -DBUILD_TESTING=ON
+            fi
+            cmake --build "$BUILD_DIR" -j"$(nproc)"
+            exec "./$BUILD_DIR/goodnet" "$@"
+          '';
+        };
+
+        gn-test = pkgs.writeShellApplication {
+          name = "gn-test";
+          runtimeInputs = devBuildInputs;
+          text = ''
+            BUILD_DIR="build"
+            if [ ! -f "$BUILD_DIR/CMakeCache.txt" ]; then
+              echo ">>> Configuring Debug build (PCH enabled)..."
+              cmake -B "$BUILD_DIR" \
+                -DCMAKE_BUILD_TYPE=Debug \
+                -G Ninja \
+                -DBUILD_TESTING=ON
+            fi
+            cmake --build "$BUILD_DIR" -j"$(nproc)"
+            exec "./$BUILD_DIR/bin/unit_tests" "$@"
+          '';
+        };
+
+        gn-coverage = pkgs.writeShellApplication {
+          name = "gn-coverage";
+          runtimeInputs = devBuildInputs ++ [ pkgs.lcov ];
+          text = ''
+            BUILD_DIR="build/coverage"
+
+            echo ">>> Configuring coverage build..."
+            cmake -B "$BUILD_DIR" \
+              -DCMAKE_BUILD_TYPE=Debug \
+              -G Ninja \
+              -DBUILD_TESTING=ON \
+              -DGOODNET_COVERAGE=ON
+
+            cmake --build "$BUILD_DIR" -j"$(nproc)"
+
+            echo ">>> Resetting coverage counters..."
+            lcov --zerocounters --directory "$BUILD_DIR"
+
+            echo ">>> Running tests..."
+            HOME="$(mktemp -d)" "./$BUILD_DIR/bin/unit_tests" \
+              --gtest_output="xml:$BUILD_DIR/test_results.xml" || true
+
+            echo ">>> Capturing coverage data..."
+            lcov --capture --directory "$BUILD_DIR" \
+              --output-file "$BUILD_DIR/coverage.info" \
+              --ignore-errors mismatch,inconsistent
+
+            echo ">>> Filtering external sources..."
+            lcov --remove "$BUILD_DIR/coverage.info" \
+              '/nix/*' '*/tests/*' '*/gtest/*' '*/boost/*' '*/nlohmann/*' \
+              --output-file "$BUILD_DIR/coverage_filtered.info" \
+              --ignore-errors unused,mismatch,inconsistent
+
+            echo ">>> Generating HTML report..."
+            genhtml "$BUILD_DIR/coverage_filtered.info" \
+              --output-directory "$BUILD_DIR/coverage_html" \
+              --title "GoodNet Coverage"
+
+            echo ""
+            echo "=== Coverage Report ==="
+            lcov --summary "$BUILD_DIR/coverage_filtered.info" \
+              --ignore-errors empty 2>&1 || true
+            echo ""
+            echo "HTML report: $BUILD_DIR/coverage_html/index.html"
+          '';
+        };
 
       in {
         packages = {
           default = fullApp;
-          debug   = fullAppDebug;
           core    = goodnet-core;
           plugins = pluginsTree;
           docker  = dockerImage;
         };
 
-        apps.docker-load = {
-          type = "app";
-          program = "${pkgs.writeShellScriptBin "docker-load" ''
-            ${pkgs.docker}/bin/docker load < ${dockerImage}
-          ''}/bin/docker-load";
+        apps = {
+          default = {
+            type    = "app";
+            program = "${gn-dev}/bin/gn-dev";
+          };
+          test = {
+            type    = "app";
+            program = "${gn-test}/bin/gn-test";
+          };
+          coverage = {
+            type    = "app";
+            program = "${gn-coverage}/bin/gn-coverage";
+          };
+          docker-load = {
+            type    = "app";
+            program = "${pkgs.writeShellScriptBin "docker-load" ''
+              ${pkgs.docker}/bin/docker load < ${dockerImage}
+            ''}/bin/docker-load";
+          };
         };
-        
-        # ── Dev shell ─────────────────────────────────────────────────────────
-        #
-        # nix develop  →  среда разработки с cmake, ninja, gdb, ccache
-        #
-        # Алиасы для быстрой пересборки:
-        #   b       → cmake --build build         (release, инкрементальный)
-        #   bd      → cmake --build build/debug   (debug, инкрементальный)
-        #   cfg     → cmake -B build -DCMAKE_BUILD_TYPE=Release
-        #   cfgd    → cmake -B build/debug -DCMAKE_BUILD_TYPE=Debug
-        #
-        # Это «Makefile»-уровень — только изменённые файлы пересобираются.
-        # CCache прозрачно кеширует результаты компиляции между сессиями.
 
         devShells.default = pkgs.mkShell {
           inputsFrom = [ goodnet-core ];
-          packages   = with pkgs; [ gdb ccache cmake-format jq ];
+          packages = with pkgs; [
+            gdb ccache cmake-format jq
+            include-what-you-use   # linting tool, not needed for build
+            lcov                   # coverage report generation
+          ];
 
           shellHook = ''
             export GOODNET_SDK_PATH="${goodnet-core}/sdk"
-
-            # ccache: кеш компиляции между сессиями nix develop
-            # ~/.cache/ccache хранит скомпилированные объекты
             export CCACHE_DIR="$HOME/.cache/ccache"
             export CMAKE_C_COMPILER_LAUNCHER=ccache
             export CMAKE_CXX_COMPILER_LAUNCHER=ccache
 
-            # ── Алиасы быстрой сборки ─────────────────────────────────────────
-            # Release
-            cfg()  { cmake -B build       -DCMAKE_BUILD_TYPE=Release -G Ninja "$@"; }
-            b()    { cmake --build build  "$@"; }
-            brun() { cmake --build build && ./build/goodnet; }
+            cfg()   { cmake -B build       -DCMAKE_BUILD_TYPE=Release -G Ninja "$@"; }
+            b()     { cmake --build build  "$@"; }
+            brun()  { cmake --build build  && ./build/goodnet "$@"; }
+            cfgd()  { cmake -B build/debug -DCMAKE_BUILD_TYPE=Debug   -G Ninja "$@"; }
+            bd()    { cmake --build build/debug "$@"; }
+            bdrun() { cmake --build build/debug && ./build/debug/goodnet "$@"; }
 
-            # Debug (инкрементальный — только изменённые файлы)
-            cfgd() { cmake -B build/debug -DCMAKE_BUILD_TYPE=Debug   -G Ninja "$@"; }
-            bd()   { cmake --build build/debug "$@"; }
-            bdrun(){ cmake --build build/debug && ./build/debug/goodnet; }
-
-            # Первый запуск: cfgd && bd
-            # Далее: bd (только изменённые файлы)
-            echo "GoodNet dev shell. Commands: cfg/b/brun (release), cfgd/bd/bdrun (debug)"
+            echo ""
+            echo "GoodNet devShell (Linux/Native)"
+            echo "  cfg / b / brun    - Release build & run"
+            echo "  cfgd / bd / bdrun - Debug build & run"
+            echo "  nix run           - Debug build & run (PCH, replaces aliases)"
+            echo "  nix run .#test    - Build & run unit tests"
+            echo "  nix run .#coverage - Coverage report"
+            echo ""
           '';
         };
       });
