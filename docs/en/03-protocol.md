@@ -19,7 +19,7 @@ GoodNet uses a simplified **Noise_XX** variant — mutual authentication without
 
 Immediately after TCP connect, **both** nodes send `MSG_TYPE_AUTH`. Order does not matter — the exchange is symmetric.
 
-### Wire format `auth_payload_t`
+### Wire format `gn::msg::AuthPayload`
 
 ```
 Offset  Size  Field          Description

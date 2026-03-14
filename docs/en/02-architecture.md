@@ -26,8 +26,8 @@
 │                                   │                                   │
 │  ┌────────────────────────────────▼──────────────────────────────┐  │
 │  │                      PluginManager                             │  │
-│  │  handlers_[name]   → HandlerInfo { DynLib, handler_t*, api_c }│  │
-│  │  connectors_[scheme]→ ConnectorInfo{ DynLib, ops_t*,  api_c } │  │
+│  │  handlers_[name]   → HandlerInfo { DynLib, handler_t*, api }│  │
+│  │  connectors_[scheme]→ ConnectorInfo{ DynLib, ops_t*,  api } │  │
 │  │  dlopen(RTLD_LOCAL) + SHA-256 verify before open             │  │
 │  └───────────────────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────────────┘

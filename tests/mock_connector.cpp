@@ -14,32 +14,25 @@ public:
     std::string get_scheme() const override { return "mock"; }
     std::string get_name()   const override { return "MockConnector"; }
 
-    void on_init() override {
-        // Ничего инициализировать не нужно для мока
-    }
+    void on_init() override {}
 
-    // Подключение: в тестах не используется реальная сеть
     int do_connect(const char* /*uri*/) override {
-        return -1;  // не поддерживается в моке
+        return -1; 
     }
 
-    // Listen: no-op
     int do_listen(const char* /*host*/, uint16_t /*port*/) override {
         return 0;
     }
 
-    // send_to: молча отбрасываем
-    int do_send_to(conn_id_t /*id*/,
-                   const void* /*data*/, size_t /*size*/) override {
+    // ИСПРАВЛЕНО: do_send вместо do_send_to + std::span
+    int do_send(conn_id_t /*id*/, std::span<const uint8_t> /*data*/) override {
         return 0;
     }
 
-    // close: no-op
-    void do_close(conn_id_t /*id*/) override {}
+    // ИСПРАВЛЕНО: добавился bool hard
+    void do_close(conn_id_t /*id*/, bool /*hard*/) override {}
 
-    void on_shutdown() override {
-        // Ничего останавливать не нужно
-    }
+    void on_shutdown() override {}
 };
 
 CONNECTOR_PLUGIN(MockConnector)

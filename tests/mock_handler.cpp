@@ -14,13 +14,11 @@ public:
         set_supported_types({MSG_TYPE_SYSTEM, MSG_TYPE_CHAT, MSG_TYPE_FILE});
     }
 
-    void handle_message(const header_t*   header,
-                        const endpoint_t* /*ep*/,
-                        const void*       /*payload*/,
-                        size_t            size) override {
-        // В тестах достаточно не падать. Реальная логика не нужна.
+    void handle_message(const header_t* header,
+                        const endpoint_t* /*endpoint*/,
+                        std::span<const uint8_t> payload) override {
         (void)header;
-        (void)size;
+        (void)payload;
     }
 
     void on_shutdown() override {

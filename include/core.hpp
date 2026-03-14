@@ -1,29 +1,26 @@
 #pragma once
+
 /// @file include/core.hpp
-/// @brief GoodNet public API — intentionally minimal.
+/// @brief GoodNet public C++ API.
 ///
-/// This header includes ONLY: stdlib (<memory>, <functional>, <string>,
-/// <string_view>, <vector>, <filesystem>, <expected>) and sdk/types.h (the
-/// plain-C ABI types shared with plugins).
-///
-/// Boost, libsodium, spdlog, fmt, nlohmann_json, ConnectionManager,
-/// PluginManager are ALL hidden behind the Pimpl.  Downstream code that
-/// includes this header compiles in milliseconds and leaks nothing.
+/// Only stdlib and signals.hpp (for StatsSnapshot) are included here.
+/// All heavy dependencies live in core.cpp behind the Pimpl.
 
 #include <cstdint>
 #include <expected>
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
 
-#include "../sdk/types.h"   // propagation_t, header_t, endpoint_t, msg types — lightweight C header
+#include "../sdk/cpp/data.hpp"
+#include "signals.hpp"
 
 namespace gn {
 
-// ─── Forward declarations — never include their headers here ─────────────────
 class ConnectionManager;
 class PluginManager;
 class SignalBus;
@@ -31,8 +28,7 @@ struct NodeIdentity;
 
 namespace fs = std::filesystem;
 
-// ─── CoreConfig ───────────────────────────────────────────────────────────────
-// Plain-data struct, no dependencies.
+// ── CoreConfig ────────────────────────────────────────────────────────────────
 
 struct CoreConfig {
     struct {
@@ -59,55 +55,94 @@ struct CoreConfig {
         int         max_files = 5;
     } logging;
 
-    fs::path config_file; ///< JSON file to load on init (optional)
+    fs::path config_file;
 };
 
-// ─── Core ─────────────────────────────────────────────────────────────────────
+// ── Core ──────────────────────────────────────────────────────────────────────
 
 class Core {
 public:
-    using PacketData    = std::shared_ptr<std::vector<uint8_t>>;
     using PacketHandler = std::function<propagation_t(
-        std::string_view name,
+        std::string_view          name,
         std::shared_ptr<header_t> hdr,
         const endpoint_t*         ep,
         PacketData                data)>;
 
     // ── Lifecycle ─────────────────────────────────────────────────────────────
+
     explicit Core(CoreConfig cfg = {});
-    ~Core();   // Must be out-of-line: Impl is incomplete at header parse time
+    ~Core();
 
     Core(const Core&)            = delete;
     Core& operator=(const Core&) = delete;
 
-    /// Block until stop() is called (starts io threads internally).
     void run();
-    /// Start io threads in background — non-blocking.
     void run_async(int threads = 0);
-    /// Stop all subsystems and join io threads.
     void stop();
     [[nodiscard]] bool is_running() const noexcept;
 
     // ── Network ───────────────────────────────────────────────────────────────
-    void send(const char* uri, uint32_t msg_type, const void* payload, size_t size);
-    void send(const char* uri, uint32_t msg_type, std::string_view payload);
+
+    bool send(const char* uri, uint32_t msg_type,
+              const void* payload, size_t size);
+    bool send(const char* uri, uint32_t msg_type,
+              std::string_view payload);
+    bool send(const char* uri, uint32_t msg_type,
+              std::span<const uint8_t> payload);
+
+    bool send_to(conn_id_t id, uint32_t msg_type,
+                 const void* payload, size_t size);
+    bool send_to(conn_id_t id, uint32_t msg_type,
+                 std::string_view payload);
+    bool send_to(conn_id_t id, uint32_t msg_type,
+                 std::span<const uint8_t> payload);
+
+    void broadcast(uint32_t msg_type, const void* payload, size_t size);
+    void broadcast(uint32_t msg_type, std::string_view payload);
+    void broadcast(uint32_t msg_type, std::span<const uint8_t> payload);
+
+    void connect   (std::string_view uri);
+    void disconnect(conn_id_t id);
+    void close_now (conn_id_t id);
+
+    // ── Key management ────────────────────────────────────────────────────────
+
+    /// Re-derive session key for an ESTABLISHED connection without disconnect.
+    bool rekey_session(conn_id_t id);
+
+    /// Rotate long-term identity keys. Existing sessions are unaffected (PFS).
+    void rotate_identity_keys();
+
+    // ── Peer info ─────────────────────────────────────────────────────────────
+
+    [[nodiscard]] std::vector<uint8_t> peer_pubkey(conn_id_t id) const;
+    [[nodiscard]] bool peer_endpoint(conn_id_t id, endpoint_t& out) const;
 
     // ── Subscriptions ─────────────────────────────────────────────────────────
-    void subscribe(uint32_t msg_type, std::string_view name,
-                   PacketHandler cb, uint8_t prio = 128);
-    void subscribe_wildcard(std::string_view name,
-                            PacketHandler cb, uint8_t prio = 128);
+
+    uint64_t subscribe(uint32_t msg_type, std::string_view name,
+                       PacketHandler cb, uint8_t prio = 128);
+    void     subscribe_wildcard(std::string_view name,
+                                PacketHandler cb, uint8_t prio = 128);
+    void     unsubscribe(uint64_t sub_id);
 
     // ── Identity ──────────────────────────────────────────────────────────────
+
     [[nodiscard]] std::string user_pubkey_hex()   const;
     [[nodiscard]] std::string device_pubkey_hex() const;
 
     // ── Stats ─────────────────────────────────────────────────────────────────
-    [[nodiscard]] size_t                   connection_count() const noexcept;
-    [[nodiscard]] std::vector<std::string> active_uris()      const;
 
-    // ── Internal access for CLI / tests only ─────────────────────────────────
-    // Callers must include the concrete headers to use the returned references.
+    [[nodiscard]] StatsSnapshot       stats_snapshot()   const noexcept;
+    [[nodiscard]] size_t              connection_count() const noexcept;
+    [[nodiscard]] std::vector<std::string> active_uris() const;
+
+    // ── Config ────────────────────────────────────────────────────────────────
+
+    bool reload_config();
+
+    // ── Internal (CLI / tests) ────────────────────────────────────────────────
+
     [[nodiscard]] ConnectionManager& cm()  noexcept;
     [[nodiscard]] PluginManager&     pm()  noexcept;
     [[nodiscard]] SignalBus&         bus() noexcept;

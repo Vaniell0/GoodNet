@@ -12,7 +12,7 @@ option(BUILD_TESTING "Build the testing suite" OFF)
 
 # ─── Зависимости ─────────────────────────────────────────────────────────────
 
-find_package(Boost         REQUIRED COMPONENTS system filesystem)
+find_package(Boost REQUIRED COMPONENTS filesystem  program_options)
 find_package(nlohmann_json REQUIRED)
 find_package(spdlog        REQUIRED)
 find_package(ftxui         REQUIRED)
@@ -35,8 +35,10 @@ set_target_properties(goodnet_sdk PROPERTIES EXPORT_NAME sdk)
 target_include_directories(goodnet_sdk INTERFACE
     $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/sdk>
     $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/sdk/cpp>
+    $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/core/data>
     $<INSTALL_INTERFACE:include/goodnet/sdk>
     $<INSTALL_INTERFACE:include/goodnet/sdk/cpp>
+    $<INSTALL_INTERFACE:include/goodnet/core/data>
 )
 
 # ─── 2. Core (SHARED) ────────────────────────────────────────────────────────
@@ -86,7 +88,6 @@ target_include_directories(goodnet_core
 target_link_libraries(goodnet_core
     PUBLIC  spdlog::spdlog
     PRIVATE nlohmann_json::nlohmann_json fmt::fmt
-            Boost::system
             ${ZSTD_LIBRARIES}
             ${SODIUM_LIBRARIES}
 )
@@ -94,6 +95,11 @@ target_link_libraries(goodnet_core
 target_compile_definitions(goodnet_core
     PUBLIC  SPDLOG_COMPILED_LIB
     PRIVATE GOODNET_PROJECT_ROOT="${CMAKE_SOURCE_DIR}/"
+)
+
+target_compile_definitions(goodnet_core PUBLIC 
+    $<$<CONFIG:Release>:_FORTIFY_SOURCE=2>
+    $<$<CONFIG:RelWithDebInfo>:_FORTIFY_SOURCE=2>
 )
 
 apply_pch(goodnet_core)
@@ -115,9 +121,8 @@ apply_pch(goodnet)
 
 if(INSTALL_DEVELOPMENT)
     install(DIRECTORY sdk/      DESTINATION include/goodnet/sdk)
-    install(DIRECTORY sdk/cpp/  DESTINATION include/goodnet/sdk/cpp)
     install(DIRECTORY include/  DESTINATION include/goodnet)
-    install(DIRECTORY core/     DESTINATION include/goodnet/core
+    install(DIRECTORY core/     DESTINATION include/goodnet/core/
             FILES_MATCHING PATTERN "*.hpp")
 
     install(FILES cmake/pch.cmake      DESTINATION lib/cmake/GoodNet)

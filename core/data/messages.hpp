@@ -15,8 +15,7 @@
 ///   • kBaseSize / kFullSize constants allow old implementations to send
 ///     smaller payloads that new code still accepts (forward compat).
 
-#include "types.h"
-#include "cpp/data.hpp"   // PodData<T>, IData
+#include "../sdk/cpp/data.hpp"   // PodData<T>, IData
 
 #include <cstdint>
 #include <cstring>

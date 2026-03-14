@@ -1,10 +1,20 @@
+/// @file src/main.cpp
+/// @brief GoodNet benchmark / server entry point.
+
 #include <iostream>
+#include <iomanip>
+#include <sstream>
 #include <chrono>
 #include <atomic>
 #include <vector>
 #include <thread>
 #include <csignal>
-#include <iomanip>
+#include <cstring>
+#include <cstdio>
+#include <algorithm>
+#include <numeric>
+#include <array>
+
 #include <boost/program_options.hpp>
 #include <sodium.h>
 
@@ -13,159 +23,540 @@
 #include "pluginManager.hpp"
 
 namespace po = boost::program_options;
-using Clock = std::chrono::steady_clock;
+using Clock     = std::chrono::steady_clock;
+using TimePoint = Clock::time_point;
+using Seconds   = std::chrono::duration<double>;
 
-std::atomic<bool> g_keep_running{true};
-void signal_handler(int) { g_keep_running = false; }
+// ─── Signal handling ──────────────────────────────────────────────────────────
+
+static std::atomic<bool> g_keep_running{true};
+
+static void signal_handler(int) {
+    g_keep_running.store(false, std::memory_order_relaxed);
+}
+
+static void setup_signals() {
+    std::signal(SIGINT,  signal_handler);
+    std::signal(SIGTERM, signal_handler);
+#if !defined(_WIN32)
+    std::signal(SIGPIPE, SIG_IGN);   // игнорируем разрыв TCP pipe
+#endif
+}
+
+// ─── Throughput sample ring ───────────────────────────────────────────────────
+// Храним последние N замеров (Gbps) для вычисления перцентилей в итоге.
+
+static constexpr size_t SAMPLE_RING = 1200;   // 10 мин при 0.5 сек интервале
+
+struct Samples {
+    std::array<double, SAMPLE_RING> data{};
+    size_t head = 0;
+    size_t count = 0;
+
+    void push(double v) {
+        data[head] = v;
+        head = (head + 1) % SAMPLE_RING;
+        if (count < SAMPLE_RING) ++count;
+    }
+
+    // Возвращает отсортированную копию накопленных значений
+    std::vector<double> sorted() const {
+        std::vector<double> v(data.begin(), data.begin() + count);
+        std::sort(v.begin(), v.end());
+        return v;
+    }
+
+    double percentile(double p) const {
+        auto s = sorted();
+        if (s.empty()) return 0.0;
+        const size_t idx = static_cast<size_t>(p / 100.0 * (s.size() - 1));
+        return s[std::min(idx, s.size() - 1)];
+    }
+
+    double mean() const {
+        if (count == 0) return 0.0;
+        double sum = 0;
+        for (size_t i = 0; i < count; ++i) sum += data[i];
+        return sum / count;
+    }
+
+    double peak() const {
+        if (count == 0) return 0.0;
+        return *std::max_element(data.begin(), data.begin() + count);
+    }
+};
+
+// ─── Formatting helpers ───────────────────────────────────────────────────────
+
+static std::string fmt_bytes(double bytes) {
+    if (bytes < 1e3)  return std::to_string(static_cast<int>(bytes)) + " B";
+    if (bytes < 1e6)  { char b[32]; std::snprintf(b, sizeof(b), "%.1f KB", bytes / 1e3); return b; }
+    if (bytes < 1e9)  { char b[32]; std::snprintf(b, sizeof(b), "%.1f MB", bytes / 1e6); return b; }
+                      { char b[32]; std::snprintf(b, sizeof(b), "%.2f GB", bytes / 1e9); return b; }
+}
+
+static std::string fmt_duration(double sec) {
+    const int h = static_cast<int>(sec) / 3600;
+    const int m = (static_cast<int>(sec) % 3600) / 60;
+    const int s = static_cast<int>(sec) % 60;
+    char buf[32];
+    if (h > 0) std::snprintf(buf, sizeof(buf), "%dh %02dm %02ds", h, m, s);
+    else       std::snprintf(buf, sizeof(buf), "%dm %02ds", m, s);
+    return buf;
+}
+
+static std::string bar(double fraction, int width = 20) {
+    const int filled = static_cast<int>(std::clamp(fraction, 0.0, 1.0) * width);
+    std::string b;
+    b.reserve(width * 3); // Резервируем место с учетом 3 байт на UTF-8 символ
+    for (int i = 0; i < filled; ++i) b += "█";
+    for (int i = filled; i < width; ++i) b += "░";
+    return b;
+}
+// ─── Live dashboard ───────────────────────────────────────────────────────────
+
+static void print_live(double gbps, double gbps_peak,
+                        double pkt_s, double total_sec,
+                        uint64_t total_bytes, uint64_t total_pkts,
+                        double backlog_mb,
+                        const gn::StatsSnapshot& st) {
+
+    // Строки монитора — всего 5 строк, затираем через \r на следующем тике
+    // (для полноценного TUI нужен ftxui, но это бенчмарк, не CLI)
+
+    std::printf(
+        "\033[2K\r"  // очистить строку
+        "[%s] "
+        "\033[1;36m%.2f Gbps\033[0m (peak \033[33m%.2f\033[0m) | "
+        "\033[1;32m%7.0f pkt/s\033[0m | "
+        "Sent \033[1m%s\033[0m | "
+        "Backlog \033[%sm%.1f MB\033[0m | "
+        "RX %s | TX %s | "
+        "Auth ✓%llu ✗%llu | "
+        "Drops %llu",
+        fmt_duration(total_sec).c_str(),
+        gbps,
+        gbps_peak,
+        pkt_s,
+        fmt_bytes(static_cast<double>(total_bytes)).c_str(),
+        (backlog_mb > 64) ? "1;31" : "0",   // красный если > 64MB backlog
+        backlog_mb,
+        fmt_bytes(static_cast<double>(st.rx_bytes)).c_str(),
+        fmt_bytes(static_cast<double>(st.tx_bytes)).c_str(),
+        (unsigned long long)st.auth_ok,
+        (unsigned long long)st.auth_fail,
+        (unsigned long long)st.backpressure
+    );
+    std::fflush(stdout);
+}
+
+// ─── Final summary ────────────────────────────────────────────────────────────
+
+static std::string fmt_num(uint64_t n) {
+    std::string s = std::to_string(n);
+    int insert_at = static_cast<int>(s.length()) - 3;
+    while (insert_at > 0) {
+        s.insert(insert_at, ",");
+        insert_at -= 3;
+    }
+    return s;
+}
+
+// Считает количество видимых символов в UTF-8 строке
+static int utf8_len(const std::string& str) {
+    int len = 0;
+    for (size_t i = 0; i < str.length(); ++i) {
+        if ((str[i] & 0xc0) != 0x80) len++;
+    }
+    return len;
+}
+
+static void print_row(const char* label, const std::string& value, const char* color = "") {
+    const int total_width = 58; // Ширина внутреннего пространства рамки
+    const std::string reset = "\033[0m";
+    
+    // Формируем левую часть: "  Метка : "
+    std::string prefix = "  ";
+    prefix += label;
+    prefix += " : ";
+    
+    int prefix_vis_len = utf8_len(prefix);
+    int value_vis_len = utf8_len(value);
+    
+    // Печатаем начало
+    std::printf("║%s%s%s", prefix.c_str(), color, value.c_str());
+    std::printf("%s", reset.c_str());
+    
+    // Добиваем пробелами: общая ширина - длина префикса - длина значения
+    int padding = total_width - prefix_vis_len - value_vis_len;
+    if (padding > 0) {
+        for (int i = 0; i < padding; ++i) std::printf(" ");
+    }
+    std::printf("║\n");
+}
+
+static void print_summary(const Samples& thr_samples,
+                           double total_sec,
+                           uint64_t total_bytes,
+                           uint64_t total_pkts,
+                           const gn::StatsSnapshot& st) {
+
+    const bool has_errors = st.decrypt_fail > 0 || st.auth_fail > 0;
+    const char* c_red   = "\033[1;31m";
+    const char* c_green = "\033[1;32m";
+    const char* c_none  = "";
+
+    std::printf("\n\n");
+    std::printf("╔══════════════════════════════════════════════════════════╗\n");
+    std::printf("║                GoodNet Benchmark — ИТОГИ                 ║\n");
+    std::printf("╠══════════════════════════════════════════════════════════╣\n");
+
+    print_row("Длительность", fmt_duration(total_sec));
+    print_row("Статус", has_errors ? "ЗАВЕРШЕНО (ошибки!)" : "ЗАВЕРШЕНО (OK)", has_errors ? c_red : c_green);
+
+    // --- Пропускная способность ---
+    const double avg_gbps = thr_samples.mean();
+    const double peak     = thr_samples.peak();
+    
+    std::printf("╠══════════════════ ТРАФИК (Throughput) ═══════════════════╣\n");
+    
+    // Ручная сборка строки со средним, чтобы bar не ломал выравнивание
+    char avg_buf[128];
+    std::snprintf(avg_buf, sizeof(avg_buf), "%.2f Gbps  %s", avg_gbps, bar(avg_gbps / (peak > 0 ? peak : 1), 20).c_str());
+    print_row("Среднее", avg_buf);
+    
+    print_row("Пик", (std::ostringstream() << std::fixed << std::setprecision(2) << peak << " Gbps").str());
+    print_row("Задержки (p95)", (std::ostringstream() << std::fixed << std::setprecision(2) << thr_samples.percentile(95) << " Gbps").str());
+
+    // --- Данные L7 ---
+    std::printf("╠══════════════════ ПЕРЕДАЧА (L7 Data) ════════════════════╣\n");
+    uint64_t display_bytes = (total_bytes > 0) ? total_bytes : st.rx_bytes;
+    uint64_t display_pkts  = (total_pkts > 0) ? total_pkts : st.rx_packets;
+
+    print_row("Всего данных", fmt_bytes(static_cast<double>(display_bytes)));
+    print_row("Всего пакетов", fmt_num(display_pkts));
+    
+    const double pkt_s_avg = total_sec > 0 ? display_pkts / total_sec : 0;
+    print_row("Темп (Avg pkt/s)", fmt_num(static_cast<uint64_t>(pkt_s_avg)));
+
+    // --- Состояние ядра ---
+    std::printf("╠══════════════════ СОСТОЯНИЕ ЯДРА (Core) ═════════════════╣\n");
+    
+    char buf[128];
+    std::snprintf(buf, sizeof(buf), "%u / %u", (unsigned)st.total_conn, (unsigned)st.total_disc);
+    print_row("Соединения (OK/Err)", buf);
+    
+    std::snprintf(buf, sizeof(buf), "%llu / %llu", (unsigned long long)st.auth_ok, (unsigned long long)st.auth_fail);
+    print_row("Авторизация (✓/✗)", buf);
+
+    uint64_t df = st.decrypt_fail;
+    print_row("Ошибки дешифрации", fmt_num(df), df > 0 ? c_red : c_none);
+    print_row("Потери (Backpres.)", fmt_num(st.backpressure));
+
+    // --- Гистограмма ---
+    if (thr_samples.count >= 4) {
+        std::printf("╠══════════════════ Histogram Gbps ════════════════════════╣\n");
+        auto sv = thr_samples.sorted();
+        const double lo = sv.front(), hi = sv.back();
+        const int BINS = 8;
+        const int BAR_MAX_WIDTH = 24; // Максимальная визуальная ширина бара
+        
+        std::array<int, BINS> bins{};
+        for (double v : sv) {
+            const int b = hi > lo ? static_cast<int>((v - lo) / (hi - lo) * (BINS - 1)) : 0;
+            ++bins[std::min(b, BINS - 1)];
+        }
+
+        for (int i = 0; i < BINS; ++i) {
+            // Считаем, сколько символов '█' нужно нарисовать
+            int num_blocks = (int)(bins[i] * BAR_MAX_WIDTH / (sv.empty() ? 1 : sv.size()));
+            
+            std::string hb;
+            for(int j=0; j < num_blocks; ++j) hb += "█";
+            
+            // Считаем сколько ПРОБЕЛОВ нужно добавить для выравнивания (визуально)
+            std::string spaces;
+            for(int j=0; j < (BAR_MAX_WIDTH - num_blocks); ++j) spaces += " ";
+            
+            char label[64];
+            double b_start = lo + (hi - lo) * i / BINS;
+            double b_end   = lo + (hi - lo) * (i + 1) / BINS;
+            std::snprintf(label, sizeof(label), "%5.1f-%-5.1f Gbps", b_start, b_end);
+            
+            // Печать: метка | бары + пробелы | проценты
+            // Используем %s для hb, так как там UTF-8, и отдельно spaces
+            std::printf("║  %s │ %s%s│ %3d%%  ║\n",
+                label, hb.c_str(), spaces.c_str(), (int)(100.0 * bins[i] / sv.size()));
+        }
+    }
+
+    std::printf("╚══════════════════════════════════════════════════════════╝\n");
+}
+
+// ─── main ─────────────────────────────────────────────────────────────────────
 
 int main(int argc, char** argv) {
-    if (sodium_init() < 0) return 1;
-    std::signal(SIGINT, signal_handler);
+    if (sodium_init() < 0) {
+        std::cerr << "[FATAL] libsodium init failed\n";
+        return 1;
+    }
+    setup_signals();
 
+    // ── CLI ──────────────────────────────────────────────────────────────────
     std::string target;
-    uint16_t listen_port = 0;
-    int threads = std::thread::hardware_concurrency();
-    uint64_t pkts_limit = 0;
-    size_t kb_size = 64;
+    uint16_t listen_port   = 0;
+    int      threads       = 0;          // 0 = auto
+    uint64_t pkts_limit    = 0;
+    size_t   kb_size       = 64;
+    double   report_hz     = 2.0;        // обновление дашборда, раз в секунду
+    bool     no_color      = false;
 
-    po::options_description desc("GoodNet High-Performance Benchmark");
+    po::options_description desc("GoodNet Benchmark");
     desc.add_options()
-        ("help,h", "Показать помощь")
-        ("target,t", po::value<std::string>(&target), "Цель для стресс-теста (tcp://IP:PORT)")
-        ("listen,l", po::value<uint16_t>(&listen_port), "Порт для прослушивания (режим сервера)")
-        ("threads,j", po::value<int>(&threads)->default_value(threads), "Количество потоков")
-        ("count,n", po::value<uint64_t>(&pkts_limit)->default_value(0), "Лимит пакетов (0 = бесконечно)")
-        ("size,s", po::value<size_t>(&kb_size)->default_value(64), "Размер пакета в КБ");
+        ("help,h",    "Справка")
+        ("target,t",  po::value<std::string>(&target),
+                      "Цель (tcp://IP:PORT)")
+        ("listen,l",  po::value<uint16_t>(&listen_port),
+                      "Порт сервера")
+        ("threads,j", po::value<int>(&threads)->default_value(0),
+                      "IO+worker потоков (0=auto)")
+        ("count,n",   po::value<uint64_t>(&pkts_limit)->default_value(0),
+                      "Лимит пакетов (0=∞)")
+        ("size,s",    po::value<size_t>(&kb_size)->default_value(64),
+                      "Размер пакета KB")
+        ("hz",        po::value<double>(&report_hz)->default_value(2.0),
+                      "Частота обновления дашборда (Гц)")
+        ("no-color",  po::bool_switch(&no_color),
+                      "Отключить ANSI-цвета");
 
     po::variables_map vm;
     try {
         po::store(po::parse_command_line(argc, argv, desc), vm);
         po::notify(vm);
     } catch (const std::exception& e) {
-        std::cerr << "Ошибка аргументов: " << e.what() << std::endl;
+        std::cerr << "Ошибка аргументов: " << e.what() << "\n";
         return 1;
     }
+    if (vm.count("help")) { std::cout << desc << "\n"; return 0; }
 
-    if (vm.count("help")) {
-        std::cout << desc << std::endl;
-        return 0;
+    // ── Auto-detect thread count ──────────────────────────────────────────────
+    if (threads <= 0) {
+        const int hw = static_cast<int>(std::thread::hardware_concurrency());
+        threads = (hw > 0) ? hw : 2;
     }
 
+    // ── Core ─────────────────────────────────────────────────────────────────
     gn::CoreConfig cfg;
     cfg.network.io_threads = std::max(1, threads);
-    cfg.plugins.auto_load = true;
-    
+    cfg.plugins.auto_load  = true;
+
     if (const char* env_dir = std::getenv("GOODNET_PLUGINS_DIR")) {
         cfg.plugins.dirs = { env_dir };
     } else {
         cfg.plugins.dirs = { "./result/plugins", "./plugins" };
     }
 
+    std::printf(">>> Threads: %d  |  Packet: %zu KB  |  Target: %s\n",
+                threads, kb_size, target.empty() ? "(server only)" : target.c_str());
+
     gn::Core core(cfg);
     core.run_async();
 
-    // --- Режим сервера ---
+    // ── Сервер ───────────────────────────────────────────────────────────────
     if (listen_port > 0) {
         if (auto opt = core.pm().find_connector_by_scheme("tcp")) {
             (*opt)->listen((*opt)->connector_ctx, "0.0.0.0", listen_port);
-            std::cout << ">>> [Server] Listening on 0.0.0.0:" << listen_port << std::endl;
+            std::printf(">>> [Server] Listening on 0.0.0.0:%u\n", listen_port);
         } else {
-            // Если плагина нет, громко ругаемся и падаем!
-            std::cerr << "!!! [ERROR] TCP Connector plugin NOT found! Check plugins dir: " 
-                      << cfg.plugins.dirs[0].string() << std::endl;
+            std::fprintf(stderr, "!!! TCP Connector plugin NOT found in: %s\n",
+                         cfg.plugins.dirs[0].string().c_str());
             return 1;
         }
     }
 
-    // --- Режим клиента ---
+    // ── Клиент ───────────────────────────────────────────────────────────────
+    std::atomic<uint64_t> total_bytes_sent{0};
+    std::atomic<uint64_t> total_pkts_sent {0};
+    TimePoint             t_start;
+    Samples               thr_samples;
+
     if (!target.empty()) {
-        std::cout << ">>> [Client] Waiting for link: " << target << "..." << std::endl;
-        
-        // Цикл ожидания рукопожатия
-        bool connected = false;
+        std::printf(">>> [Client] Waiting for handshake: %s ...\n", target.c_str());
+
+        // Ожидание handshake
         while (g_keep_running) {
-            core.send(target.c_str(), 0, nullptr, 0); // Пингуем хэндшейком
-            
-            auto uris = core.active_uris();
-            for(const auto& u : uris) {
-                if(u.find(target) != std::string::npos || target.find(u) != std::string::npos) {
-                    connected = true;
-                    break;
-                }
-            }
-            if (connected) break;
-            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            core.send(target.c_str(), 0, nullptr, 0);
+            bool found = false;
+            for (const auto& u : core.active_uris())
+                if (u.find(target) != std::string::npos ||
+                    target.find(u)  != std::string::npos)
+                    { found = true; break; }
+            if (found) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
 
-        if (connected) {
-            std::cout << ">>> [Client] Connected! Firing " << threads << " workers." << std::endl;
-            
-            std::atomic<uint64_t> total_bytes{0};
-            std::atomic<uint64_t> sent_pkts{0};
-            auto t_start = Clock::now();
+        if (!g_keep_running) goto shutdown;
 
-            std::vector<std::thread> workers;
-            for (int i = 0; i < threads; ++i) {
-                workers.emplace_back([&, kb_size, target, pkts_limit]() {
-                    std::vector<uint8_t> payload(kb_size * 1024);
-                    randombytes_buf(payload.data(), payload.size());
-                    
-                    while (g_keep_running) {
-                        // Проверка лимита пакетов
-                        if (pkts_limit > 0 && sent_pkts.load(std::memory_order_relaxed) >= pkts_limit) break;
+        std::printf(">>> [Client] Connected! Firing %d worker threads.\n", threads);
+        t_start = Clock::now();
 
-                        // Защита от переполнения очереди (Backpressure)
-                        if (core.cm().get_pending_bytes() > 128 * 1024 * 1024) { // 128MB max
-                            std::this_thread::yield(); 
-                            continue;
-                        }
+        // Worker threads
+        std::vector<std::thread> workers;
+        workers.reserve(threads);
+        for (int i = 0; i < threads; ++i) {
+            workers.emplace_back([&]() {
+                // Каждый поток держит свой payload — нет false sharing
+                std::vector<uint8_t> payload(kb_size * 1024);
+                randombytes_buf(payload.data(), payload.size());
+                const size_t psz = payload.size();
 
-                        core.send(target.c_str(), 100, payload.data(), payload.size());
-                        
-                        total_bytes.fetch_add(payload.size(), std::memory_order_relaxed);
-                        sent_pkts.fetch_add(1, std::memory_order_relaxed);
+                while (g_keep_running) {
+                    if (pkts_limit > 0 &&
+                        total_pkts_sent >= pkts_limit)
+                        break;
+
+                    // Backpressure — не спинлочим, yield дешевле
+                    while (core.cm().get_pending_bytes() > 128UL * 1024 * 1024) {
+                        if (!g_keep_running) return;
+                        std::this_thread::yield();
                     }
-                });
-            }
 
-            // Мониторинг
-            auto last_report = Clock::now();
-            uint64_t last_bytes = 0;
-
-            while (g_keep_running) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(500));
-                
-                auto now = Clock::now();
-                double duration = std::chrono::duration<double>(now - last_report).count();
-                uint64_t current_bytes = total_bytes.load();
-                uint64_t delta_bytes = current_bytes - last_bytes;
-                
-                double bps = (delta_bytes * 8.0) / duration;
-                double total_sec = std::chrono::duration<double>(now - t_start).count();
-
-                std::printf("\r[Bench] %6.2f Gbps | %7.0f pkt/s | Sent: %8.1f MB | Backlog: %5.1f MB  ", 
-                            bps / 1e9, 
-                            (sent_pkts.load() / total_sec),
-                            current_bytes / 1e6,
-                            core.cm().get_pending_bytes() / 1e6);
-                std::fflush(stdout);
-
-                last_report = now;
-                last_bytes = current_bytes;
-
-                if (pkts_limit > 0 && sent_pkts.load() >= pkts_limit) break;
-            }
-
-            for (auto& w : workers) {
-                if(w.joinable()) w.join();
-            }
+                    // send() returns false если соединение ещё не установлено
+                    // или уже упало — в таком случае байты не считаем.
+                    // Именно это не давало словить phantom Tbps при падении сервера.
+                    if (core.send(target.c_str(), 100, payload.data(), psz)) {
+                        total_bytes_sent.fetch_add(psz, std::memory_order_relaxed);
+                        total_pkts_sent .fetch_add(1,   std::memory_order_relaxed);
+                    }
+                }
+            });
         }
+
+        // Monitor loop
+        const long interval_ms = static_cast<long>(1000.0 / report_hz);
+        TimePoint last_tp   = t_start;
+        uint64_t  last_bytes = 0;
+        double    gbps_peak  = 0.0;
+
+        while (g_keep_running) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(interval_ms));
+            if (!g_keep_running) break;
+
+            const auto now  = Clock::now();
+            const double dt = Seconds(now - last_tp).count();
+            last_tp = now;
+
+            const uint64_t cur    = total_bytes_sent;
+            const uint64_t delta  = cur - last_bytes;
+            last_bytes = cur;
+
+            const double gbps   = (delta * 8.0) / dt / 1e9;
+            const double total_sec = Seconds(now - t_start).count();
+            const double pkt_s  = total_sec > 0
+                ? total_pkts_sent / total_sec : 0;
+
+            if (gbps > gbps_peak) gbps_peak = gbps;
+            thr_samples.push(gbps);
+
+            const double backlog_mb = core.cm().get_pending_bytes() / 1e6;
+
+            auto st_snap = core.bus().stats_snapshot();
+            if (!no_color) {
+                print_live(gbps, gbps_peak, pkt_s, total_sec,
+                           cur, total_pkts_sent.load(), backlog_mb, st_snap);
+            } else {
+                std::printf("[%.0fs] %.2f Gbps | %.0f pkt/s | Sent %s | Backlog %.1f MB\n",
+                            total_sec, gbps, pkt_s,
+                            fmt_bytes(static_cast<double>(cur)).c_str(), backlog_mb);
+            }
+
+            if (pkts_limit > 0 &&
+                total_pkts_sent >= pkts_limit)
+                break;
+        }
+
+        g_keep_running.store(false);
+        for (auto& w : workers) if (w.joinable()) w.join();
+
+        // ── Итоги ─────────────────────────────────────────────────────────
+        const double total_sec = Seconds(Clock::now() - t_start).count();
+        print_summary(thr_samples, total_sec,
+                      total_bytes_sent.load(), total_pkts_sent.load(),
+                      core.bus().stats_snapshot());
     } else {
-        // Просто режим сервера: ждем Ctrl+C
-        while(g_keep_running) std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        // Только сервер — ждём сигнала, печатаем live статистику
+        t_start = Clock::now();
+        TimePoint last_tp    = t_start;
+        uint64_t  last_rx_b  = 0;
+        uint64_t  last_tx_b  = 0;
+        uint64_t  last_pkts  = 0;
+
+        while (g_keep_running) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(
+                static_cast<long>(1000.0 / report_hz)));
+
+            const auto   now       = Clock::now();
+            const double total_sec = Seconds(now - t_start).count();
+            const double dt        = Seconds(now - last_tp).count();
+            last_tp = now;
+
+            const auto& st = core.bus().stats_snapshot();
+            
+            const uint64_t cur_rx_b  = st.rx_bytes;
+            const uint64_t cur_tx_b  = st.tx_bytes;
+            const uint64_t cur_pkts  = st.rx_packets;
+
+            const double rx_gbps = dt > 0
+                ? static_cast<double>(cur_rx_b - last_rx_b) * 8.0 / dt / 1e9 : 0.0;
+            const double tx_gbps = dt > 0
+                ? static_cast<double>(cur_tx_b - last_tx_b) * 8.0 / dt / 1e9 : 0.0;
+            const double pkt_s   = dt > 0
+                ? static_cast<double>(cur_pkts - last_pkts) / dt : 0.0;
+
+            last_rx_b = cur_rx_b;
+            last_tx_b = cur_tx_b;
+            last_pkts = cur_pkts;
+            // Записываем в гистограмму только после "прогрева"
+            if (total_sec > 2.0) thr_samples.push(rx_gbps);
+
+            std::printf(
+                "\033[2K\r"
+                "[Server %s] "
+                "conns=\033[1;32m%u\033[0m  "
+                "RX \033[1;36m%.2f\033[0m Gbps  "
+                "TX \033[1;33m%.2f\033[0m Gbps  "
+                "%.0f pkt/s  "
+                "auth✓\033[32m%llu\033[0m ✗\033[31m%llu\033[0m  "
+                "dec_fail \033[%s%llu\033[0m  "
+                "drops=%llu",
+                fmt_duration(total_sec).c_str(),
+                (unsigned)st.connections,
+                rx_gbps, tx_gbps, pkt_s,
+                (unsigned long long)st.auth_ok,
+                (unsigned long long)st.auth_fail,
+                st.decrypt_fail ? "1;31m" : "0m",
+                (unsigned long long)st.decrypt_fail,
+                (unsigned long long)st.backpressure);
+            std::fflush(stdout);
+        }
+
+        const double total_sec = Seconds(Clock::now() - t_start).count();
+        std::printf("\n");
+        print_summary(thr_samples, total_sec,
+                      total_bytes_sent.load(), total_pkts_sent.load(),
+                      core.bus().stats_snapshot());
     }
 
-    std::cout << "\n>>> Shutting down core..." << std::endl;
-    core.stop(); 
+    if (!target.empty()) {
+        std::printf("\n>>> [Client] Sending finished. Waiting for kernel buffers to flush...\n");
+        while (core.cm().get_pending_bytes() > 0 && g_keep_running) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+    }
+
+shutdown:
+    std::printf("\n>>> Shutting down core...\n");
+    core.stop();
+    std::printf(">>> Done.\n");
     return 0;
 }

@@ -31,15 +31,15 @@ load_plugin(path.so)
     │                                       ✗ → unexpected(dlerror())
     │
     ├─ 4a. symbol("handler_init") found?
-    │       info.api_c = *host_api_;            ← COPY, not pointer
-    │       info.api_c.plugin_type = PLUGIN_TYPE_HANDLER;
-    │       (*handler_init)(&info.api_c, &info.handler);
+    │       info.api = *host_api_;            ← COPY, not pointer
+    │       info.api.plugin_type = PLUGIN_TYPE_HANDLER;
+    │       (*handler_init)(&info.api, &info.handler);
     │       handlers_[info.handler->name] = move(info);
     │       return {}  (success)
     │
     └─ 4b. symbol("connector_init") found?
-            info.api_c.plugin_type = PLUGIN_TYPE_CONNECTOR;
-            (*connector_init)(&info.api_c, &info.ops);
+            info.api.plugin_type = PLUGIN_TYPE_CONNECTOR;
+            (*connector_init)(&info.api, &info.ops);
             connectors_[scheme] = move(info);
             return {}
 ```
@@ -53,7 +53,7 @@ struct HandlerInfo {
     DynLib      lib;      // RAII: dlclose() in destructor
     handler_t*  handler;  // static object inside .so
     bool        enabled = true;
-    host_api_t  api_c;    // OWN COPY of API (not a pointer!)
+    host_api_t  api;    // OWN COPY of API (not a pointer!)
 
     ~HandlerInfo() {
         if (handler && handler->shutdown)
@@ -62,7 +62,7 @@ struct HandlerInfo {
 };
 ```
 
-**Why `api_c` is a copy?** The plugin stores `host_api_t*` for its lifetime. A pointer into an `unordered_map` element is invalidated on rehash. A copy in `HandlerInfo` lives exactly as long as the map entry.
+**Why `api` is a copy?** The plugin stores `host_api_t*` for its lifetime. A pointer into an `unordered_map` element is invalidated on rehash. A copy in `HandlerInfo` lives exactly as long as the map entry.
 
 ---
 

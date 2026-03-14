@@ -8,14 +8,14 @@
 /// Subscribes as a wildcard listener — receives ALL message types without
 /// touching the payload bytes themselves (no copy, header pointer only).
 
+#include <fmt/format.h>
 #include <handler.hpp>
 #include <logger.hpp>
-#include <fmt/format.h>
 
 #include <atomic>
 #include <chrono>
-#include <cstdint>
 #include <cstdio>
+#include <cstdint>
 
 namespace gn {
 
@@ -33,37 +33,36 @@ public:
         LOG_INFO("[MsgLogger] started — logging all packet types");
     }
 
-    void handle_message(const header_t*   hdr,
-                        const endpoint_t* ep,
-                        const void*       /*payload*/,
-                        size_t            payload_size) override
+    void handle_message(const header_t* header,
+                        const endpoint_t* endpoint,
+                        std::span<const uint8_t> payload) override
     {
-        if (!hdr) return;
+        if (!header) return;
 
         const uint64_t count = ++count_;
 
         // Peer address string
-        const char* addr = (ep && ep->address[0]) ? ep->address : "?";
-        const uint16_t port = ep ? ep->port : 0;
+        const char* addr = (endpoint && endpoint->address[0]) ? endpoint->address : "?";
+        const uint16_t port = endpoint ? endpoint->port : 0;
 
         // Peer pubkey prefix (first 4 bytes → 8 hex chars) — enough to identify
         char pk_prefix[9] = "????????";
-        if (ep) {
+        if (endpoint) {
             std::snprintf(pk_prefix, sizeof(pk_prefix),
                           "%02x%02x%02x%02x",
-                          ep->pubkey[0], ep->pubkey[1],
-                          ep->pubkey[2], ep->pubkey[3]);
+                          endpoint->pubkey[0], endpoint->pubkey[1],
+                          endpoint->pubkey[2], endpoint->pubkey[3]);
         }
 
         // Human-readable type name for common types
-        const char* type_name = type_str(hdr->payload_type);
+        const char* type_name = type_str(header->payload_type);
 
         LOG_INFO("[MsgLogger] #{} type={} ({}) from={}:{} size={} ts={} pk={}...",
                  count,
-                 hdr->payload_type, type_name,
+                 header->payload_type, type_name,
                  addr, port,
-                 payload_size,
-                 hdr->timestamp,
+                 payload.size(),
+                 header->timestamp,
                  pk_prefix);
     }
 

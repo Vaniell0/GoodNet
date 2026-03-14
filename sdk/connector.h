@@ -1,67 +1,59 @@
 #pragma once
 /// @file sdk/connector.h
-/// @brief C interface for transport connector plugins (TCP, UDP, WebSocket, ICE…).
+/// @brief C interface for transport connector plugins.
 
 #include "plugin.h"
 
 #ifdef __cplusplus
+#include <sys/uio.h>   // struct iovec (POSIX); connector may ignore if on Windows
 extern "C" {
 #endif
 
 /// @brief Connector operations vtable.
 ///
-/// Ownership model
-/// ───────────────
-/// The plugin owns connection objects (sockets, state machines).
-/// The core (ConnectionManager) owns ConnectionRecord, keyed by conn_id_t.
-/// conn_id_t is obtained from api->on_connect() and must be stored alongside
-/// the socket for use in subsequent on_data() / on_disconnect() calls.
-///
-/// Lifecycle
-/// ─────────
-/// 1. Incoming:  accept   → api->on_connect(ep)  → store conn_id
-/// 2. Outgoing:  async_connect → api->on_connect(ep) → store conn_id
-/// 3. Data:      read     → api->on_data(conn_id, buf, len)
-/// 4. Close:     close    → api->on_disconnect(conn_id, error)
-/// 5. Send:      core calls send_to(conn_id, data, size)
+/// Lifecycle:
+///   accept/connect → api->on_connect(ep) → store conn_id
+///   recv           → api->on_data(id, buf, len)
+///   close          → api->on_disconnect(id, err)
+///   send           → core calls send_to() or send_gather() if available
 typedef struct connector_ops_t {
 
-    /// @brief Start async outgoing connection to uri ("tcp://host:port").
-    ///        Must return quickly — actual connect happens asynchronously.
-    /// @return 0 if request accepted, -1 on immediate error
-    int (*connect)(void* connector_ctx, const char* uri);
+    /// Begin async outgoing connection. Returns 0 if accepted, -1 on error.
+    int (*connect)(void* ctx, const char* uri);
 
-    /// @brief Start listening on host:port.  Call api->on_connect() per accept.
-    /// @return 0 on success, -1 on error
-    int (*listen)(void* connector_ctx, const char* host, uint16_t port);
+    /// Start listening. Calls api->on_connect() per accept. Returns 0 or -1.
+    int (*listen)(void* ctx, const char* host, uint16_t port);
 
-    /// @brief Write raw bytes to conn_id.
-    /// @return 0 on success, -1 on error
-    int (*send_to)(void* connector_ctx, conn_id_t conn_id,
-                   const void* data, size_t size);
+    /// Write raw bytes to conn_id. Returns 0 or -1.
+    int (*send_to)(void* ctx, conn_id_t conn_id, const void* data, size_t size);
 
-    /// @brief Close conn_id.  Must eventually call api->on_disconnect().
-    void (*close)(void* connector_ctx, conn_id_t conn_id);
+    /// Vectored write (gather IO). NULL if not supported — core falls back to send_to.
+    /// Returns total bytes written, or -1 on error.
+    int (*send_gather)(void* ctx, conn_id_t conn_id,
+                       const struct iovec* iov, int iovcnt);
 
-    /// @brief Fill buf with URI scheme: "tcp", "udp", "ws", "ice", "mock", …
-    void (*get_scheme)(void* connector_ctx, char* buf, size_t buf_size);
+    /// Begin graceful close of conn_id. Must eventually call api->on_disconnect().
+    void (*close)(void* ctx, conn_id_t conn_id);
 
-    /// @brief Fill buf with human-readable name: "GoodNet TCP Connector", …
-    void (*get_name)(void* connector_ctx, char* buf, size_t buf_size);
+    /// Hard close without drain.
+    void (*close_now)(void* ctx, conn_id_t conn_id);
 
-    /// @brief Invoked before dlclose().  Close all connections, free resources.
-    void (*shutdown)(void* connector_ctx);
+    /// Fill buf with URI scheme: "tcp", "udp", "ws", "ice", "mock", …
+    void (*get_scheme)(void* ctx, char* buf, size_t buf_size);
 
-    /// Opaque plugin context, typically `this`.
+    /// Fill buf with human-readable name.
+    void (*get_name)(void* ctx, char* buf, size_t buf_size);
+
+    /// Invoked before dlclose(). Close all connections, stop threads.
+    void (*shutdown)(void* ctx);
+
+    /// Opaque plugin context.
     void* connector_ctx;
 
 } connector_ops_t;
 
-/// @brief Connector plugin entry point.
-typedef int (*connector_init_t)(host_api_t* api, connector_ops_t** out_ops);
-
-/// @brief Optional metadata export (same as handler side).
-typedef const plugin_info_t* (*plugin_get_info_t)(void);
+typedef int                  (*connector_init_t)   (host_api_t*, connector_ops_t**);
+typedef const plugin_info_t* (*plugin_get_info_t)  (void);
 
 #ifdef __cplusplus
 }

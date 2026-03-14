@@ -33,8 +33,8 @@
 │  │       on_connection_state → EventSignal                          │
 │  │                                                                  │
 │  └── PluginManager                                                  │
-│      handlers_[name]    → HandlerInfo { DynLib, handler_t*, api_c } │
-│      connectors_[scheme]→ ConnectorInfo { DynLib, ops_t*, api_c }   │
+│      handlers_[name]    → HandlerInfo { DynLib, handler_t*, api } │
+│      connectors_[scheme]→ ConnectorInfo { DynLib, ops_t*, api }   │
 │      SHA-256 verify ДО dlopen(RTLD_NOW|RTLD_LOCAL)                  │
 │      priority из plugin_info_t → порядок в PipelineSignal           │
 └─────────────────────────────────────────────────────────────────────┘

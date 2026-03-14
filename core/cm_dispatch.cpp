@@ -1,137 +1,165 @@
+/// @file core/cm_dispatch.cpp
+
 #include "connectionManager.hpp"
 #include "logger.hpp"
+
 #include <cstring>
+#include <ctime>
 
 namespace gn {
 
-// ─── handle_data ─────────────────────────────────────────────────────────────
+// ── handle_data ───────────────────────────────────────────────────────────────
 
 void ConnectionManager::handle_data(conn_id_t id, const void* raw, size_t size) {
     if (shutting_down_.load(std::memory_order_relaxed)) return;
+    const uint64_t recv_ts = monotonic_ns();
 
-    std::unique_lock lock(records_mu_);
-    auto it = records_.find(id);
-    if (it == records_.end()) return;
+    // We need a write-capable view of recv_buf — use a direct record access
+    // via write-locked RCU to append bytes (recv_buf is hot, per-connection).
+    std::shared_ptr<ConnectionRecord> rec;
+    {
+        auto map = rcu_read();
+        auto it  = map->find(id);
+        if (it == map->end()) return;
+        rec = it->second;
+    }
 
-    auto& rec = it->second;
-    const auto* bytes = static_cast<const uint8_t*>(raw);
-    rec.recv_buf.insert(rec.recv_buf.end(), bytes, bytes + size);
+    {
+        auto& buf = rec->recv_buf;
+        const auto* bytes = static_cast<const uint8_t*>(raw);
+        buf.insert(buf.end(), bytes, bytes + size);
+    }
 
-    while (rec.recv_buf.size() >= sizeof(header_t)) {
-        const auto* hdr = reinterpret_cast<const header_t*>(rec.recv_buf.data());
+    thread_local std::vector<uint8_t> pkt_buf;
+
+    size_t consumed = 0;
+    while (true) {
+        auto& buf   = rec->recv_buf;
+        const size_t avail = buf.size() - consumed;
+
+        if (avail < sizeof(header_t)) break;
+
+        const auto* hdr = reinterpret_cast<const header_t*>(buf.data() + consumed);
 
         if (hdr->magic != GNET_MAGIC) {
-            LOG_WARN("handle_data #{}: bad magic 0x{:08X}, dropping", id, hdr->magic);
-            rec.recv_buf.clear(); break;
+            LOG_WARN("handle_data #{}: bad magic 0x{:08X}", id, hdr->magic);
+            bus_.emit_drop(id, DropReason::BadMagic);
+            buf.clear(); consumed = 0; break;
         }
         if (hdr->proto_ver != GNET_PROTO_VER) {
             LOG_WARN("handle_data #{}: bad proto_ver {}", id, hdr->proto_ver);
-            rec.recv_buf.clear(); break;
+            bus_.emit_drop(id, DropReason::BadProtoVer);
+            buf.clear(); consumed = 0; break;
         }
 
         const size_t total = sizeof(header_t) + hdr->payload_len;
-        if (rec.recv_buf.size() < total) break;
+        if (avail < total) break;
 
-        std::vector<uint8_t> pkt(rec.recv_buf.begin(),
-                                  rec.recv_buf.begin() + static_cast<ptrdiff_t>(total));
-        rec.recv_buf.erase(rec.recv_buf.begin(),
-                           rec.recv_buf.begin() + static_cast<ptrdiff_t>(total));
+        pkt_buf.assign(buf.data() + consumed, buf.data() + consumed + total);
+        consumed += total;
 
-        const auto* phdr    = reinterpret_cast<const header_t*>(pkt.data());
-        const uint8_t* payload = pkt.data() + sizeof(header_t);
-        const size_t plen   = phdr->payload_len;
+        const auto* phdr    = reinterpret_cast<const header_t*>(pkt_buf.data());
+        const std::span<const uint8_t> payload(
+            pkt_buf.data() + sizeof(header_t), phdr->payload_len);
 
-        lock.unlock();
-        dispatch_packet(id, phdr, payload, plen);
-        lock.lock();
+        dispatch_packet(id, phdr, payload, recv_ts);
 
-        it = records_.find(id);
-        if (it == records_.end()) break;
+        // Re-acquire after potential state changes inside dispatch
+        auto map = rcu_read();
+        auto it  = map->find(id);
+        if (it == map->end()) return;
+        rec = it->second;
+    }
+
+    if (consumed > 0) {
+        auto& buf = rec->recv_buf;
+        if (consumed == buf.size()) buf.clear();
+        else buf.erase(buf.begin(), buf.begin() + static_cast<ptrdiff_t>(consumed));
     }
 }
 
-// ─── dispatch_packet ─────────────────────────────────────────────────────────
+// ── dispatch_packet ───────────────────────────────────────────────────────────
 
 void ConnectionManager::dispatch_packet(conn_id_t id, const header_t* hdr,
-                                         const uint8_t* payload, size_t plen) {
+                                         std::span<const uint8_t> payload,
+                                         uint64_t recv_ts_ns) {
+    // ── AUTH ──────────────────────────────────────────────────────────────────
     if (hdr->payload_type == MSG_TYPE_AUTH) {
-        const bool ok = process_auth(id, payload, plen);
-        if (ok)   stats_.auth_ok  .fetch_add(1, std::memory_order_relaxed);
-        else      stats_.auth_fail.fetch_add(1, std::memory_order_relaxed);
+        const bool ok = process_auth(id, payload);
+        bus_.emit_stat({ok ? StatsEvent::Kind::AuthOk : StatsEvent::Kind::AuthFail,
+                        1, id});
         return;
     }
 
-    endpoint_t remote{};
-    bool       is_localhost = false;
-    std::string affinity_hint;
-    std::vector<uint8_t> plaintext;
-
-    {
-        std::unique_lock lk(records_mu_);
-        auto it = records_.find(id);
-        if (it == records_.end()) return;
-        auto& rec = it->second;
-
-        if (rec.state != STATE_ESTABLISHED) {
-            LOG_WARN("dispatch #{}: type={} before ESTABLISHED, dropping",
-                     id, hdr->payload_type);
-            return;
-        }
-
-        remote         = rec.remote;
-        remote.peer_id = id;          // lets handlers call send_response(ep->peer_id)
-        is_localhost   = rec.is_localhost;
-        affinity_hint  = rec.affinity_plugin;
-
-        if (is_localhost || !rec.session) {
-            plaintext.assign(payload, payload + plen);
-        } else if (rec.session->ready) {
-            plaintext = rec.session->decrypt(payload, plen);
-            if (plaintext.empty()) {
-                LOG_WARN("dispatch #{}: decrypt failed (type={}), dropping",
-                         id, hdr->payload_type);
-                stats_.decrypt_fail.fetch_add(1, std::memory_order_relaxed);
-                return;
-            }
-        } else {
-            LOG_WARN("dispatch #{}: session not ready, dropping type={}", id, hdr->payload_type);
-            return;
-        }
+    // ── KEY_EXCHANGE ──────────────────────────────────────────────────────────
+    if (hdr->payload_type == MSG_TYPE_KEY_EXCHANGE) {
+        process_keyex(id, payload);
+        return;
     }
 
-    stats_.on_rx(plen);
+    // ── ICE_SIGNAL ────────────────────────────────────────────────────────────
+    if (hdr->payload_type == MSG_TYPE_ICE_SIGNAL) {
+        handle_ice_signal(id, payload);
+        return;
+    }
+
+    // ── Normal dispatch ───────────────────────────────────────────────────────
+
+    auto rec = rcu_find(id);
+    if (!rec) { bus_.emit_drop(id, DropReason::ConnNotFound); return; }
+
+    if (rec->state != STATE_ESTABLISHED) {
+        LOG_WARN("dispatch #{}: type={} before ESTABLISHED", id, hdr->payload_type);
+        bus_.emit_drop(id, DropReason::StateNotEstablished);
+        return;
+    }
+
+    // Decrypt
+    std::vector<uint8_t> plaintext;
+    if (rec->is_localhost || !rec->session) {
+        plaintext.assign(payload.begin(), payload.end());
+    } else if (rec->session->ready) {
+        plaintext = rec->session->decrypt(payload.data(), payload.size());
+        if (plaintext.empty()) {
+            bus_.emit_drop(id, DropReason::DecryptFail);
+            return;
+        }
+    } else {
+        bus_.emit_drop(id, DropReason::SessionNotReady);
+        return;
+    }
+
+    bus_.emit_stat({StatsEvent::Kind::RxBytes,  payload.size(), id});
+    bus_.emit_stat({StatsEvent::Kind::RxPacket, 1,              id});
 
     auto hdr_ptr  = std::make_shared<header_t>(*hdr);
-    auto data_ptr = std::make_shared<std::vector<uint8_t>>(std::move(plaintext));
+    auto data_ptr = std::make_shared<sdk::RawBuffer>(std::move(plaintext));
 
-    // Pipeline dispatch — replaces old bus_.emit()
+    endpoint_t remote  = rec->remote;
+    remote.peer_id     = id;
+    const auto affinity = rec->affinity_plugin;
+
     const auto result = bus_.dispatch_packet(
         hdr->payload_type, hdr_ptr, &remote, data_ptr);
 
-    // Session affinity: pin on first CONSUMED
-    if (result.result == PROPAGATION_CONSUMED && affinity_hint.empty()) {
-        std::unique_lock lk(records_mu_);
-        if (auto it = records_.find(id); it != records_.end())
-            it->second.affinity_plugin = result.consumed_by;
-        LOG_DEBUG("dispatch #{}: affinity pinned → '{}'", id, result.consumed_by);
-        stats_.consumed.fetch_add(1, std::memory_order_relaxed);
+    // Latency: nanoseconds from byte arrival to handler return
+    const uint64_t lat_ns = monotonic_ns() - recv_ts_ns;
+    bus_.emit_latency(id, lat_ns);
+
+    if (result.result == PROPAGATION_CONSUMED && affinity.empty()) {
+        std::lock_guard wlk(records_write_mu_);
+        rcu_update([&](RecordMap& m) {
+            if (auto it = m.find(id); it != m.end())
+                it->second->affinity_plugin = result.consumed_by;
+        });
+        LOG_DEBUG("dispatch #{}: affinity → '{}'", id, result.consumed_by);
+        bus_.emit_stat({StatsEvent::Kind::Consumed, 1, id});
     } else if (result.result == PROPAGATION_REJECT) {
         LOG_WARN("dispatch #{}: REJECTED by '{}' (type={})",
                  id, result.consumed_by, hdr->payload_type);
-        stats_.rejected.fetch_add(1, std::memory_order_relaxed);
+        bus_.emit_drop(id, DropReason::RejectedByHandler);
+        bus_.emit_stat({StatsEvent::Kind::Rejected, 1, id});
     }
-}
-
-// ─── send_on_conn ─────────────────────────────────────────────────────────────
-// Used by host_api_t::send_response — direct reply without URI lookup.
-
-void ConnectionManager::send_on_conn(conn_id_t id, uint32_t msg_type,
-                                      const void* data, size_t size) {
-    {
-        std::shared_lock lk(records_mu_);
-        if (records_.find(id) == records_.end()) return;
-    }
-    send_frame(id, msg_type, data, size);
 }
 
 } // namespace gn

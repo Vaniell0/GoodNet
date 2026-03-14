@@ -11,6 +11,8 @@
 #include "signals.hpp"
 #include "logger.hpp"
 
+#include "../sdk/connector.h"
+
 namespace fs = std::filesystem;
 using namespace gn;
 
@@ -132,7 +134,7 @@ static connector_ops_t make_mock_connector_ops() {
 // Build a valid AUTH payload for a given identity
 static std::vector<uint8_t> build_auth_payload(const NodeIdentity& id,
                                                  const std::vector<std::string>& schemes = {}) {
-    auth_payload_t ap{};
+    msg::AuthPayload ap{};
     std::memcpy(ap.user_pubkey,   id.user_pubkey,   32);
     std::memcpy(ap.device_pubkey, id.device_pubkey, 32);
 
@@ -153,8 +155,8 @@ static std::vector<uint8_t> build_auth_payload(const NodeIdentity& id,
 
     ap.set_schemes(schemes);
 
-    std::vector<uint8_t> out(auth_payload_t::kFullSize);
-    std::memcpy(out.data(), &ap, auth_payload_t::kFullSize);
+    std::vector<uint8_t> out(msg::AuthPayload::kFullSize);
+    std::memcpy(out.data(), &ap, msg::AuthPayload::kFullSize);
     return out;
 }
 
@@ -401,8 +403,12 @@ TEST(SessionTest, EncryptDecryptRoundTrip) {
 
     std::vector<uint8_t> plain = {0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03};
     auto wire = s.encrypt(plain.data(), plain.size());
+    
     ASSERT_FALSE(wire.empty());
-    EXPECT_EQ(wire.size(), 8u + plain.size() + crypto_secretbox_MACBYTES);
+    
+    // Обновленное ожидание: 8 (nonce) + 1 (flag) + plain + MAC
+    size_t expected_size = 8u + 1u + plain.size() + crypto_secretbox_MACBYTES;
+    EXPECT_EQ(wire.size(), expected_size);
 
     auto result = s.decrypt(wire.data(), wire.size());
     ASSERT_EQ(result, plain);
@@ -475,10 +481,12 @@ TEST(SessionTest, EmptyPlaintextRoundTrip) {
     s.ready = true;
 
     auto wire = s.encrypt(nullptr, 0);
-    EXPECT_EQ(wire.size(), 8u + crypto_secretbox_MACBYTES);
+    
+    // Ожидание: 8 (nonce) + 1 (flag) + 0 (plain) + MAC
+    EXPECT_EQ(wire.size(), 8u + 1u + crypto_secretbox_MACBYTES);
 
     auto result = s.decrypt(wire.data(), wire.size());
-    EXPECT_TRUE(result.empty()); // empty plaintext is valid
+    EXPECT_TRUE(result.empty());
 }
 
 TEST(SessionTest, LargePayloadRoundTrip) {
@@ -495,11 +503,11 @@ TEST(SessionTest, LargePayloadRoundTrip) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// SECTION 3: auth_payload_t helpers
+// SECTION 3: gn::msg::AuthPayload helpers
 // ═══════════════════════════════════════════════════════════════════════════════
 
 TEST(AuthPayloadTest, SetGetSchemesRoundTrip) {
-    auth_payload_t ap{};
+    msg::AuthPayload ap{};
     ap.set_schemes({"tcp", "ws", "udp"});
     EXPECT_EQ(ap.schemes_count, 3);
     auto schemes = ap.get_schemes();
@@ -510,13 +518,13 @@ TEST(AuthPayloadTest, SetGetSchemesRoundTrip) {
 }
 
 TEST(AuthPayloadTest, TooManySchemesClipped) {
-    auth_payload_t ap{};
+    msg::AuthPayload ap{};
     ap.set_schemes({"a","b","c","d","e","f","g","h","i","j"});  // 10 > AUTH_MAX_SCHEMES(8)
-    EXPECT_EQ(ap.schemes_count, AUTH_MAX_SCHEMES);
+    EXPECT_EQ(ap.schemes_count, msg::AUTH_MAX_SCHEMES);
 }
 
 TEST(AuthPayloadTest, EmptySchemesProducesWildcard) {
-    auth_payload_t ap{};
+    msg::AuthPayload ap{};
     ap.set_schemes({});
     EXPECT_EQ(ap.schemes_count, 0);
     auto s = ap.get_schemes();
@@ -524,7 +532,7 @@ TEST(AuthPayloadTest, EmptySchemesProducesWildcard) {
 }
 
 TEST(AuthPayloadTest, SizeAssert) {
-    using gn::msg::AuthPayload;
+    using msg::AuthPayload;
     
     // Проверка базовой части (до схем)
     EXPECT_EQ(AuthPayload::kBaseSize, 160u);
@@ -533,7 +541,7 @@ TEST(AuthPayloadTest, SizeAssert) {
     EXPECT_EQ(AuthPayload::kSchemeBlock, 129u);
     
     // Проверка мета-данных (2 * uint32)
-    EXPECT_EQ(sizeof(gn::msg::CoreMeta), 8u);
+    EXPECT_EQ(sizeof(msg::CoreMeta), 8u);
     
     // Итоговый размер: 160 + 129 + 8 = 297
     EXPECT_EQ(sizeof(AuthPayload), 297u);
@@ -892,14 +900,14 @@ TEST_F(CMTest, BadAuthPayload_InvalidSignature_Dropped) {
     conn_id_t id = api.on_connect(api.ctx, &ep);
 
     // Valid-sized payload but corrupt signature
-    auth_payload_t ap{};
+    msg::AuthPayload ap{};
     std::memcpy(ap.user_pubkey,   id_b_.user_pubkey,   32);
     std::memcpy(ap.device_pubkey, id_b_.device_pubkey, 32);
     // Leave signature as zeros (invalid)
     randombytes_buf(ap.ephem_pubkey, 32);
     ap.schemes_count = 0;
-    std::vector<uint8_t> payload(auth_payload_t::kFullSize);
-    std::memcpy(payload.data(), &ap, auth_payload_t::kFullSize);
+    std::vector<uint8_t> payload(msg::AuthPayload::kFullSize);
+    std::memcpy(payload.data(), &ap, msg::AuthPayload::kFullSize);
 
     header_t h{};
     h.magic = GNET_MAGIC; h.proto_ver = GNET_PROTO_VER;
