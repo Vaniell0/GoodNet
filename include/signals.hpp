@@ -31,7 +31,10 @@ enum class DropReason : uint8_t {
     SessionNotReady     = 9,
     RejectedByHandler   = 10,
     ShuttingDown        = 11,
-    _Count              = 12,
+    RelayDropped        = 12,
+    SenderIdMismatch    = 13,
+    TrustedFromRemote   = 14,
+    _Count              = 15,
 };
 
 // ── Latency histogram ─────────────────────────────────────────────────────────

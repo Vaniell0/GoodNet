@@ -174,7 +174,7 @@ NodeIdentity NodeIdentity::load_or_generate(const IdentityConfig& cfg) {
     bool loaded = false;
     if (!cfg.ssh_key_path.empty())
         loaded = try_load_ssh_key(cfg.ssh_key_path, id.user_pubkey, id.user_seckey);
-    if (!loaded) {
+    if (!loaded && !cfg.skip_ssh_fallback) {
         const char* home = std::getenv("HOME");
 #if defined(_WIN32)
         if (!home) home = std::getenv("USERPROFILE");

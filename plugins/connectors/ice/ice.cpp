@@ -26,6 +26,7 @@
 
 #include <atomic>
 #include <cerrno>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -81,6 +82,20 @@ public:
     // ── Lifecycle ─────────────────────────────────────────────────────────────
 
     void on_init() override {
+        // STUN config: config_get() → env var → compiled default
+        if (auto v = config_get("ice.stun_server"); !v.empty())
+            stun_server_ = v;
+        else if (const char* env = std::getenv("GOODNET_STUN_SERVER"))
+            stun_server_ = env;
+
+        if (auto v = config_get("ice.stun_port"); !v.empty()) {
+            int p = std::atoi(v.c_str());
+            if (p > 0 && p <= 65535) stun_port_ = static_cast<uint16_t>(p);
+        } else if (const char* env = std::getenv("GOODNET_STUN_PORT")) {
+            int p = std::atoi(env);
+            if (p > 0 && p <= 65535) stun_port_ = static_cast<uint16_t>(p);
+        }
+
         gctx_  = g_main_context_new();
         gloop_ = g_main_loop_new(gctx_, FALSE);
         glib_thread_ = std::thread([this] {
@@ -99,7 +114,7 @@ public:
         sig_handler_.num_supported_types = 1;
         register_extra_handler(&sig_handler_);
 
-        LOG_INFO("[ICE] connector ready");
+        LOG_INFO("[ICE] connector ready (STUN={}:{})", stun_server_, stun_port_);
     }
 
     void on_shutdown() override {
@@ -201,8 +216,8 @@ private:
         if (!s->agent) return nullptr;
 
         g_object_set(s->agent,
-                     "stun-server",      "stun.l.google.com",
-                     "stun-server-port", 19302,
+                     "stun-server",      stun_server_.c_str(),
+                     "stun-server-port", static_cast<guint>(stun_port_),
                      "controlling-mode", (kind == IceSignalKind::OFFER),
                      nullptr);
 
@@ -381,6 +396,9 @@ private:
 
     std::mutex mu_;
     std::unordered_map<std::string, std::shared_ptr<IceSess>> sessions_;
+
+    std::string stun_server_ = "stun.l.google.com";
+    uint16_t    stun_port_   = 19302;
 
     handler_t sig_handler_{};
     static constexpr uint32_t kSigType = MSG_TYPE_ICE_SIGNAL;

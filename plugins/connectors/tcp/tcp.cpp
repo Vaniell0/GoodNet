@@ -264,6 +264,8 @@ private:
             std::strncpy(ep.address, rep.address().to_string().c_str(),
                          sizeof(ep.address) - 1);
             ep.port = rep.port();
+            if (rep.address().is_loopback())
+                ep.flags = EP_FLAG_TRUSTED;
         } catch (...) {}
 
         conn_id_t id = notify_connect(&ep);

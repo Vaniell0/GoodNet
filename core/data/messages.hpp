@@ -33,6 +33,7 @@ namespace gn::msg {
 #define CORE_CAP_ZSTD   (1U << 0) ///< Payload compression available
 #define CORE_CAP_ICE    (1U << 1) ///< ICE/DTLS transport supported
 #define CORE_CAP_KEYROT (1U << 2) ///< On-line key rotation supported
+#define CORE_CAP_RELAY  (1U << 3) ///< Gossip relay supported
 
 /// Packed core version: (major<<16)|(minor<<8)|patch
 #define GN_CORE_VERSION ((1U << 16) | (0U << 8) | 2U)  // 1.0.2
@@ -130,6 +131,20 @@ struct KeyExchangePayload {
 static_assert(sizeof(KeyExchangePayload) == 96, "KeyExchangePayload size mismatch");
 
 using KeyExchangeMessage = gn::sdk::PodData<KeyExchangePayload>;
+
+// ─── RELAY (MSG_TYPE_RELAY = 10) ───────────────────────────────────────────────
+/// Gossip relay wrapper. Encrypted payload after decrypt:
+///   ttl(1) | dest_pubkey(32) | inner_frame (header_t + encrypted payload)
+/// inner_frame is opaque to relay nodes — forwarded as-is.
+
+#pragma pack(push, 1)
+struct RelayPayload {
+    uint8_t  ttl;              ///< Remaining hops (decremented, drop at 0)
+    uint8_t  dest_pubkey[32];  ///< Final destination user_pubkey
+    // Followed by inner_frame: original header_t + encrypted payload (opaque)
+};
+#pragma pack(pop)
+static_assert(sizeof(RelayPayload) == 33, "RelayPayload size mismatch");
 
 // ─── ICE_SIGNAL (MSG_TYPE_ICE_SIGNAL = 11) ────────────────────────────────────
 /// Carries SDP blobs between peers over the existing TCP signaling channel.

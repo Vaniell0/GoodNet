@@ -1243,53 +1243,212 @@ TEST_F(CMTest, SortedPubkeys_Deterministic) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// SECTION 16: ICE state machine
+// SECTION 16: Relay (MSG_TYPE_RELAY)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-TEST_F(CMTest, IceState_DefaultIdle) {
-    host_api_t api{};
-    cm_a_->fill_host_api(&api);
-    endpoint_t ep{};
-    strncpy(ep.address, "10.0.0.1", sizeof(ep.address));
-    ep.port = 8001;
-    conn_id_t id = api.on_connect(api.ctx, &ep);
-
-    EXPECT_EQ(cm_a_->ice_state(id), IceState::Idle);
+TEST(RelayPayloadTest, SizeCheck) {
+    EXPECT_EQ(sizeof(msg::RelayPayload), 33u);
 }
 
-TEST_F(CMTest, InitiateOnNonEstablished_Noop) {
-    host_api_t api{};
-    cm_a_->fill_host_api(&api);
-    endpoint_t ep{};
-    strncpy(ep.address, "10.0.0.1", sizeof(ep.address));
-    ep.port = 8002;
-    conn_id_t id = api.on_connect(api.ctx, &ep);
-
-    // initiate_ice on AUTH_PENDING should be a no-op
-    cm_a_->initiate_ice(id);
-    EXPECT_EQ(cm_a_->ice_state(id), IceState::Idle);
-}
-
-TEST_F(CMTest, InitiateIce_SetsGathering) {
+TEST_F(CMTest, HandleRelay_LocalDelivery) {
+    // Setup: A and B handshake on localhost (no encryption).
+    cm_a_->register_connector("mock", &mock_ops_);
     auto [cid_a, cid_b] = do_handshake(*cm_a_, id_a_, *cm_b_, id_b_, true);
-    EXPECT_EQ(*cm_a_->get_state(cid_a), STATE_ESTABLISHED);
+    ASSERT_EQ(*cm_a_->get_state(cid_a), STATE_ESTABLISHED);
 
-    cm_a_->initiate_ice(cid_a);
-    EXPECT_EQ(cm_a_->ice_state(cid_a), IceState::Gathering);
-}
+    // Build an inner frame: a MSG_TYPE_CHAT packet destined for local delivery.
+    header_t inner_hdr{};
+    inner_hdr.magic        = GNET_MAGIC;
+    inner_hdr.proto_ver    = GNET_PROTO_VER;
+    inner_hdr.payload_type = MSG_TYPE_CHAT;
+    inner_hdr.payload_len  = 4;
+    inner_hdr.packet_id    = 42;
+    std::memcpy(inner_hdr.sender_id, id_b_.device_pubkey, 16);
+    uint8_t chat_data[4] = {0xCA, 0xFE, 0xBA, 0xBE};
 
-TEST_F(CMTest, IceSignal_Connecting) {
+    std::vector<uint8_t> inner_frame(sizeof(inner_hdr) + 4);
+    std::memcpy(inner_frame.data(), &inner_hdr, sizeof(inner_hdr));
+    std::memcpy(inner_frame.data() + sizeof(inner_hdr), chat_data, 4);
+
+    // Build relay payload: TTL=3, dest = id_a_ (local)
+    constexpr size_t RELAY_HDR = sizeof(msg::RelayPayload);
+    std::vector<uint8_t> relay_payload(RELAY_HDR + inner_frame.size());
+    auto* rp = reinterpret_cast<msg::RelayPayload*>(relay_payload.data());
+    rp->ttl = 3;
+    std::memcpy(rp->dest_pubkey, id_a_.user_pubkey, 32);
+    std::memcpy(relay_payload.data() + RELAY_HDR,
+                inner_frame.data(), inner_frame.size());
+
+    // Wrap in a MSG_TYPE_RELAY wire frame and feed to A.
+    header_t relay_hdr{};
+    relay_hdr.magic        = GNET_MAGIC;
+    relay_hdr.proto_ver    = GNET_PROTO_VER;
+    relay_hdr.payload_type = MSG_TYPE_RELAY;
+    relay_hdr.payload_len  = static_cast<uint32_t>(relay_payload.size());
+
+    std::vector<uint8_t> wire(sizeof(relay_hdr) + relay_payload.size());
+    std::memcpy(wire.data(), &relay_hdr, sizeof(relay_hdr));
+    std::memcpy(wire.data() + sizeof(relay_hdr),
+                relay_payload.data(), relay_payload.size());
+
+    // Feed to on_data — should not crash (local delivery via dispatch_packet).
     host_api_t api{};
     cm_a_->fill_host_api(&api);
-    endpoint_t ep{};
-    strncpy(ep.address, "10.0.0.1", sizeof(ep.address));
-    ep.port = 8003;
-    conn_id_t id = api.on_connect(api.ctx, &ep);
+    EXPECT_NO_THROW(api.on_data(api.ctx, cid_a, wire.data(), wire.size()));
+}
 
-    // handle_ice_signal on Idle → should transition to Connecting
-    uint8_t signal_data[] = {1, 2, 3, 4};
-    cm_a_->handle_ice_signal(id, std::span<const uint8_t>(signal_data, sizeof(signal_data)));
-    EXPECT_EQ(cm_a_->ice_state(id), IceState::Connecting);
+TEST_F(CMTest, HandleRelay_Forward) {
+    // Three nodes: A ←→ B ←→ C. Send relay through B to C.
+    cm_b_->register_connector("mock", &mock_ops_);
+
+    auto dir_c = tmp_dir("relay_c");
+    auto id_c  = NodeIdentity::load_or_generate(dir_c);
+    boost::asio::io_context ioc_c;
+    SignalBus bus_c{ioc_c};
+    auto cm_c = std::make_unique<ConnectionManager>(bus_c, id_c);
+
+    // Handshake A↔B and B↔C on localhost.
+    auto [cid_ba, cid_ab] = do_handshake(*cm_b_, id_b_, *cm_a_, id_a_, true);
+    auto [cid_bc, cid_cb] = do_handshake(*cm_b_, id_b_, *cm_c,  id_c,  true);
+
+    ASSERT_EQ(*cm_b_->get_state(cid_ba), STATE_ESTABLISHED);
+    ASSERT_EQ(*cm_b_->get_state(cid_bc), STATE_ESTABLISHED);
+
+    // Build inner frame.
+    header_t inner_hdr{};
+    inner_hdr.magic        = GNET_MAGIC;
+    inner_hdr.proto_ver    = GNET_PROTO_VER;
+    inner_hdr.payload_type = MSG_TYPE_CHAT;
+    inner_hdr.payload_len  = 2;
+    inner_hdr.packet_id    = 99;
+    std::memcpy(inner_hdr.sender_id, id_a_.device_pubkey, 16);
+    uint8_t chat[2] = {0x01, 0x02};
+
+    std::vector<uint8_t> inner_frame(sizeof(inner_hdr) + 2);
+    std::memcpy(inner_frame.data(), &inner_hdr, sizeof(inner_hdr));
+    std::memcpy(inner_frame.data() + sizeof(inner_hdr), chat, 2);
+
+    // Build relay payload destined for C, TTL=3.
+    constexpr size_t RELAY_HDR = sizeof(msg::RelayPayload);
+    std::vector<uint8_t> relay_payload(RELAY_HDR + inner_frame.size());
+    auto* rp = reinterpret_cast<msg::RelayPayload*>(relay_payload.data());
+    rp->ttl = 3;
+    std::memcpy(rp->dest_pubkey, id_c.user_pubkey, 32);
+    std::memcpy(relay_payload.data() + RELAY_HDR,
+                inner_frame.data(), inner_frame.size());
+
+    // Wrap and feed to B from A's connection.
+    header_t relay_hdr{};
+    relay_hdr.magic        = GNET_MAGIC;
+    relay_hdr.proto_ver    = GNET_PROTO_VER;
+    relay_hdr.payload_type = MSG_TYPE_RELAY;
+    relay_hdr.payload_len  = static_cast<uint32_t>(relay_payload.size());
+
+    std::vector<uint8_t> wire(sizeof(relay_hdr) + relay_payload.size());
+    std::memcpy(wire.data(), &relay_hdr, sizeof(relay_hdr));
+    std::memcpy(wire.data() + sizeof(relay_hdr),
+                relay_payload.data(), relay_payload.size());
+
+    host_api_t api_b{};
+    cm_b_->fill_host_api(&api_b);
+    // B receives relay from A — should forward to C (not crash, not loop back to A).
+    EXPECT_NO_THROW(api_b.on_data(api_b.ctx, cid_ba, wire.data(), wire.size()));
+
+    cm_c->shutdown();
+    fs::remove_all(dir_c);
+}
+
+TEST_F(CMTest, HandleRelay_TTLZero_Dropped) {
+    cm_a_->register_connector("mock", &mock_ops_);
+    auto [cid_a, cid_b] = do_handshake(*cm_a_, id_a_, *cm_b_, id_b_, true);
+
+    // Build minimal inner frame.
+    header_t inner_hdr{};
+    inner_hdr.magic        = GNET_MAGIC;
+    inner_hdr.proto_ver    = GNET_PROTO_VER;
+    inner_hdr.payload_type = MSG_TYPE_CHAT;
+    inner_hdr.payload_len  = 1;
+    inner_hdr.packet_id    = 200;
+
+    std::vector<uint8_t> inner_frame(sizeof(inner_hdr) + 1);
+    std::memcpy(inner_frame.data(), &inner_hdr, sizeof(inner_hdr));
+    inner_frame.back() = 0xFF;
+
+    // Build relay with TTL=0 → should be dropped.
+    constexpr size_t RELAY_HDR = sizeof(msg::RelayPayload);
+    std::vector<uint8_t> relay_payload(RELAY_HDR + inner_frame.size());
+    auto* rp = reinterpret_cast<msg::RelayPayload*>(relay_payload.data());
+    rp->ttl = 0;  // zero!
+    std::memcpy(rp->dest_pubkey, id_b_.user_pubkey, 32);
+    std::memcpy(relay_payload.data() + RELAY_HDR,
+                inner_frame.data(), inner_frame.size());
+
+    header_t relay_hdr{};
+    relay_hdr.magic        = GNET_MAGIC;
+    relay_hdr.proto_ver    = GNET_PROTO_VER;
+    relay_hdr.payload_type = MSG_TYPE_RELAY;
+    relay_hdr.payload_len  = static_cast<uint32_t>(relay_payload.size());
+
+    std::vector<uint8_t> wire(sizeof(relay_hdr) + relay_payload.size());
+    std::memcpy(wire.data(), &relay_hdr, sizeof(relay_hdr));
+    std::memcpy(wire.data() + sizeof(relay_hdr),
+                relay_payload.data(), relay_payload.size());
+
+    host_api_t api{};
+    cm_a_->fill_host_api(&api);
+    // TTL=0 → dropped silently (no crash).
+    EXPECT_NO_THROW(api.on_data(api.ctx, cid_a, wire.data(), wire.size()));
+}
+
+TEST_F(CMTest, HandleRelay_Dedup) {
+    cm_a_->register_connector("mock", &mock_ops_);
+    auto [cid_a, cid_b] = do_handshake(*cm_a_, id_a_, *cm_b_, id_b_, true);
+
+    // Build inner frame with unique sender_id + packet_id.
+    header_t inner_hdr{};
+    inner_hdr.magic        = GNET_MAGIC;
+    inner_hdr.proto_ver    = GNET_PROTO_VER;
+    inner_hdr.payload_type = MSG_TYPE_CHAT;
+    inner_hdr.payload_len  = 1;
+    inner_hdr.packet_id    = 777;
+    std::memcpy(inner_hdr.sender_id, id_b_.device_pubkey, 16);
+
+    std::vector<uint8_t> inner_frame(sizeof(inner_hdr) + 1);
+    std::memcpy(inner_frame.data(), &inner_hdr, sizeof(inner_hdr));
+    inner_frame.back() = 0xAA;
+
+    // Build relay destined for id_a_ (local delivery).
+    constexpr size_t RELAY_HDR = sizeof(msg::RelayPayload);
+    std::vector<uint8_t> relay_payload(RELAY_HDR + inner_frame.size());
+    auto* rp = reinterpret_cast<msg::RelayPayload*>(relay_payload.data());
+    rp->ttl = 5;
+    std::memcpy(rp->dest_pubkey, id_a_.user_pubkey, 32);
+    std::memcpy(relay_payload.data() + RELAY_HDR,
+                inner_frame.data(), inner_frame.size());
+
+    header_t relay_hdr{};
+    relay_hdr.magic        = GNET_MAGIC;
+    relay_hdr.proto_ver    = GNET_PROTO_VER;
+    relay_hdr.payload_type = MSG_TYPE_RELAY;
+    relay_hdr.payload_len  = static_cast<uint32_t>(relay_payload.size());
+
+    std::vector<uint8_t> wire(sizeof(relay_hdr) + relay_payload.size());
+    std::memcpy(wire.data(), &relay_hdr, sizeof(relay_hdr));
+    std::memcpy(wire.data() + sizeof(relay_hdr),
+                relay_payload.data(), relay_payload.size());
+
+    host_api_t api{};
+    cm_a_->fill_host_api(&api);
+
+    // First delivery — should succeed.
+    EXPECT_NO_THROW(api.on_data(api.ctx, cid_a, wire.data(), wire.size()));
+    // Second delivery (same sender_id + packet_id) — should be deduped (no crash).
+    EXPECT_NO_THROW(api.on_data(api.ctx, cid_a, wire.data(), wire.size()));
+}
+
+TEST_F(CMTest, Relay_CoreCapAdvertised) {
+    auto meta = cm_a_->local_core_meta();
+    EXPECT_NE(meta.caps_mask & CORE_CAP_RELAY, 0u);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1365,7 +1524,7 @@ TEST_F(CMTest, RotateIdentityKeys) {
 }
 
 TEST_F(CMTest, LocalCoreMeta_HasVersion) {
-    auto meta = ConnectionManager::local_core_meta();
+    auto meta = cm_a_->local_core_meta();
     EXPECT_GT(meta.core_version, 0u);
     // Should have ZSTD and KEYROT caps
     EXPECT_NE(meta.caps_mask & CORE_CAP_ZSTD, 0u);

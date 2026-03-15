@@ -9,10 +9,15 @@ std::string bytes_to_hex(const uint8_t* data, size_t len);
 
 // ── local_core_meta / find_conn_by_pubkey ────────────────────────────────────
 
-msg::CoreMeta ConnectionManager::local_core_meta() {
+msg::CoreMeta ConnectionManager::local_core_meta() const {
     msg::CoreMeta m{};
     m.core_version = GN_CORE_VERSION;
-    m.caps_mask    = CORE_CAP_ZSTD | CORE_CAP_KEYROT;
+    m.caps_mask    = CORE_CAP_ZSTD | CORE_CAP_KEYROT | CORE_CAP_RELAY;
+    {
+        std::shared_lock lk(connectors_mu_);
+        if (connectors_.count("ice"))
+            m.caps_mask |= CORE_CAP_ICE;
+    }
     return m;
 }
 

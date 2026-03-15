@@ -134,7 +134,7 @@
         dockerImage = pkgs.dockerTools.buildLayeredImage {
           name     = "goodnet-docker";
           tag      = "latest";
-          contents = [ fullApp pkgs.cacert pkgs.bashInteractive pkgs.coreutils ];
+          contents = [ fullApp pkgs.cacert pkgs.bashInteractive pkgs.coreutils pkgs.fakeNss ];
           config   = {
             Entrypoint = [ "${fullApp}/bin/goodnet" ];
             WorkingDir = "/data";

@@ -70,6 +70,7 @@ add_library(goodnet_core SHARED
     core/cm_lifecycle.cpp
     core/cm_auth.cpp
     core/cm_query.cpp
+    core/cm_relay.cpp
     core/cm_capi.cpp
 
     core/data/machine_id.cpp

@@ -114,12 +114,6 @@ void ConnectionManager::dispatch_packet(conn_id_t id, const header_t* hdr,
         return;
     }
 
-    // ── ICE_SIGNAL ────────────────────────────────────────────────────────────
-    if (hdr->payload_type == MSG_TYPE_ICE_SIGNAL) {
-        handle_ice_signal(id, payload);
-        return;
-    }
-
     // ── Normal dispatch ───────────────────────────────────────────────────────
 
     auto rec = rcu_find(id);
@@ -131,9 +125,26 @@ void ConnectionManager::dispatch_packet(conn_id_t id, const header_t* hdr,
         return;
     }
 
-    // Decrypt
+    // ── Early Drop: sender_id mismatch (pre-decrypt, ~10ns) ─────────────────
+    if (rec->peer_authenticated) {
+        if (std::memcmp(hdr->sender_id, rec->peer_device_pubkey, 16) != 0) {
+            bus_.emit_drop(id, DropReason::SenderIdMismatch);
+            return;
+        }
+    }
+
+    // ── Decrypt / TRUSTED validation ─────────────────────────────────────────
     std::vector<uint8_t> plaintext;
-    if (rec->is_localhost || !rec->session) {
+    if (hdr->flags & GNET_FLAG_TRUSTED) {
+        // Plaintext fast-path: only for localhost connections
+        if (!rec->is_localhost) {
+            LOG_WARN("dispatch #{}: TRUSTED flag from non-localhost — dropping", id);
+            bus_.emit_drop(id, DropReason::TrustedFromRemote);
+            return;
+        }
+        plaintext.assign(payload.begin(), payload.end());
+    } else if (rec->is_localhost || !rec->session) {
+        // Legacy localhost without flag (backward compat during transition)
         plaintext.assign(payload.begin(), payload.end());
     } else if (rec->session->ready) {
         plaintext = rec->session->decrypt(payload.data(), payload.size());
@@ -148,6 +159,12 @@ void ConnectionManager::dispatch_packet(conn_id_t id, const header_t* hdr,
 
     bus_.emit_stat({StatsEvent::Kind::RxBytes,  payload.size(), id});
     bus_.emit_stat({StatsEvent::Kind::RxPacket, 1,              id});
+
+    // ── RELAY ────────────────────────────────────────────────────────────────
+    if (hdr->payload_type == MSG_TYPE_RELAY) {
+        handle_relay(id, std::span<const uint8_t>(plaintext));
+        return;
+    }
 
     auto hdr_ptr  = std::make_shared<header_t>(*hdr);
     auto data_ptr = std::make_shared<sdk::RawBuffer>(std::move(plaintext));

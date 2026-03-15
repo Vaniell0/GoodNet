@@ -24,7 +24,7 @@ typedef struct {
     uint64_t decrypt_fail, backpressure;
     uint64_t consumed, rejected;
     uint32_t connections, total_conn, total_disc;
-    uint64_t drops[12];         ///< indexed by DropReason
+    uint64_t drops[15];         ///< indexed by DropReason
     uint64_t dispatch_lat_avg;  ///< average dispatch latency, nanoseconds
 } gn_stats_t;
 

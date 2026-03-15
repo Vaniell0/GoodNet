@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <functional>
@@ -62,16 +63,6 @@ struct PerConnQueue {
         pending_bytes.fetch_sub(bytes, std::memory_order_relaxed);
         return batch;
     }
-};
-
-// ── ICE state ─────────────────────────────────────────────────────────────────
-
-enum class IceState : uint8_t {
-    Idle,
-    Gathering,
-    Connecting,
-    Connected,
-    Failed,
 };
 
 // ── ConnectionManager ─────────────────────────────────────────────────────────
@@ -154,17 +145,12 @@ public:
     /// dropping it (sends MSG_TYPE_KEY_EXCHANGE, awaits peer response).
     bool rekey_session(conn_id_t id);
 
-    // ── ICE / P2P ─────────────────────────────────────────────────────────────
+    // ── Relay ─────────────────────────────────────────────────────────────────
 
-    /// Kick off ICE negotiation on an ESTABLISHED TCP connection.
-    /// Sends MSG_TYPE_ICE_SIGNAL with local SDP offer.
-    void initiate_ice(conn_id_t id);
-
-    /// Feed inbound ICE candidate / SDP answer (called from dispatch).
-    void handle_ice_signal(conn_id_t id, std::span<const uint8_t> payload);
-
-    /// Current ICE state for a connection (Idle if never initiated).
-    [[nodiscard]] IceState ice_state(conn_id_t id) const;
+    /// Send inner_frame via gossip relay to dest_pubkey through all peers.
+    void relay(conn_id_t exclude_conn, uint8_t ttl,
+               const uint8_t dest_pubkey[32],
+               std::span<const uint8_t> inner_frame);
 
     // ── Queries ───────────────────────────────────────────────────────────────
 
@@ -181,7 +167,7 @@ public:
 
     [[nodiscard]] const NodeIdentity& identity() const { return identity_; }
 
-    static msg::CoreMeta local_core_meta();
+    msg::CoreMeta local_core_meta() const;
 
 private:
     // ── RCU connection registry ───────────────────────────────────────────────
@@ -219,10 +205,19 @@ private:
     std::shared_ptr<PerConnQueue> get_or_create_queue(conn_id_t id);
     void flush_queue(conn_id_t id, PerConnQueue& q);
 
-    // ── ICE state ─────────────────────────────────────────────────────────────
+    // ── Relay (private) ───────────────────────────────────────────────────────
 
-    mutable std::shared_mutex ice_mu_;
-    std::unordered_map<conn_id_t, IceState> ice_states_;
+    void handle_relay(conn_id_t id, std::span<const uint8_t> plaintext);
+
+    static constexpr size_t RELAY_DEDUP_SIZE = 4096;
+    struct RelayFingerprint {
+        uint64_t sender_hash;
+        uint64_t packet_id;
+    };
+    std::mutex relay_dedup_mu_;
+    std::array<RelayFingerprint, RELAY_DEDUP_SIZE> relay_dedup_{};
+    size_t relay_dedup_pos_ = 0;
+    bool relay_seen(const header_t* inner_hdr);
 
     // ── Internal callbacks ────────────────────────────────────────────────────
 
@@ -287,7 +282,7 @@ private:
     std::atomic<bool>  shutting_down_{false};
     std::atomic<conn_id_t> next_id_{1};
 
-    std::vector<std::string> scheme_priority_{"tcp", "ws", "udp", "mock", "ice"};
+    std::vector<std::string> scheme_priority_{"tcp", "ice", "udp", "mock"};
 
     mutable std::shared_mutex handlers_mu_;
     std::unordered_map<std::string, HandlerEntry> handler_entries_;

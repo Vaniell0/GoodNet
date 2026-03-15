@@ -1,5 +1,5 @@
 /// @file core/cm_lifecycle.cpp
-/// Connection lifecycle, registration, ICE state management.
+/// Connection lifecycle, registration.
 
 #include "connectionManager.hpp"
 #include "config.hpp"
@@ -107,7 +107,7 @@ conn_id_t ConnectionManager::handle_connect(const endpoint_t* ep) {
     if (shutting_down_.load(std::memory_order_relaxed)) return CONN_ID_INVALID;
 
     const conn_id_t id = next_id_.fetch_add(1, std::memory_order_relaxed);
-    const bool is_local = is_localhost_address(ep->address);
+    const bool is_local = (ep->flags & EP_FLAG_TRUSTED);
 
     auto rec            = std::make_shared<ConnectionRecord>();
     rec->id             = id;
@@ -165,7 +165,6 @@ void ConnectionManager::handle_disconnect(conn_id_t id, int error) {
         rcu_update([&](RecordMap& m) { m.erase(id); });
     }
     { std::unique_lock lk(queues_mu_); send_queues_.erase(id); }
-    { std::unique_lock lk(ice_mu_);    ice_states_.erase(id);  }
 
     bus_.emit_stat({StatsEvent::Kind::Disconnect, 1, id});
 
@@ -220,52 +219,6 @@ void ConnectionManager::shutdown() {
     shutting_down_.store(true, std::memory_order_release);
     auto map = rcu_read();
     for (auto& [id, _] : *map) close_now(id);
-}
-
-// ── ICE / P2P ─────────────────────────────────────────────────────────────────
-
-void ConnectionManager::initiate_ice(conn_id_t id) {
-    auto rec = rcu_find(id);
-    if (!rec || rec->state != STATE_ESTABLISHED) return;
-    {
-        std::unique_lock lk(ice_mu_);
-        ice_states_[id] = IceState::Gathering;
-    }
-    // Plugins (libnice) handle actual SDP generation via MSG_TYPE_ICE_SIGNAL.
-    // The core just maintains state and routes the message.
-    // Signal the ice plugin via bus to start gathering:
-    auto dummy_hdr  = std::make_shared<header_t>();
-    dummy_hdr->payload_type = MSG_TYPE_ICE_SIGNAL;
-    auto empty_data = std::make_shared<sdk::RawBuffer>();
-    endpoint_t ep   = rec->remote;
-    ep.peer_id      = id;
-    bus_.dispatch_packet(MSG_TYPE_ICE_SIGNAL, dummy_hdr, &ep, empty_data);
-    LOG_INFO("initiate_ice #{}: ICE gathering started", id);
-}
-
-void ConnectionManager::handle_ice_signal(conn_id_t id,
-                                           std::span<const uint8_t> payload) {
-    {
-        std::unique_lock lk(ice_mu_);
-        auto& st = ice_states_[id];
-        if (st == IceState::Idle) st = IceState::Connecting;
-    }
-    // Forward to ICE plugin via normal dispatch (MSG_TYPE_ICE_SIGNAL).
-    auto rec = rcu_find(id);
-    if (!rec) return;
-    auto hdr_ptr  = std::make_shared<header_t>();
-    hdr_ptr->payload_type = MSG_TYPE_ICE_SIGNAL;
-    hdr_ptr->payload_len  = static_cast<uint32_t>(payload.size());
-    auto data_ptr = std::make_shared<sdk::RawBuffer>(payload.begin(), payload.end());
-    endpoint_t ep = rec->remote;
-    ep.peer_id    = id;
-    bus_.dispatch_packet(MSG_TYPE_ICE_SIGNAL, hdr_ptr, &ep, data_ptr);
-}
-
-IceState ConnectionManager::ice_state(conn_id_t id) const {
-    std::shared_lock lk(ice_mu_);
-    auto it = ice_states_.find(id);
-    return it != ice_states_.end() ? it->second : IceState::Idle;
 }
 
 } // namespace gn

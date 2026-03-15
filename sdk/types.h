@@ -31,6 +31,9 @@ extern "C" {
 #define GNET_MAGIC      0x474E4554U  ///< ASCII 'GNET' — frame validation only
 #define GNET_PROTO_VER  2U           ///< header_t layout version
 
+// ── Header flags (header_t::flags) ──────────────────────────────────────────
+#define GNET_FLAG_TRUSTED  0x01U  ///< Plaintext frame (localhost/trusted transport only)
+
 // ── Connection identifier ─────────────────────────────────────────────────────
 typedef uint64_t conn_id_t;
 #define CONN_ID_INVALID 0ULL
@@ -41,6 +44,7 @@ typedef uint64_t conn_id_t;
 #define MSG_TYPE_AUTH         1u
 #define MSG_TYPE_KEY_EXCHANGE 2u
 #define MSG_TYPE_HEARTBEAT    3u
+#define MSG_TYPE_RELAY       10u   ///< Gossip relay (core-level forwarding)
 #define MSG_TYPE_ICE_SIGNAL  11u   ///< ICE/DTLS SDP exchange
 #define MSG_TYPE_CHAT       100u
 #define MSG_TYPE_FILE       200u
@@ -98,7 +102,11 @@ typedef struct {
     uint16_t port;
     uint8_t  pubkey[32];   ///< Peer Ed25519 user pubkey (valid after AUTH)
     uint64_t peer_id;      ///< conn_id — set by core on every dispatch call
+    uint8_t  flags;        ///< EP_FLAG_* bitmask, set by connector
 } endpoint_t;
+
+/// Endpoint flags (endpoint_t::flags)
+#define EP_FLAG_TRUSTED  0x01U  ///< Connector marks connection as trusted (loopback/veth)
 
 // ── Status codes ──────────────────────────────────────────────────────────────
 #define STATUS_OK    0

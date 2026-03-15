@@ -183,7 +183,7 @@ StatsSnapshot SignalBus::stats_snapshot() const noexcept {
     s.connections  = a.connections .load(std::memory_order_relaxed);
     s.total_conn   = a.total_conn  .load(std::memory_order_relaxed);
     s.total_disc   = a.total_disc  .load(std::memory_order_relaxed);
-    for (size_t i = 0; i < 12; ++i)
+    for (size_t i = 0; i < static_cast<size_t>(DropReason::_Count); ++i)
         s.drops[i] = a.drops[i].load(std::memory_order_relaxed);
     // Copy histogram (non-atomic read — approximate, good enough for telemetry)
     for (int i = 0; i < 7; ++i)

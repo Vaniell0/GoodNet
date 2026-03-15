@@ -11,8 +11,9 @@ namespace fs = std::filesystem;
 
 struct IdentityConfig {
     fs::path dir            = "~/.goodnet";
-    fs::path ssh_key_path = {};
+    fs::path ssh_key_path   = {};
     bool     use_machine_id = true;
+    bool     skip_ssh_fallback = false;  ///< Не пробовать ~/.ssh/id_ed25519
 };
 
 // ── NodeIdentity ──────────────────────────────────────────────────────────────
@@ -26,7 +27,7 @@ struct NodeIdentity {
 
     static NodeIdentity load_or_generate(const IdentityConfig& cfg);
     static NodeIdentity load_or_generate(const fs::path& dir) {
-        return load_or_generate(IdentityConfig{.dir = dir});
+        return load_or_generate(IdentityConfig{.dir = dir, .skip_ssh_fallback = true});
     }
 
     [[nodiscard]] std::string user_pubkey_hex()   const;

@@ -43,6 +43,19 @@ static void setup_signals() {
 #endif
 }
 
+// ─── Hex helper ──────────────────────────────────────────────────────────────
+
+static std::string local_bytes_to_hex(const uint8_t* data, size_t len) {
+    std::string out;
+    out.reserve(len * 2);
+    for (size_t i = 0; i < len; ++i) {
+        char b[3];
+        std::snprintf(b, 3, "%02x", data[i]);
+        out += b;
+    }
+    return out;
+}
+
 // ─── Throughput sample ring ───────────────────────────────────────────────────
 /// Keeps the last N throughput samples (Gbps) for percentile computation.
 
@@ -308,9 +321,10 @@ int main(int argc, char** argv) {
     size_t   kb_size       = 64;
     double   report_hz     = 2.0;        // Dashboard refresh rate (Hz).
     bool     no_color      = false;
-    bool     ice_upgrade   = false;
     double   exit_after    = 0.0;        // 0 = disabled (server runs forever)
     bool     exit_code     = false;      // structured exit codes for CI
+    bool     ice_upgrade   = false;      // ICE/DTLS upgrade after TCP handshake
+    std::string config_path;
 
     po::options_description desc("GoodNet Benchmark");
     desc.add_options()
@@ -329,12 +343,14 @@ int main(int argc, char** argv) {
                       "Dashboard refresh rate (Hz)")
         ("no-color",  po::bool_switch(&no_color),
                       "Disable ANSI colors")
-        ("ice-upgrade", po::bool_switch(&ice_upgrade),
-                      "Initiate ICE upgrade after TCP ESTABLISHED")
         ("exit-after", po::value<double>(&exit_after)->default_value(0),
                       "Exit after N seconds (for CI; 0=disabled)")
         ("exit-code", po::bool_switch(&exit_code),
-                      "Structured exit codes: 0=ok, 1=crypto error, 2=ICE fail");
+                      "Structured exit codes: 0=ok, 1=crypto error")
+        ("ice-upgrade", po::bool_switch(&ice_upgrade),
+                      "Upgrade to ICE/DTLS after TCP handshake (NAT traversal)")
+        ("config,c",  po::value<std::string>(&config_path),
+                      "Path to JSON config file");
 
     po::variables_map vm;
     try {
@@ -356,6 +372,9 @@ int main(int argc, char** argv) {
     gn::CoreConfig cfg;
     cfg.network.io_threads = std::max(1, threads);
     cfg.plugins.auto_load  = true;
+
+    if (!config_path.empty())
+        cfg.config_file = config_path;
 
     if (const char* env_dir = std::getenv("GOODNET_PLUGINS_DIR")) {
         cfg.plugins.dirs = { env_dir };
@@ -404,47 +423,39 @@ int main(int argc, char** argv) {
 
         if (!g_keep_running) goto shutdown;
 
-        std::printf(">>> [Client] Connected! Firing %d worker threads.\n", threads);
-
-        // ── ICE upgrade ──────────────────────────────────────────────────
-        bool ice_failed = false;
+        // ── ICE upgrade ──────────────────────────────────────────────────────
         if (ice_upgrade) {
-            auto ids = core.active_conn_ids();
-            if (ids.empty()) {
-                std::fprintf(stderr, "!!! No ESTABLISHED connections for ICE upgrade\n");
-                ice_failed = true;
-            } else {
-                const auto ice_conn = ids.front();
-                std::printf(">>> [ICE] Initiating ICE upgrade on conn %u ...\n",
-                            static_cast<unsigned>(ice_conn));
-                core.cm().initiate_ice(ice_conn);
-
-                const auto ice_start = Clock::now();
-                constexpr double ICE_TIMEOUT_SEC = 30.0;
-                while (g_keep_running) {
-                    auto st = core.cm().ice_state(ice_conn);
-                    if (st == gn::IceState::Connected) {
-                        std::printf(">>> [ICE] ICE upgrade successful!\n");
-                        break;
-                    }
-                    if (st == gn::IceState::Failed) {
-                        std::fprintf(stderr, "!!! [ICE] ICE negotiation failed\n");
-                        ice_failed = true;
-                        break;
-                    }
-                    if (Seconds(Clock::now() - ice_start).count() > ICE_TIMEOUT_SEC) {
-                        std::fprintf(stderr, "!!! [ICE] ICE timeout (%.0fs)\n", ICE_TIMEOUT_SEC);
-                        ice_failed = true;
-                        break;
-                    }
-                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            std::string peer_hex;
+            for (auto cid : core.active_conn_ids()) {
+                auto pk = core.peer_pubkey(cid);
+                if (!pk.empty()) {
+                    peer_hex = local_bytes_to_hex(pk.data(), pk.size());
+                    break;
                 }
             }
-            if (ice_failed && exit_code) {
-                core.stop();
-                return 2;
+            if (!peer_hex.empty()) {
+                std::printf(">>> [Client] ICE upgrade: negotiating...\n");
+                core.connect("ice://" + peer_hex);
+
+                auto ice_start = Clock::now();
+                while (g_keep_running && core.connection_count() < 2) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                    if (Seconds(Clock::now() - ice_start).count() > 30.0) {
+                        std::fprintf(stderr, "!!! ICE upgrade timed out (30s)\n");
+                        break;
+                    }
+                }
+                if (core.connection_count() >= 2) {
+                    std::printf(">>> [Client] ICE connected! Data flows over UDP.\n");
+                    target = "ice://" + peer_hex;
+                }
+            } else {
+                std::fprintf(stderr, "!!! ICE upgrade: no peer pubkey available\n");
             }
         }
+        if (!g_keep_running) goto shutdown;
+
+        std::printf(">>> [Client] Connected! Firing %d worker threads.\n", threads);
 
         t_start = Clock::now();
 

@@ -99,6 +99,8 @@ std::vector<uint8_t> ConnectionManager::build_frame(conn_id_t id,
     header_t hdr{};
     hdr.magic        = GNET_MAGIC;
     hdr.proto_ver    = GNET_PROTO_VER;
+    if (rec->is_localhost)
+        hdr.flags = GNET_FLAG_TRUSTED;
     hdr.payload_type = static_cast<uint16_t>(msg_type);
     hdr.payload_len  = static_cast<uint32_t>(final_payload.size());
     hdr.packet_id    = rec->send_packet_id.fetch_add(1, std::memory_order_relaxed);
