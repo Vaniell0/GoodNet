@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <filesystem>
 #include <string>
 
@@ -20,14 +21,14 @@ struct HandlerInfo {
     host_api_t  api{};
     fs::path    path;
     std::string name;
-    bool        enabled = true;
+    std::atomic<bool> enabled{true};
 
     ~HandlerInfo();
     HandlerInfo()                              = default;
     HandlerInfo(const HandlerInfo&)            = delete;
     HandlerInfo& operator=(const HandlerInfo&) = delete;
-    HandlerInfo(HandlerInfo&&) noexcept        = default;
-    HandlerInfo& operator=(HandlerInfo&&) noexcept = default;
+    HandlerInfo(HandlerInfo&&) noexcept;
+    HandlerInfo& operator=(HandlerInfo&&) noexcept;
 };
 
 // ── ConnectorInfo ─────────────────────────────────────────────────────────────
@@ -40,14 +41,14 @@ struct ConnectorInfo {
     fs::path         path;
     std::string      name;
     std::string      scheme;
-    bool             enabled = true;
+    std::atomic<bool> enabled{true};
 
     ConnectorInfo()                                = default;
     ~ConnectorInfo();
     ConnectorInfo(const ConnectorInfo&)            = delete;
     ConnectorInfo& operator=(const ConnectorInfo&) = delete;
-    ConnectorInfo(ConnectorInfo&&) noexcept        = default;
-    ConnectorInfo& operator=(ConnectorInfo&&) noexcept = default;
+    ConnectorInfo(ConnectorInfo&&) noexcept;
+    ConnectorInfo& operator=(ConnectorInfo&&) noexcept;
 };
 
 } // namespace gn

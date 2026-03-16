@@ -196,7 +196,11 @@ public:
             {
                 std::lock_guard lock(conn_mu_);
                 auto it = connections_.find(id);
-                if (it == connections_.end()) return;
+                if (it == connections_.end()) {
+                    // Connection already removed — still notify core so it cleans up.
+                    notify_disconnect(id, 0);
+                    return;
+                }
                 boost::system::error_code ec;
                 if (hard)
                     it->second->socket.lowest_layer().cancel(ec);

@@ -1,15 +1,18 @@
 /// @file core/cm_relay.cpp
-/// Gossip relay: handle_relay(), relay(), relay_seen().
+/// Smart relay: handle_relay(), relay(), relay_seen().
+/// Route table lookup → direct delivery → gossip fallback.
 
 #include "connectionManager.hpp"
+#include "route_table.hpp"
 #include "logger.hpp"
 
+#include <chrono>
 #include <cstring>
 
 namespace gn {
 
 // ── relay_seen ────────────────────────────────────────────────────────────────
-/// Ring-buffer dedup: returns true if (sender_id, packet_id) was already seen.
+/// Hash-set dedup with TTL eviction: O(1) lookup instead of O(N) scan.
 
 bool ConnectionManager::relay_seen(const header_t* inner_hdr) {
     // Hash sender_id[16] into a uint64_t for fast comparison.
@@ -21,16 +24,24 @@ bool ConnectionManager::relay_seen(const header_t* inner_hdr) {
     sh ^= sh2;
 
     const uint64_t pid = inner_hdr->packet_id;
+    const auto now = std::chrono::steady_clock::now();
 
     std::lock_guard lock(relay_dedup_mu_);
-    for (size_t i = 0; i < RELAY_DEDUP_SIZE; ++i) {
-        if (relay_dedup_[i].sender_hash == sh &&
-            relay_dedup_[i].packet_id   == pid)
-            return true;
+
+    // Periodic TTL eviction (every 4096 checks or when set grows large)
+    if (relay_dedup_set_.size() > 8192) {
+        const auto cutoff = now - std::chrono::seconds(30);
+        for (auto it = relay_dedup_set_.begin(); it != relay_dedup_set_.end(); ) {
+            if (it->ts < cutoff) it = relay_dedup_set_.erase(it);
+            else ++it;
+        }
     }
-    // Not seen — insert at ring head.
-    relay_dedup_[relay_dedup_pos_] = {sh, pid};
-    relay_dedup_pos_ = (relay_dedup_pos_ + 1) % RELAY_DEDUP_SIZE;
+
+    RelayFingerprint fp{sh, pid, now};
+    if (relay_dedup_set_.count(fp))
+        return true;
+
+    relay_dedup_set_.insert(fp);
     return false;
 }
 
@@ -91,8 +102,7 @@ void ConnectionManager::handle_relay(conn_id_t id,
 }
 
 // ── relay ─────────────────────────────────────────────────────────────────────
-/// Public API: wrap inner_frame in RelayPayload and send to all ESTABLISHED
-/// peers except exclude_conn.
+/// Smart relay: direct delivery → route table → gossip fallback.
 
 void ConnectionManager::relay(conn_id_t exclude_conn, uint8_t ttl,
                                const uint8_t dest_pubkey[32],
@@ -107,13 +117,30 @@ void ConnectionManager::relay(conn_id_t exclude_conn, uint8_t ttl,
     std::memcpy(relay_payload.data() + RELAY_HDR,
                 inner_frame.data(), inner_frame.size());
 
-    // Send to all ESTABLISHED peers except exclude_conn.
+    const auto relay_span = std::span<const uint8_t>(relay_payload);
+
+    // Шаг 1: Direct connection? (pk_index_)
+    std::string hex = bytes_to_hex(dest_pubkey, 32);
+    conn_id_t direct = find_conn_by_pubkey(hex.c_str());
+    if (direct != CONN_ID_INVALID && direct != exclude_conn) {
+        send_frame(direct, MSG_TYPE_RELAY, relay_span);
+        return;
+    }
+
+    // Шаг 2: Route table lookup
+    if (auto next = route_table_.find_route(dest_pubkey)) {
+        if (*next != exclude_conn) {
+            send_frame(*next, MSG_TYPE_RELAY, relay_span);
+            return;
+        }
+    }
+
+    // Шаг 3: Fallback — gossip broadcast
     auto map = rcu_read();
     for (auto& [cid, rec] : *map) {
         if (cid == exclude_conn) continue;
         if (rec->state != STATE_ESTABLISHED) continue;
-        send_frame(cid, MSG_TYPE_RELAY,
-                   std::span<const uint8_t>(relay_payload));
+        send_frame(cid, MSG_TYPE_RELAY, relay_span);
     }
 }
 

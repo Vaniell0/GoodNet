@@ -44,6 +44,9 @@ namespace gn {
 using msg::IceSignalKind;
 using IceSignalHdr = msg::IceSignalPayload;
 
+// Forward declaration for weak_ptr in IceSess
+class IceConnector;
+
 // ── Per-peer session state ────────────────────────────────────────────────────
 
 enum class IceSessState : uint8_t {
@@ -62,7 +65,7 @@ struct IceSess {
     conn_id_t   conn_id   = CONN_ID_INVALID;
     IceSignalKind our_kind{};
     std::atomic<IceSessState> state{IceSessState::Gathering};
-    class IceConnector* owner = nullptr;
+    std::weak_ptr<IceConnector> owner_weak;
 
     /// Set to true before agent teardown; checked by all GObject callbacks.
     std::atomic<bool> destroyed{false};
@@ -74,7 +77,8 @@ struct IceSess {
 
 // ── Connector ─────────────────────────────────────────────────────────────────
 
-class IceConnector : public IConnector {
+class IceConnector : public IConnector,
+                     public std::enable_shared_from_this<IceConnector> {
 public:
     std::string get_scheme() const override { return "ice"; }
     std::string get_name()   const override { return "GoodNet ICE/DTLS (libnice)"; }
@@ -209,7 +213,7 @@ private:
         auto s     = std::make_shared<IceSess>();
         s->peer_hex = peer;
         s->our_kind = kind;
-        s->owner    = this;
+        s->owner_weak = weak_from_this();
 
         s->agent = nice_agent_new_full(gctx_, NICE_COMPATIBILITY_RFC5245,
                                         NICE_AGENT_OPTION_REGULAR_NOMINATION);
@@ -316,12 +320,14 @@ private:
         auto* s = static_cast<IceSess*>(ud);
         if (s->destroyed.load(std::memory_order_acquire)) return;
         if (s->our_kind != IceSignalKind::OFFER) return;
-        s->owner->invoke([s] {
+        auto owner = s->owner_weak.lock();
+        if (!owner) return;
+        owner->invoke([s, owner] {
             if (s->destroyed.load(std::memory_order_acquire)) return;
-            conn_id_t sig = s->owner->find_peer_conn(s->peer_hex.c_str());
+            conn_id_t sig = owner->find_peer_conn(s->peer_hex.c_str());
             if (sig != CONN_ID_INVALID)
-                if (auto sp = s->owner->by_peer(s->peer_hex))
-                    s->owner->send_sdp(sp, sig);
+                if (auto sp = owner->by_peer(s->peer_hex))
+                    owner->send_sdp(sp, sig);
         });
     }
 
@@ -329,16 +335,18 @@ private:
                                   guint state, gpointer ud) {
         auto* s = static_cast<IceSess*>(ud);
         if (s->destroyed.load(std::memory_order_acquire)) return;
+        auto owner = s->owner_weak.lock();
+        if (!owner) return;
         if (state == NICE_COMPONENT_STATE_READY) {
             if (s->state.exchange(IceSessState::Connected) != IceSessState::Connected)
-                s->owner->invoke([s] {
+                owner->invoke([s, owner] {
                     if (s->destroyed.load(std::memory_order_acquire)) return;
-                    s->owner->ice_connected(s);
+                    owner->ice_connected(s);
                 });
         } else if (state == NICE_COMPONENT_STATE_FAILED) {
             s->state.store(IceSessState::Failed);
             if (s->conn_id != CONN_ID_INVALID)
-                s->owner->notify_disconnect(s->conn_id, EIO);
+                owner->notify_disconnect(s->conn_id, EIO);
         }
     }
 
@@ -347,7 +355,9 @@ private:
         auto* s = static_cast<IceSess*>(ud);
         if (s->destroyed.load(std::memory_order_acquire)) return;
         if (s->conn_id == CONN_ID_INVALID) return;
-        s->owner->notify_data(s->conn_id,
+        auto owner = s->owner_weak.lock();
+        if (!owner) return;
+        owner->notify_data(s->conn_id,
             {reinterpret_cast<const uint8_t*>(buf), static_cast<size_t>(len)});
     }
 

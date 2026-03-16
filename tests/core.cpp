@@ -19,15 +19,15 @@ TEST(CoreTest, FastStartup) {
     core.stop();
 }
 
-TEST(CoreTest, SingletonGuard) {
+TEST(CoreTest, MultiInstance) {
     gn::CoreConfig cfg;
     cfg.network.io_threads = 1;
     cfg.plugins.auto_load = false;
 
     gn::Core first(cfg);
-    EXPECT_THROW({
+    EXPECT_NO_THROW({
         gn::Core second(cfg);
-    }, std::runtime_error);
+    });
 }
 
 TEST(CoreTest, SequentialLifecycle) {

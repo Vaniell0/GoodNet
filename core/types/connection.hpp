@@ -28,6 +28,7 @@ struct SessionState {
 
     std::atomic<uint64_t> send_nonce{1};
     std::atomic<uint64_t> recv_nonce_expected{1};
+    std::atomic<bool>     rekey_pending{false};
 
     std::vector<uint8_t> encrypt(const void* plain, size_t len);
     std::vector<uint8_t> decrypt(const void* wire,  size_t len);

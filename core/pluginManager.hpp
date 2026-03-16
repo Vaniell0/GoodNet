@@ -35,9 +35,10 @@ public:
     void                             load_all_plugins();
     void                             unload_all();
 
-    bool unload_handler (std::string_view name);
-    bool enable_handler (std::string_view name);
-    bool disable_handler(std::string_view name);
+    bool unload_handler   (std::string_view name);
+    bool unload_connector (std::string_view scheme);
+    bool enable_handler   (std::string_view name);
+    bool disable_handler  (std::string_view name);
 
     // ── Queries ───────────────────────────────────────────────────────────────
 

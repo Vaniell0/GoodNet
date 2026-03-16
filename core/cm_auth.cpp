@@ -30,7 +30,8 @@ bool ConnectionManager::rekey_session(conn_id_t id) {
     uint8_t new_ephem_pk[32]{}, new_ephem_sk[32]{};
     crypto_box_keypair(new_ephem_pk, new_ephem_sk);
 
-    // Store it temporarily in the session (session remains valid until new one derived)
+    // Store new ephemeral keypair; mark rekey_pending — nonces reset after
+    // both sides have derived the new session key (in process_keyex).
     {
         std::lock_guard wlk(records_write_mu_);
         rcu_update([&](RecordMap& m) {
@@ -39,9 +40,7 @@ bool ConnectionManager::rekey_session(conn_id_t id) {
             auto& s = *it->second->session;
             std::memcpy(s.my_ephem_pk, new_ephem_pk, 32);
             std::memcpy(s.my_ephem_sk, new_ephem_sk, 32);
-            // Reset nonces for the new session
-            s.send_nonce.store(1, std::memory_order_relaxed);
-            s.recv_nonce_expected.store(1, std::memory_order_relaxed);
+            s.rekey_pending.store(true, std::memory_order_release);
         });
     }
 
@@ -184,6 +183,14 @@ bool ConnectionManager::process_keyex(conn_id_t id, std::span<const uint8_t> sp)
     }
 
     if (!derive_session(id, peer_ephem_pk, rec->peer_user_pubkey)) return false;
+
+    // Two-phase rekey: nonces reset only after both sides processed KEY_EXCHANGE
+    if (rec->session) {
+        rec->session->send_nonce.store(1, std::memory_order_release);
+        rec->session->recv_nonce_expected.store(1, std::memory_order_release);
+        rec->session->rekey_pending.store(false, std::memory_order_release);
+    }
+
     LOG_INFO("KEY_EXCHANGE #{}: session rekeyed ephem={}...",
              id, bytes_to_hex(peer_ephem_pk, 4));
     return true;

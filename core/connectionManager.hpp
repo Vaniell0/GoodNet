@@ -14,13 +14,20 @@
 #include <unordered_map>
 #include <vector>
 
+#include <chrono>
+#include <unordered_set>
+
 #include "signals.hpp"
 #include "types/connection.hpp"
 #include "types/identify.hpp"
+#include "system_services.hpp"
+#include "route_table.hpp"
 
 #include "../sdk/connector.h"
 #include "../sdk/handler.h"
 #include "../sdk/plugin.h"
+
+class Config;
 
 namespace gn {
 
@@ -74,7 +81,8 @@ struct PerConnQueue {
 /// and do a copy-and-swap.
 class ConnectionManager {
 public:
-    explicit ConnectionManager(SignalBus& bus, NodeIdentity identity);
+    explicit ConnectionManager(SignalBus& bus, NodeIdentity identity,
+                               Config* config = nullptr);
     ~ConnectionManager();
 
     ConnectionManager(const ConnectionManager&)            = delete;
@@ -169,6 +177,12 @@ public:
 
     msg::CoreMeta local_core_meta() const;
 
+    /// @brief Access the system service dispatcher (layered dispatch).
+    SystemServiceDispatcher& system_services() { return sys_dispatcher_; }
+
+    /// @brief Access the route table.
+    RouteTable& route_table() { return route_table_; }
+
 private:
     // ── RCU connection registry ───────────────────────────────────────────────
 
@@ -209,14 +223,24 @@ private:
 
     void handle_relay(conn_id_t id, std::span<const uint8_t> plaintext);
 
-    static constexpr size_t RELAY_DEDUP_SIZE = 4096;
     struct RelayFingerprint {
         uint64_t sender_hash;
         uint64_t packet_id;
+        std::chrono::steady_clock::time_point ts;
+    };
+    struct RelayFingerprintHash {
+        size_t operator()(const RelayFingerprint& f) const noexcept {
+            return std::hash<uint64_t>{}(f.sender_hash) ^
+                   (std::hash<uint64_t>{}(f.packet_id) << 1);
+        }
+    };
+    struct RelayFingerprintEq {
+        bool operator()(const RelayFingerprint& a, const RelayFingerprint& b) const noexcept {
+            return a.sender_hash == b.sender_hash && a.packet_id == b.packet_id;
+        }
     };
     std::mutex relay_dedup_mu_;
-    std::array<RelayFingerprint, RELAY_DEDUP_SIZE> relay_dedup_{};
-    size_t relay_dedup_pos_ = 0;
+    std::unordered_set<RelayFingerprint, RelayFingerprintHash, RelayFingerprintEq> relay_dedup_set_;
     bool relay_seen(const header_t* inner_hdr);
 
     // ── Internal callbacks ────────────────────────────────────────────────────
@@ -275,6 +299,10 @@ private:
     // ── Members ───────────────────────────────────────────────────────────────
 
     SignalBus&         bus_;
+    Config*            config_ = nullptr;
+
+    SystemServiceDispatcher sys_dispatcher_;
+    RouteTable              route_table_;
 
     mutable std::shared_mutex identity_mu_;
     NodeIdentity               identity_;

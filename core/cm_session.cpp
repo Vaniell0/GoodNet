@@ -81,11 +81,18 @@ std::vector<uint8_t> SessionState::decrypt(const void* wire_ptr, size_t wire_len
     for (int i = 0; i < 8; ++i)
         nonce_val |= (uint64_t(wire[i]) << (i * 8));
 
+    // CAS loop: thread-safe nonce validation without TOCTOU race.
     {
-        const uint64_t expected = recv_nonce_expected.load(std::memory_order_acquire);
-        if (nonce_val < expected) {
-            LOG_WARN("decrypt: replay (nonce={} < expected={})", nonce_val, expected);
-            return {};
+        uint64_t expected = recv_nonce_expected.load(std::memory_order_acquire);
+        while (true) {
+            if (nonce_val < expected) {
+                LOG_WARN("decrypt: replay (nonce={} < expected={})", nonce_val, expected);
+                return {};
+            }
+            if (recv_nonce_expected.compare_exchange_weak(expected, nonce_val + 1,
+                    std::memory_order_acq_rel, std::memory_order_acquire))
+                break;
+            // expected обновился — проверяем снова
         }
     }
 
@@ -97,8 +104,6 @@ std::vector<uint8_t> SessionState::decrypt(const void* wire_ptr, size_t wire_len
         LOG_WARN("decrypt: MAC failed (nonce={})", nonce_val);
         return {};
     }
-
-    recv_nonce_expected.store(nonce_val + 1, std::memory_order_release);
 
     if (body.empty()) { LOG_WARN("decrypt: empty body"); return {}; }
 

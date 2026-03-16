@@ -1,6 +1,7 @@
 /// @file core/cm_dispatch.cpp
 
 #include "connectionManager.hpp"
+#include "system_services.hpp"
 #include "logger.hpp"
 
 #include <cstring>
@@ -164,6 +165,17 @@ void ConnectionManager::dispatch_packet(conn_id_t id, const header_t* hdr,
     if (hdr->payload_type == MSG_TYPE_RELAY) {
         handle_relay(id, std::span<const uint8_t>(plaintext));
         return;
+    }
+
+    // ── System services (0x0100-0x0FFF) ──────────────────────────────────
+    if (SystemServiceDispatcher::is_system_type(hdr->payload_type)) {
+        endpoint_t remote_ep = rec->remote;
+        remote_ep.peer_id = id;
+        auto result = sys_dispatcher_.dispatch(
+            id, hdr, &remote_ep,
+            std::span<const uint8_t>(plaintext));
+        if (result.intercepted) return;
+        // If not intercepted, fall through to user handlers
     }
 
     auto hdr_ptr  = std::make_shared<header_t>(*hdr);

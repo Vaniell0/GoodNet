@@ -9,9 +9,47 @@ HandlerInfo::~HandlerInfo() {
         handler->shutdown(handler->user_data);
 }
 
+HandlerInfo::HandlerInfo(HandlerInfo&& o) noexcept
+    : lib(std::move(o.lib)), handler(o.handler), api(o.api),
+      path(std::move(o.path)), name(std::move(o.name)),
+      enabled(o.enabled.load(std::memory_order_relaxed))
+{ o.handler = nullptr; }
+
+HandlerInfo& HandlerInfo::operator=(HandlerInfo&& o) noexcept {
+    if (this != &o) {
+        lib     = std::move(o.lib);
+        handler = o.handler; o.handler = nullptr;
+        api     = o.api;
+        path    = std::move(o.path);
+        name    = std::move(o.name);
+        enabled.store(o.enabled.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    }
+    return *this;
+}
+
 ConnectorInfo::~ConnectorInfo() {
     if (ops && ops->shutdown)
         ops->shutdown(ops->connector_ctx);
+}
+
+ConnectorInfo::ConnectorInfo(ConnectorInfo&& o) noexcept
+    : lib(std::move(o.lib)), ops(o.ops), api(o.api),
+      path(std::move(o.path)), name(std::move(o.name)),
+      scheme(std::move(o.scheme)),
+      enabled(o.enabled.load(std::memory_order_relaxed))
+{ o.ops = nullptr; }
+
+ConnectorInfo& ConnectorInfo::operator=(ConnectorInfo&& o) noexcept {
+    if (this != &o) {
+        lib    = std::move(o.lib);
+        ops    = o.ops; o.ops = nullptr;
+        api    = o.api;
+        path   = std::move(o.path);
+        name   = std::move(o.name);
+        scheme = std::move(o.scheme);
+        enabled.store(o.enabled.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    }
+    return *this;
 }
 
 PluginManager::PluginManager(host_api_t* api, fs::path plugins_base_dir)

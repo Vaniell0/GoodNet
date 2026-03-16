@@ -234,13 +234,59 @@ ICE_SIGNAL маршрутизируется через обычный pipeline. 
 
 ---
 
+## Системные сервисы (0x0100-0x0FFF)
+
+Новый слой **SystemServiceDispatcher** перехватывает сообщения в диапазоне `0x0100-0x0FFF` **до** пользовательских хендлеров. Регистрация через `ConnectionManager::system_services().register_service(type, handler)`.
+
+### DHT / Service Discovery
+
+| Тип | Код | Payload | Назначение |
+|-----|-----|---------|------------|
+| DHT_PING | 0x0100 | DhtPingPayload (44 B) | Ping/pong для проверки живости |
+| DHT_FIND_NODE | 0x0101 | DhtFindNodePayload + N×DhtNodeEntry | Поиск узла по pubkey |
+| DHT_ANNOUNCE | 0x0102 | DhtAnnouncePayload | Объявление присутствия |
+
+### Health / Metrics
+
+| Тип | Код | Payload | Назначение |
+|-----|-----|---------|------------|
+| HEALTH_PING | 0x0200 | HealthPingPayload (16 B) | Keepalive с метриками |
+| HEALTH_PONG | 0x0201 | HealthPingPayload (16 B) | Ответ на ping |
+| HEALTH_REPORT | 0x0202 | HealthReportPayload (32 B) | Полный отчёт о состоянии |
+
+### Distributed RPC
+
+| Тип | Код | Payload | Назначение |
+|-----|-----|---------|------------|
+| RPC_REQUEST | 0x0300 | RpcRequestPayload (16 B) + data | Вызов метода (FNV-1a hash) |
+| RPC_RESPONSE | 0x0301 | RpcResponsePayload (16 B) + data | Результат вызова |
+
+**RPC method hash**: `GN_RPC_HASH("method_name")` — compile-time FNV-1a для zero-overhead dispatch.
+
+### Routing
+
+| Тип | Код | Payload | Назначение |
+|-----|-----|---------|------------|
+| ROUTE_ANNOUNCE | 0x0400 | RouteAnnouncePayload (72 B) | Объявление маршрута |
+| ROUTE_QUERY | 0x0401 | RouteQueryPayload + via_pubkey | Запрос маршрута |
+
+### TUN/TAP
+
+| Тип | Код | Payload | Назначение |
+|-----|-----|---------|------------|
+| TUN_CONFIG | 0x0500 | TunConfigPayload (48 B) | Конфигурация туннеля |
+| TUN_DATA | 0x0501 | TunDataPayload (8 B) + IP packet | Инкапсулированный IP |
+
+---
+
 ## Правила расширения
 
-1. Новые системные типы: определить `#define MSG_TYPE_*` в `sdk/types.h` (диапазон 0–99)
-2. Формат: `#pragma pack(push, 1)` struct в `core/data/messages.hpp`
-3. `static_assert` на размер структуры
-4. `kBaseSize` / `kFullSize` для forward compatibility
-5. Обработка: добавить ветку в `cm_dispatch.cpp::dispatch_packet()`
+1. Core типы (0x00-0x0F): `#define MSG_TYPE_*` в `sdk/types.h`
+2. System services (0x0100-0x0FFF): `#define MSG_TYPE_SYS_*` в `sdk/types.h`, register через `SystemServiceDispatcher`
+3. User типы (0x1000+): определяются плагинами
+4. Формат: `#pragma pack(push, 1)` struct в `core/data/messages.hpp`
+5. `static_assert` на размер структуры
+6. `kBaseSize` / `kFullSize` для forward compatibility
 
 ---
 

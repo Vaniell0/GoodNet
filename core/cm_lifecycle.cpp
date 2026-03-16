@@ -18,8 +18,9 @@ std::string bytes_to_hex(const uint8_t* data, size_t len);
 
 // ── Construction ──────────────────────────────────────────────────────────────
 
-ConnectionManager::ConnectionManager(SignalBus& bus, NodeIdentity identity)
-    : bus_(bus), identity_(std::move(identity))
+ConnectionManager::ConnectionManager(SignalBus& bus, NodeIdentity identity,
+                                     Config* config)
+    : bus_(bus), config_(config), identity_(std::move(identity))
 {
     records_rcu_.store(std::make_shared<const RecordMap>(),
                        std::memory_order_relaxed);

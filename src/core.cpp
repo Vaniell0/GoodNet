@@ -1,5 +1,5 @@
 /// @file src/core.cpp
-/// @brief Core singleton implementation — lifecycle, plugin wiring, config bridge.
+/// @brief Core implementation — lifecycle, plugin wiring, config bridge.
 
 #include "core.hpp"
 
@@ -23,9 +23,6 @@ namespace gn {
 
 namespace fs   = std::filesystem;
 namespace asio = boost::asio;
-
-/// Singleton guard — only one Core instance may exist at a time.
-static std::atomic<Core*> g_core_instance{nullptr};
 
 // ── Impl ──────────────────────────────────────────────────────────────────────
 
@@ -68,11 +65,6 @@ static fs::path expand_home(const fs::path& p) {
 // ── Construction ──────────────────────────────────────────────────────────────
 
 Core::Core(CoreConfig cfg) : impl_(std::make_unique<Impl>(std::move(cfg))) {
-    // Enforce singleton — only one Core per process.
-    Core* expected = nullptr;
-    if (!g_core_instance.compare_exchange_strong(expected, this))
-        throw std::runtime_error("gn::Core is a singleton — only one instance allowed per process");
-
     auto& d = *impl_;
 
     Logger::log_level = d.cfg.logging.level;
@@ -92,21 +84,9 @@ Core::Core(CoreConfig cfg) : impl_(std::make_unique<Impl>(std::move(cfg))) {
     };
     d.identity = NodeIdentity::load_or_generate(id_cfg);
 
-    d.cm = std::make_unique<ConnectionManager>(*d.bus, d.identity);
+    d.cm = std::make_unique<ConnectionManager>(*d.bus, d.identity, &d.config);
     d.cm->fill_host_api(&d.host_api);
     d.host_api.internal_logger = static_cast<void*>(Logger::get().get());
-
-    // Config bridge: host_api.ctx points to ConnectionManager (set by fill_host_api),
-    // but config_get needs access to our Config instance.  Since Core is a process
-    // singleton, we safely route through g_core_instance.
-    d.host_api.config_get = [](void*, const char* key, char* buf, size_t sz) -> int {
-        auto* core = g_core_instance.load(std::memory_order_acquire);
-        if (!core) return -1;
-        auto v = core->impl_->config.get<std::string>(key);
-        if (!v) return -1;
-        std::strncpy(buf, v->c_str(), sz - 1); buf[sz - 1] = '\0';
-        return static_cast<int>(v->size());
-    };
 
     fs::path base_dir;
     if (!d.cfg.plugins.dirs.empty()) base_dir = d.cfg.plugins.dirs.front();
@@ -141,7 +121,6 @@ Core::Core(CoreConfig cfg) : impl_(std::make_unique<Impl>(std::move(cfg))) {
 
 Core::~Core() {
     stop();
-    g_core_instance.store(nullptr, std::memory_order_release);
 }
 
 // ── Lifecycle ─────────────────────────────────────────────────────────────────

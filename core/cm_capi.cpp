@@ -2,6 +2,7 @@
 /// C ABI trampoline functions.
 
 #include "connectionManager.hpp"
+#include "config.hpp"
 #include "logger.hpp"
 
 #include <sodium/crypto_sign.h>
@@ -39,12 +40,15 @@ conn_id_t ConnectionManager::s_find_conn_by_pk(void* ctx, const char* hex) {
     return static_cast<ConnectionManager*>(ctx)->find_conn_by_pubkey(hex); }
 int ConnectionManager::s_get_peer_info(void* ctx, conn_id_t id, endpoint_t* ep) {
     return static_cast<ConnectionManager*>(ctx)->get_peer_endpoint(id, *ep) ? 0 : -1; }
-int ConnectionManager::s_config_get(void* /*ctx*/, const char* key,
+int ConnectionManager::s_config_get(void* ctx, const char* key,
                                      char* buf, size_t sz) {
-    // Config is not injected into CM — forward via a thread-local pointer set by Core
-    // For now, return -1; Core::fill_host_api overrides this with a lambda closure.
-    (void)key; (void)buf; (void)sz;
-    return -1;
+    auto* self = static_cast<ConnectionManager*>(ctx);
+    if (!self->config_) return -1;
+    auto v = self->config_->get<std::string>(key);
+    if (!v) return -1;
+    std::strncpy(buf, v->c_str(), sz - 1);
+    buf[sz - 1] = '\0';
+    return static_cast<int>(v->size());
 }
 void ConnectionManager::s_register_handler(void* ctx, handler_t* h) {
     static_cast<ConnectionManager*>(ctx)->register_handler(h); }

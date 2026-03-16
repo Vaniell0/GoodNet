@@ -39,7 +39,7 @@ typedef uint64_t conn_id_t;
 #define CONN_ID_INVALID 0ULL
 
 // ── Message type registry ─────────────────────────────────────────────────────
-/// Ranges: 0–99 core | 100–999 built-in | 1000–9999 user | 10000+ experimental
+/// Ranges: 0x00–0x0F core | 0x0100–0x0FFF system services | 0x1000+ user
 #define MSG_TYPE_SYSTEM       0u
 #define MSG_TYPE_AUTH         1u
 #define MSG_TYPE_KEY_EXCHANGE 2u
@@ -48,6 +48,32 @@ typedef uint64_t conn_id_t;
 #define MSG_TYPE_ICE_SIGNAL  11u   ///< ICE/DTLS SDP exchange
 #define MSG_TYPE_CHAT       100u
 #define MSG_TYPE_FILE       200u
+
+// ── System service range (intercepted before user handlers) ─────────────────
+#define MSG_TYPE_SYS_BASE           0x0100u  /* 256  */
+#define MSG_TYPE_SYS_MAX            0x0FFFu  /* 4095 */
+
+// DHT / Service Discovery
+#define MSG_TYPE_SYS_DHT_PING       0x0100u  ///< DHT: ping/pong
+#define MSG_TYPE_SYS_DHT_FIND_NODE  0x0101u  ///< DHT: find_node request/response
+#define MSG_TYPE_SYS_DHT_ANNOUNCE   0x0102u  ///< DHT: announce presence
+
+// Health / Metrics
+#define MSG_TYPE_SYS_HEALTH_PING    0x0200u  ///< Health: keepalive ping
+#define MSG_TYPE_SYS_HEALTH_PONG    0x0201u  ///< Health: keepalive pong
+#define MSG_TYPE_SYS_HEALTH_REPORT  0x0202u  ///< Health: metrics report
+
+// Distributed RPC
+#define MSG_TYPE_SYS_RPC_REQUEST    0x0300u  ///< RPC: request
+#define MSG_TYPE_SYS_RPC_RESPONSE   0x0301u  ///< RPC: response
+
+// Routing
+#define MSG_TYPE_SYS_ROUTE_ANNOUNCE 0x0400u  ///< Routing: announce known routes
+#define MSG_TYPE_SYS_ROUTE_QUERY    0x0401u  ///< Routing: query path to pubkey
+
+// TUN/TAP
+#define MSG_TYPE_SYS_TUN_CONFIG     0x0500u  ///< TUN/TAP: tunnel configuration
+#define MSG_TYPE_SYS_TUN_DATA       0x0501u  ///< TUN/TAP: encapsulated IP packet
 
 // ── Connection lifecycle ──────────────────────────────────────────────────────
 typedef enum {

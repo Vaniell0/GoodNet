@@ -18,7 +18,7 @@ std::optional<handler_t*>
 PluginManager::find_handler_by_name(std::string_view name) const {
     std::shared_lock lock(rw_mutex_);
     if (auto it = handlers_.find(name); it != handlers_.end()) {
-        if (it->second->enabled) return it->second->handler;
+        if (it->second->enabled.load(std::memory_order_relaxed)) return it->second->handler;
         LOG_DEBUG("Handler '{}' found but disabled", name);
     }
     return std::nullopt;
@@ -28,7 +28,7 @@ std::optional<connector_ops_t*>
 PluginManager::find_connector_by_scheme(std::string_view scheme) const {
     std::shared_lock lock(rw_mutex_);
     if (auto it = connectors_.find(scheme); it != connectors_.end())
-        if (it->second->enabled) return it->second->ops;
+        if (it->second->enabled.load(std::memory_order_relaxed)) return it->second->ops;
     return std::nullopt;
 }
 
@@ -36,21 +36,21 @@ size_t PluginManager::get_enabled_handler_count() const {
     std::shared_lock lock(rw_mutex_);
     return static_cast<size_t>(
         std::ranges::count_if(handlers_ | std::views::values,
-                              [](const auto& i) { return i->enabled; }));
+                              [](const auto& i) { return i->enabled.load(std::memory_order_relaxed); }));
 }
 
 size_t PluginManager::get_enabled_connector_count() const {
     std::shared_lock lock(rw_mutex_);
     return static_cast<size_t>(
         std::ranges::count_if(connectors_ | std::views::values,
-                              [](const auto& i) { return i->enabled; }));
+                              [](const auto& i) { return i->enabled.load(std::memory_order_relaxed); }));
 }
 
 std::vector<std::string> PluginManager::get_enabled_handler_names() const {
     std::shared_lock lock(rw_mutex_);
     std::vector<std::string> names;
     for (const auto& [name, info] : handlers_) {
-        if (info->enabled) names.push_back(name);
+        if (info->enabled.load(std::memory_order_relaxed)) names.push_back(name);
     }
     return names;
 }
@@ -60,11 +60,11 @@ void PluginManager::list_plugins() const {
     LOG_INFO("=== Handlers ({}) ===", handlers_.size());
     for (const auto& [name, info] : handlers_)
         LOG_INFO("  [{}] '{}' ({})",
-                 info->enabled ? "ON " : "OFF", name, info->path.filename().string());
+                 info->enabled.load(std::memory_order_relaxed) ? "ON " : "OFF", name, info->path.filename().string());
     LOG_INFO("=== Connectors ({}) ===", connectors_.size());
     for (const auto& [scheme, info] : connectors_)
         LOG_INFO("  [{}] {}:// -> '{}' ({})",
-                 info->enabled ? "ON " : "OFF", scheme, info->name,
+                 info->enabled.load(std::memory_order_relaxed) ? "ON " : "OFF", scheme, info->name,
                  info->path.filename().string());
 }
 
@@ -73,7 +73,7 @@ std::vector<handler_t*> PluginManager::get_active_handlers() const {
     std::vector<handler_t*> active;
     active.reserve(handlers_.size());
     for (const auto& [name, info] : handlers_)
-        if (info->enabled && info->handler)
+        if (info->enabled.load(std::memory_order_relaxed) && info->handler)
             active.push_back(info->handler);
     return active;
 }
@@ -83,7 +83,7 @@ std::vector<connector_ops_t*> PluginManager::get_active_connectors() const {
     std::vector<connector_ops_t*> active;
     active.reserve(connectors_.size());
     for (const auto& [name, info] : connectors_)
-        if (info->enabled && info->ops)
+        if (info->enabled.load(std::memory_order_relaxed) && info->ops)
             active.push_back(info->ops);
     return active;
 }
@@ -155,6 +155,16 @@ bool PluginManager::unload_handler(std::string_view name) {
     if (auto it = handlers_.find(name); it != handlers_.end()) {
         LOG_INFO("Unloading handler: '{}'", name);
         handlers_.erase(it);
+        return true;
+    }
+    return false;
+}
+
+bool PluginManager::unload_connector(std::string_view scheme) {
+    std::unique_lock lock(rw_mutex_);
+    if (auto it = connectors_.find(scheme); it != connectors_.end()) {
+        LOG_INFO("Unloading connector: '{}'", scheme);
+        connectors_.erase(it);
         return true;
     }
     return false;

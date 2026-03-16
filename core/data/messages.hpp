@@ -164,4 +164,157 @@ struct IceSignalPayload {
 };
 #pragma pack(pop)
 
+// ─── DHT / Service Discovery ─────────────────────────────────────────────────
+
+#pragma pack(push, 1)
+struct DhtPingPayload {
+    uint64_t request_id;        ///< Unique request identifier
+    uint8_t  sender_pubkey[32]; ///< Sender's user pubkey
+    uint16_t listen_port;       ///< Sender's listening port
+    uint8_t  _pad[2];
+};
+#pragma pack(pop)
+static_assert(sizeof(DhtPingPayload) == 44, "DhtPingPayload size mismatch");
+
+#pragma pack(push, 1)
+struct DhtFindNodePayload {
+    uint64_t request_id;
+    uint8_t  target_pubkey[32]; ///< Key we're looking for
+    uint8_t  k;                 ///< Number of closest nodes requested
+    uint8_t  response_count;    ///< 0 = request, >0 = response with entries
+    uint8_t  _pad[2];
+    // Followed by response_count * DhtNodeEntry (variable)
+};
+#pragma pack(pop)
+
+#pragma pack(push, 1)
+struct DhtNodeEntry {
+    uint8_t  pubkey[32];
+    char     address[64];  ///< ip:port
+    uint16_t port;
+    uint8_t  _pad[2];
+};
+#pragma pack(pop)
+
+#pragma pack(push, 1)
+struct DhtAnnouncePayload {
+    uint8_t  pubkey[32];
+    char     address[64];
+    uint16_t port;
+    uint8_t  flags;        ///< 0x01=leaving
+    uint8_t  _pad;
+};
+#pragma pack(pop)
+
+// ─── Health / Metrics ─────────────────────────────────────────────────────────
+
+#pragma pack(push, 1)
+struct HealthPingPayload {
+    uint64_t timestamp_us;      ///< Sender unix microseconds
+    uint32_t seq;               ///< Monotonic counter
+    uint32_t connection_count;  ///< Sender's active connections
+};
+#pragma pack(pop)
+static_assert(sizeof(HealthPingPayload) == 16, "HealthPingPayload size mismatch");
+
+#pragma pack(push, 1)
+struct HealthReportPayload {
+    uint64_t uptime_s;
+    uint32_t connections;
+    uint32_t rx_bytes_sec;
+    uint32_t tx_bytes_sec;
+    uint16_t cpu_percent;    ///< x100 (5000 = 50.00%)
+    uint16_t mem_mb;
+    uint32_t latency_p50_us;
+    uint32_t latency_p99_us;
+};
+#pragma pack(pop)
+static_assert(sizeof(HealthReportPayload) == 32, "HealthReportPayload size mismatch");
+
+// ─── Distributed RPC ─────────────────────────────────────────────────────────
+
+/// Compile-time FNV-1a hash for RPC method names.
+/// Usage: send_rpc(GN_RPC_HASH("get_status"), payload, len);
+constexpr uint32_t gn_rpc_hash(const char* s, size_t len) {
+    uint32_t h = 2166136261u;
+    for (size_t i = 0; i < len; ++i)
+        h = (h ^ static_cast<uint32_t>(s[i])) * 16777619u;
+    return h;
+}
+#define GN_RPC_HASH(str) (::gn::msg::gn_rpc_hash(str, sizeof(str) - 1))
+
+#pragma pack(push, 1)
+struct RpcRequestPayload {
+    uint64_t request_id;
+    uint32_t method_hash;    ///< GN_RPC_HASH("method_name") — compile-time FNV-1a
+    uint32_t timeout_ms;
+    // Followed by payload bytes (variable)
+};
+#pragma pack(pop)
+static_assert(sizeof(RpcRequestPayload) == 16, "RpcRequestPayload size mismatch");
+
+#pragma pack(push, 1)
+struct RpcResponsePayload {
+    uint64_t request_id;     ///< Matches RpcRequestPayload::request_id
+    uint32_t status;         ///< 0=OK, 1=ERROR, 2=TIMEOUT, 3=NOT_FOUND
+    uint32_t _reserved;
+    // Followed by payload bytes (variable)
+};
+#pragma pack(pop)
+static_assert(sizeof(RpcResponsePayload) == 16, "RpcResponsePayload size mismatch");
+
+// ─── Routing ──────────────────────────────────────────────────────────────────
+
+#pragma pack(push, 1)
+struct RouteAnnouncePayload {
+    uint8_t  dest_pubkey[32];  ///< Reachable destination
+    uint8_t  via_pubkey[32];   ///< Next hop (announcer)
+    uint8_t  hop_count;        ///< Distance metric
+    uint8_t  flags;            ///< 0x01=withdraw
+    uint16_t ttl_sec;          ///< Entry validity time
+    uint32_t seq_num;          ///< Monotonic for conflict resolution
+};
+#pragma pack(pop)
+static_assert(sizeof(RouteAnnouncePayload) == 72, "RouteAnnouncePayload size mismatch");
+
+#pragma pack(push, 1)
+struct RouteQueryPayload {
+    uint64_t request_id;
+    uint8_t  target_pubkey[32];
+    uint8_t  is_response;      ///< 0=query, 1=response
+    uint8_t  hop_count;        ///< Hops from responder to target
+    uint8_t  _pad[2];
+    // If is_response: followed by via_pubkey[32]
+};
+#pragma pack(pop)
+
+// ─── TUN/TAP ──────────────────────────────────────────────────────────────────
+
+#pragma pack(push, 1)
+struct TunConfigPayload {
+    uint32_t tunnel_id;
+    uint8_t  virtual_ip[4];     ///< Assigned virtual IPv4
+    uint8_t  netmask[4];        ///< /24 default
+    uint8_t  gateway_pubkey[32]; ///< Mesh gateway
+    uint16_t mtu;
+    uint8_t  flags;             ///< 0x01=IPv6 support
+    uint8_t  _pad;
+};
+#pragma pack(pop)
+static_assert(sizeof(TunConfigPayload) == 48, "TunConfigPayload size mismatch");
+
+#pragma pack(push, 1)
+struct TunDataPayload {
+    uint32_t tunnel_id;
+    uint16_t ip_len;            ///< Length of encapsulated IP packet (MUST <= MTU)
+    uint8_t  _pad[2];
+    // Followed by ip_len bytes of raw IP packet
+    //
+    // IMPORTANT: TUN/TAP plugin MUST validate ip_len <= TunConfigPayload::mtu
+    // before encapsulation. Packets exceeding MTU are dropped with
+    // DropReason::TunMtuExceeded — no kernel-level fragmentation allowed.
+};
+#pragma pack(pop)
+static_assert(sizeof(TunDataPayload) == 8, "TunDataPayload size mismatch");
+
 } // namespace gn::msg
