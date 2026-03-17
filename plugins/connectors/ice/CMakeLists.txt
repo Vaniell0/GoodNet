@@ -3,7 +3,6 @@ set(CMAKE_CXX_STANDARD 23)
 project(goodnet-ice)
 
 find_package(GoodNet REQUIRED)
-cmake_policy(SET CMP0167 NEW)
 
 # ── libnice + GLib ────────────────────────────────────────────────────────────
 # libnice ships pkg-config files; CMake's FindPkgConfig is the canonical way.

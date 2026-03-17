@@ -22,6 +22,7 @@
 
 namespace gn {
 
+
 namespace fs = std::filesystem;
 
 class PluginManager {
@@ -33,6 +34,7 @@ public:
 
     std::expected<void, std::string> load_plugin   (const fs::path& path);
     void                             load_all_plugins();
+    void                             load_static_plugins();
     void                             unload_all();
 
     bool unload_handler   (std::string_view name);

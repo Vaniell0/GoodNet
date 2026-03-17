@@ -16,6 +16,8 @@ std::string bytes_to_hex(const uint8_t* data, size_t len);
 // ── Key rotation ──────────────────────────────────────────────────────────────
 
 void ConnectionManager::rotate_identity_keys(const IdentityConfig& cfg) {
+    LOG_SCOPED_TRACE();
+    
     NodeIdentity next = NodeIdentity::load_or_generate(cfg);
     std::unique_lock lk(identity_mu_);
     identity_ = std::move(next);
@@ -23,12 +25,17 @@ void ConnectionManager::rotate_identity_keys(const IdentityConfig& cfg) {
 }
 
 bool ConnectionManager::rekey_session(conn_id_t id) {
+    LOG_SCOPED_DEBUG();
+    
     auto rec = rcu_find(id);
     if (!rec || rec->state != STATE_ESTABLISHED) return false;
 
     // Generate new ephemeral keypair for this connection
     uint8_t new_ephem_pk[32]{}, new_ephem_sk[32]{};
     crypto_box_keypair(new_ephem_pk, new_ephem_sk);
+
+    TRACE_VALUE(id);
+    LOG_DEBUG("Generating new ephemeral keypair for conn #{}", id);
 
     // Store new ephemeral keypair; mark rekey_pending — nonces reset after
     // both sides have derived the new session key (in process_keyex).
@@ -53,6 +60,7 @@ bool ConnectionManager::rekey_session(conn_id_t id) {
                                       new_ephem_pk, 32,
                                       identity_.device_seckey);
     }
+    LOG_TRACE("Signing new ephemeral PK with device secret key");
 
     send_frame(id, MSG_TYPE_KEY_EXCHANGE,
                std::span<const uint8_t>(keyex, sizeof(keyex)));
@@ -64,6 +72,8 @@ bool ConnectionManager::rekey_session(conn_id_t id) {
 // ── AUTH ──────────────────────────────────────────────────────────────────────
 
 void ConnectionManager::send_auth(conn_id_t id) {
+    LOG_SCOPED_TRACE();
+    
     msg::AuthPayload ap{};
     {
         std::shared_lock lk(identity_mu_);
@@ -95,6 +105,8 @@ void ConnectionManager::send_auth(conn_id_t id) {
 }
 
 bool ConnectionManager::process_auth(conn_id_t id, std::span<const uint8_t> sp) {
+    LOG_SCOPED_DEBUG();
+
     if (sp.size() < msg::AuthPayload::kBaseSize) {
         bus_.emit_drop(id, DropReason::AuthFail);
         return false;
@@ -168,6 +180,8 @@ bool ConnectionManager::process_auth(conn_id_t id, std::span<const uint8_t> sp) 
 }
 
 bool ConnectionManager::process_keyex(conn_id_t id, std::span<const uint8_t> sp) {
+    LOG_SCOPED_TRACE();
+
     if (sp.size() < 96) return false;
     const uint8_t* peer_ephem_pk = sp.data();
     const uint8_t* sig           = sp.data() + 32;

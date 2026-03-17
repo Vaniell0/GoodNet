@@ -14,6 +14,7 @@
           config.allowUnfree = true;
         };
         lib  = pkgs.lib;
+        isDarwin = pkgs.stdenv.isDarwin;
 
         buildPlugin = import ./nix/buildPlugin.nix { inherit lib pkgs; };
         mkCppPlugin = import ./nix/mkCppPlugin.nix { inherit pkgs buildPlugin; };
@@ -26,8 +27,14 @@
             !(b == "build" || b == "result" || b == ".git" || b == ".direnv");
         };
 
-        coreBuildInputs = with pkgs; [ boost spdlog fmt nlohmann_json libsodium zstd ];
+        coreBuildInputs = with pkgs; [ boost spdlog fmt nlohmann_json libsodium zstd ]
+          ++ lib.optionals isDarwin [ darwin.apple_sdk.frameworks.CoreFoundation
+                                      darwin.apple_sdk.frameworks.Security ];
         coreNative      = with pkgs; [ cmake ninja pkg-config ];
+
+        libPathVar = if isDarwin then "DYLD_LIBRARY_PATH" else "LD_LIBRARY_PATH";
+        sharedLibGlob = if isDarwin then "*.dylib" else "*.so";
+        ncpuCmd = if isDarwin then "sysctl -n hw.ncpu" else "nproc";
 
         # ── Core ──────────────────────────────────────────────────────────────
         makeCore = { buildType ? "Release", extraFlags ? [] }:
@@ -39,6 +46,9 @@
             nativeBuildInputs = coreNative ++ [ pkgs.gtest ];
             buildInputs = with pkgs; [
               fmt nlohmann_json libsodium zstd boost gtest
+            ] ++ lib.optionals isDarwin [
+              darwin.apple_sdk.frameworks.CoreFoundation
+              darwin.apple_sdk.frameworks.Security
             ];
             propagatedBuildInputs = with pkgs; [ spdlog ];
 
@@ -96,7 +106,7 @@
             collect_to() {
               local src=$1 dest=$2
               [ -d "$src" ] && find -L "$src" -type f \
-                \( -name "*.so" -o -name "*.json" \) -exec cp -v {} "$dest/" \;
+                \( -name "${sharedLibGlob}" -o -name "*.json" \) -exec cp -v {} "$dest/" \;
             }
             ${lib.concatStringsSep "\n" (lib.mapAttrsToList (_: d: ''
               collect_to "${d}" "$out/plugins/handlers"
@@ -122,7 +132,7 @@
               cp -r ${bundle}/plugins/* $out/plugins/
               if [ -d "${core}/share" ]; then cp -r ${core}/share $out/share; fi
               wrapProgram $out/bin/goodnet \
-                --set LD_LIBRARY_PATH \
+                --set ${libPathVar} \
                     "${lib.makeLibraryPath ([ core ] ++ coreBuildInputs)}" \
                 --set GOODNET_PLUGINS_DIR "$out/plugins"
             '';
@@ -130,8 +140,8 @@
 
         fullApp = makeApp { core = goodnet-core; bundle = pluginsBundle; };
 
-        # ── Docker ────────────────────────────────────────────────────────────
-        dockerImage = pkgs.dockerTools.buildLayeredImage {
+        # ── Docker (Linux only) ──────────────────────────────────────────────
+        dockerImage = lib.optionalAttrs (!isDarwin) (pkgs.dockerTools.buildLayeredImage {
           name     = "goodnet-docker";
           tag      = "latest";
           contents = [ fullApp pkgs.cacert pkgs.bashInteractive pkgs.coreutils pkgs.fakeNss ];
@@ -144,12 +154,9 @@
             ];
             Volumes = { "/data" = {}; };
           };
-        };
+        });
 
         # ── Local development scripts (nix run) ──────────────────────────────
-        # These scripts build in the project directory (not /nix/store) with
-        # PCH enabled (Debug mode, GOODNET_DISABLE_PCH=OFF by default).
-
         devBuildInputs = coreNative ++ coreBuildInputs ++ [ pkgs.gtest ];
 
         gn-dev = pkgs.writeShellApplication {
@@ -164,7 +171,7 @@
                 -G Ninja \
                 -DBUILD_TESTING=ON
             fi
-            cmake --build "$BUILD_DIR" -j"$(nproc)"
+            cmake --build "$BUILD_DIR" -j"$(${ncpuCmd})"
             exec "./$BUILD_DIR/goodnet" "$@"
           '';
         };
@@ -181,7 +188,7 @@
                 -G Ninja \
                 -DBUILD_TESTING=ON
             fi
-            cmake --build "$BUILD_DIR" -j"$(nproc)"
+            cmake --build "$BUILD_DIR" -j"$(${ncpuCmd})"
             exec "./$BUILD_DIR/bin/unit_tests" "$@"
           '';
         };
@@ -199,7 +206,7 @@
               -DBUILD_TESTING=ON \
               -DGOODNET_COVERAGE=ON
 
-            cmake --build "$BUILD_DIR" -j"$(nproc)"
+            cmake --build "$BUILD_DIR" -j"$(${ncpuCmd})"
 
             echo ">>> Resetting coverage counters..."
             lcov --zerocounters --directory "$BUILD_DIR"
@@ -238,6 +245,7 @@
           default = fullApp;
           core    = goodnet-core;
           plugins = pluginsTree;
+        } // lib.optionalAttrs (!isDarwin) {
           docker  = dockerImage;
         };
 
@@ -254,6 +262,7 @@
             type    = "app";
             program = "${gn-coverage}/bin/gn-coverage";
           };
+        } // lib.optionalAttrs (!isDarwin) {
           docker-load = {
             type    = "app";
             program = "${pkgs.writeShellScriptBin "docker-load" ''
@@ -265,9 +274,13 @@
         devShells.default = pkgs.mkShell {
           inputsFrom = [ goodnet-core ];
           packages = with pkgs; [
-            gdb ccache cmake-format jq
-            include-what-you-use   # linting tool, not needed for build
-            lcov                   # coverage report generation
+            ccache cmake-format jq
+            lcov
+          ] ++ lib.optionals (!isDarwin) [
+            gdb valgrind
+            include-what-you-use
+          ] ++ lib.optionals isDarwin [
+            lldb
           ];
 
           shellHook = ''
@@ -284,7 +297,7 @@
             bdrun() { cmake --build build/debug && ./build/debug/goodnet "$@"; }
 
             echo ""
-            echo "GoodNet devShell (Linux/Native)"
+            echo "GoodNet devShell (${if isDarwin then "macOS/Darwin" else "Linux/Native"})"
             echo "  cfg / b / brun    - Release build & run"
             echo "  cfgd / bd / bdrun - Debug build & run"
             echo "  nix run           - Debug build & run (PCH, replaces aliases)"

@@ -417,4 +417,32 @@ mkCppPlugin {
 
 ---
 
+## Статическая линковка плагинов
+
+По умолчанию GoodNet загружает плагины динамически через `dlopen()` / `LoadLibrary()`. Для портативных сборок, встраиваемых систем или Windows-развёртывания можно скомпилировать плагины прямо в бинарник.
+
+### Как это работает
+
+1. `sdk/static_registry.hpp` предоставляет глобальный реестр `gn::static_plugin_registry()`
+2. При компиляции с `-DGOODNET_STATIC_PLUGINS` макросы `HANDLER_PLUGIN` / `CONNECTOR_PLUGIN` регистрируют плагин в этой таблице при статической инициализации (вместо экспорта `extern "C"` символов)
+3. `PluginManager::load_static_plugins()` обходит реестр и инициализирует каждую запись точно так же, как динамически загруженный плагин
+
+### Использование в CMake
+
+```cmake
+add_executable(myapp
+    src/main.cpp
+    plugins/connectors/tcp/tcp.cpp
+    plugins/handlers/logger/logger.cpp
+)
+target_compile_definitions(myapp PRIVATE GOODNET_STATIC_PLUGINS)
+target_link_libraries(myapp PRIVATE goodnet_core)
+```
+
+### Совместимость с динамической загрузкой
+
+Оба режима совместимы — часть плагинов может быть статической, а остальные загружаются динамически во время выполнения. Статические плагины регистрируются при старте программы, а `load_all_plugins()` загружает дополнительные `.so` из директории плагинов.
+
+---
+
 *← [03 — Core API](03-core-api.md) · [05 — Системные сообщения →](05-system-messages.md)*

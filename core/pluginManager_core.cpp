@@ -1,6 +1,7 @@
 #include "pluginManager.hpp"
 #include "connectionManager.hpp"
 #include "logger.hpp"
+#include "static_registry.hpp"
 
 namespace gn {
 
@@ -170,6 +171,81 @@ void PluginManager::load_all_plugins() {
                 // Если это не плагин (нет нужных символов) - просто идем дальше
                 LOG_DEBUG("File {} is not a valid plugin: {}", path.filename().string(), result.error());
             }
+        }
+    }
+}
+
+void PluginManager::load_static_plugins() {
+    auto& registry = gn::static_plugin_registry();
+    if (registry.empty()) return;
+
+    LOG_INFO("PluginManager: loading {} static plugin(s)", registry.size());
+
+    for (auto& entry : registry) {
+        // ── Handler ──────────────────────────────────────────────────────────
+        if (entry.handler_init) {
+            auto info   = std::make_unique<HandlerInfo>();
+            info->api   = *host_api_;
+            info->api.plugin_type     = PLUGIN_TYPE_HANDLER;
+            info->api.internal_logger = host_api_->internal_logger;
+
+            handler_t* h = nullptr;
+            if (entry.handler_init(&info->api, &h) != 0 || !h) {
+                LOG_WARN("Static handler '{}' init failed", entry.name);
+                continue;
+            }
+
+            std::string name = (h->name && h->name[0]) ? h->name : entry.name;
+
+            std::unique_lock lock(rw_mutex_);
+            if (handlers_.contains(name)) {
+                LOG_WARN("Static handler '{}' already loaded, skipping", name);
+                continue;
+            }
+
+            info->handler = h;
+            info->name    = name;
+            LOG_INFO("Static handler loaded: '{}'", name);
+            handlers_[name] = std::move(info);
+            continue;
+        }
+
+        // ── Connector ────────────────────────────────────────────────────────
+        if (entry.connector_init) {
+            auto info   = std::make_unique<ConnectorInfo>();
+            info->api   = *host_api_;
+            info->api.plugin_type     = PLUGIN_TYPE_CONNECTOR;
+            info->api.internal_logger = host_api_->internal_logger;
+
+            connector_ops_t* ops = nullptr;
+            if (entry.connector_init(&info->api, &ops) != 0 || !ops) {
+                LOG_WARN("Static connector '{}' init failed", entry.name);
+                continue;
+            }
+
+            char buf[256] = {};
+            if (ops->get_scheme) ops->get_scheme(ops->connector_ctx, buf, sizeof(buf));
+            std::string scheme = buf;
+            if (scheme.empty()) {
+                LOG_WARN("Static connector '{}': get_scheme() empty", entry.name);
+                continue;
+            }
+
+            buf[0] = '\0';
+            if (ops->get_name) ops->get_name(ops->connector_ctx, buf, sizeof(buf));
+            std::string conn_name = buf[0] ? buf : entry.name;
+
+            std::unique_lock lock(rw_mutex_);
+            if (connectors_.contains(scheme)) {
+                LOG_WARN("Static connector scheme '{}' already loaded, skipping", scheme);
+                continue;
+            }
+
+            info->ops    = ops;
+            info->name   = std::move(conn_name);
+            info->scheme = scheme;
+            LOG_INFO("Static connector loaded: '{}' scheme='{}'", info->name, scheme);
+            connectors_[scheme] = std::move(info);
         }
     }
 }

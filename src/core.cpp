@@ -92,6 +92,8 @@ Core::Core(CoreConfig cfg) : impl_(std::make_unique<Impl>(std::move(cfg))) {
     if (!d.cfg.plugins.dirs.empty()) base_dir = d.cfg.plugins.dirs.front();
     d.pm = std::make_unique<PluginManager>(&d.host_api, base_dir);
 
+    d.pm->load_static_plugins();
+
     if (d.cfg.plugins.auto_load) {
         if (!base_dir.empty()) d.pm->load_all_plugins();
 

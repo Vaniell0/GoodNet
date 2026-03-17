@@ -25,7 +25,6 @@
 
 #include "../sdk/connector.h"
 #include "../sdk/handler.h"
-#include "../sdk/plugin.h"
 
 class Config;
 
@@ -90,9 +89,9 @@ public:
 
     // ── Registration ─────────────────────────────────────────────────────────
 
-    void register_connector   (const std::string& scheme, connector_ops_t* ops);
-    void register_handler     (handler_t* h);
-    void set_scheme_priority  (std::vector<std::string> priority);
+    void register_handler    (handler_t* h);
+    void register_connector  (const std::string& scheme, connector_ops_t* ops);
+    void set_scheme_priority (std::vector<std::string> priority);
 
     /// Populate a host_api_t vtable with all CM callbacks.
     void fill_host_api(host_api_t* api);
@@ -164,7 +163,7 @@ public:
 
     [[nodiscard]] size_t                      connection_count()              const;
     [[nodiscard]] std::vector<std::string>    get_active_uris()               const;
-    [[nodiscard]] std::vector<conn_id_t>     get_active_conn_ids()           const;
+    [[nodiscard]] std::vector<conn_id_t>      get_active_conn_ids()           const;
     [[nodiscard]] std::optional<conn_state_t> get_state(conn_id_t id)         const;
     [[nodiscard]] std::optional<std::string>  get_negotiated_scheme(conn_id_t id) const;
     [[nodiscard]] std::optional<std::vector<uint8_t>> get_peer_pubkey(conn_id_t id) const;
@@ -189,7 +188,7 @@ private:
     using RecordMap = std::unordered_map<conn_id_t, std::shared_ptr<ConnectionRecord>>;
     using RecordMapPtr = std::shared_ptr<const RecordMap>;
 
-    std::mutex       records_write_mu_;   // serialises writers
+    std::mutex           records_write_mu_;   // serialises writers
     std::atomic<RecordMapPtr> records_rcu_;   // readers: one atomic load, no lock
 
     RecordMapPtr rcu_read() const noexcept {

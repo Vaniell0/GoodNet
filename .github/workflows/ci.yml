@@ -15,8 +15,5 @@ jobs:
       - uses: DeterminateSystems/nix-installer-action@main
       - uses: DeterminateSystems/magic-nix-cache-action@main
 
-      - name: Build core + plugins (runs unit tests in check phase)
+      - name: Build core + plugins (unit tests run in checkPhase)
         run: nix build --print-build-logs
-
-      - name: Run unit tests
-        run: ./result/bin/unit_tests --gtest_output="xml:test_results.xml" || true

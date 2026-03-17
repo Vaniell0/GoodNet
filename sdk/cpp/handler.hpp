@@ -137,6 +137,24 @@ protected:
 } // namespace gn
 
 // ── HANDLER_PLUGIN macro ──────────────────────────────────────────────────────
+#ifdef GOODNET_STATIC_PLUGINS
+#include "../sdk/static_registry.hpp"
+#define _GN_CONCAT2(a, b) a##b
+#define _GN_CONCAT(a, b)  _GN_CONCAT2(a, b)
+#define HANDLER_PLUGIN(ClassName)                                              \
+    static ClassName _gn_plugin_instance;                                      \
+    static int _gn_static_handler_init(host_api_t* api, handler_t** out) {     \
+        _gn_plugin_instance.init(api);                                         \
+        *out = _gn_plugin_instance.to_c_handler();                             \
+        return 0;                                                              \
+    }                                                                          \
+    namespace { struct _GN_CONCAT(_gn_reg_h_, __LINE__) {                      \
+        _GN_CONCAT(_gn_reg_h_, __LINE__)() {                                   \
+            gn::static_plugin_registry().push_back(                            \
+                {#ClassName, _gn_static_handler_init, nullptr});               \
+        }                                                                      \
+    } _GN_CONCAT(_gn_reg_h_inst_, __LINE__); }
+#else
 #define HANDLER_PLUGIN(ClassName)                                              \
     static ClassName _gn_plugin_instance;                                      \
     extern "C" GN_EXPORT                                                       \
@@ -149,3 +167,4 @@ protected:
         *out = _gn_plugin_instance.to_c_handler();                             \
         return 0;                                                              \
     }
+#endif

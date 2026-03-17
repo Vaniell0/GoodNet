@@ -52,6 +52,77 @@ cmake --build build -j$(nproc)
 ./build/goodnet --listen 25565
 ```
 
+### CMake Presets
+
+В проекте есть `CMakePresets.json` с готовыми конфигурациями:
+
+```bash
+# Linux (Ninja)
+cmake --preset linux-release
+cmake --build --preset linux-release
+
+# Windows (vcpkg + Visual Studio)
+cmake --preset windows-msvc
+
+# Windows (vcpkg + Ninja)
+cmake --preset windows-ninja
+```
+
+Список всех пресетов: `cmake --list-presets`
+
+### Windows (vcpkg)
+
+Зависимости разрешаются автоматически через манифест `vcpkg.json`:
+
+```powershell
+# Клонировать vcpkg (если ещё нет)
+git clone https://github.com/microsoft/vcpkg
+.\vcpkg\bootstrap-vcpkg.bat
+set VCPKG_ROOT=%cd%\vcpkg
+
+# Сборка через пресет
+cmake --preset windows-msvc
+cmake --build --preset windows-msvc
+```
+
+Или вручную:
+
+```powershell
+cmake -B build -G "Visual Studio 17 2022" ^
+    -DCMAKE_TOOLCHAIN_FILE=%VCPKG_ROOT%/scripts/buildsystems/vcpkg.cmake ^
+    -DBUILD_TESTING=ON
+cmake --build build --config Release
+```
+
+### Поддержка платформ
+
+| Возможность | Linux | macOS | Windows |
+|---|---|---|---|
+| TCP коннектор | да | да | да |
+| ICE коннектор | да | нет | нет |
+| Динамические плагины (.so/.dylib/.dll) | да | да | да |
+| Статические плагины | да | да | да |
+| Docker-образ | да | нет | нет |
+
+> ICE коннектор использует `<sys/epoll.h>` — только Linux.
+> TCP коннектор полностью кроссплатформенный.
+
+### Кросс-компиляция
+
+Нативная кросс-компиляция из Linux в Windows **непрактична** с текущим стеком зависимостей (Boost, libsodium, spdlog). Рекомендуемые подходы:
+
+1. **Windows-машина или VM** — нативная сборка с MSVC + vcpkg
+2. **GitHub Actions CI** — раннер `windows-latest` с кэшированием vcpkg
+3. **WSL2** — собирает Linux-бинарники, не Windows
+
+mingw-w64 теоретически возможен, но ненадёжен для Boost/spdlog/FTXUI.
+
+### Требования к компилятору
+
+- C++23: GCC 15+, Clang 18+, MSVC 17.12+
+- CMake 3.22+
+- Ninja (рекомендуется) или Make
+
 ### Зависимости
 
 | Библиотека | Версия | Используется |
@@ -68,13 +139,13 @@ cmake --build build -j$(nproc)
 | Target | Тип | Описание |
 |---|---|---|
 | `goodnet_sdk` | INTERFACE | Заголовки SDK для плагинов |
-| `goodnet_core` | SHARED | `libgoodnet_core.so` — всё ядро |
+| `goodnet_core` | SHARED / STATIC | `libgoodnet_core.so` — всё ядро (`-DGOODNET_STATIC_CORE=ON` → STATIC) |
 | `goodnet` | EXECUTABLE | Benchmark / server бинарник |
 | `unit_tests` | EXECUTABLE | GTest suite |
 | `mock_handler` | SHARED | Mock handler для тестов |
 | `mock_connector` | SHARED | Mock connector для тестов |
 
-Почему `goodnet_core` — SHARED: одна копия статических переменных (Logger singleton, `std::call_once` флаг). При STATIC каждый плагин получил бы свою копию → несколько синглтонов → логи в разные файлы.
+Почему `goodnet_core` — SHARED по умолчанию: одна копия статических переменных (Logger singleton, `std::call_once` флаг). При STATIC каждый динамический плагин получил бы свою копию → несколько синглтонов → логи в разные файлы. Используйте `GOODNET_STATIC_CORE=ON` только совместно с `GOODNET_STATIC_PLUGINS=ON` (единый бинарник без динамических плагинов).
 
 ### Флаги сборки
 

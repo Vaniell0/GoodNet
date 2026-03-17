@@ -5,14 +5,14 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-cmake_policy(SET CMP0167 NEW)
-
 option(INSTALL_DEVELOPMENT "Install SDK headers and cmake config" OFF)
 option(BUILD_TESTING "Build the testing suite" OFF)
+option(GOODNET_STATIC_CORE "Build goodnet_core as static library" OFF)
+option(GOODNET_STATIC_PLUGINS "Compile built-in plugins into the binary" OFF)
 
 # ─── Dependencies ────────────────────────────────────────────────────────────
 
-find_package(Boost REQUIRED COMPONENTS filesystem  program_options)
+find_package(Boost REQUIRED COMPONENTS filesystem program_options)
 find_package(nlohmann_json REQUIRED)
 find_package(spdlog        REQUIRED)
 find_package(fmt           REQUIRED)
@@ -49,10 +49,17 @@ target_include_directories(goodnet_sdk INTERFACE
 
 # ─── 2. Core (SHARED) ────────────────────────────────────────────────────────
 #
-# SHARED is required: single copy of static variables (Logger, once_flag).
+# SHARED is the default: single copy of static variables (Logger, once_flag).
 # Plugins loaded via dlopen(RTLD_GLOBAL) see the same Logger as the core.
+# STATIC is used for portable single-binary builds (e.g. Windows + GOODNET_STATIC_PLUGINS).
 
-add_library(goodnet_core SHARED
+if(GOODNET_STATIC_CORE)
+    set(_CORE_LIB_TYPE STATIC)
+else()
+    set(_CORE_LIB_TYPE SHARED)
+endif()
+
+add_library(goodnet_core ${_CORE_LIB_TYPE}
     src/capi.cpp
     src/core.cpp
 
@@ -126,6 +133,19 @@ target_compile_definitions(goodnet PRIVATE
     GOODNET_PROJECT_ROOT="${CMAKE_SOURCE_DIR}/"
 )
 apply_pch(goodnet)
+
+# ─── 3b. Static plugins (optional) ──────────────────────────────────────────
+
+if(GOODNET_STATIC_PLUGINS)
+    target_sources(goodnet PRIVATE
+        plugins/connectors/tcp/tcp.cpp
+        plugins/handlers/logger/logger.cpp
+    )
+    target_compile_definitions(goodnet PRIVATE GOODNET_STATIC_PLUGINS)
+    target_include_directories(goodnet PRIVATE
+        ${Boost_INCLUDE_DIRS}
+    )
+endif()
 
 # ─── 4. Installation ─────────────────────────────────────────────────────────
 

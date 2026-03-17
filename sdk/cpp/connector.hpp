@@ -6,7 +6,12 @@
 #include <cstring>
 #include <span>
 #include <string>
+
+#if defined(_WIN32)
+struct iovec { void* iov_base; size_t iov_len; };
+#else
 #include <sys/uio.h>
+#endif
 
 namespace gn {
 
@@ -124,6 +129,27 @@ protected:
 } // namespace gn
 
 // ── CONNECTOR_PLUGIN macro ────────────────────────────────────────────────────
+#ifdef GOODNET_STATIC_PLUGINS
+#include "../sdk/static_registry.hpp"
+#ifndef _GN_CONCAT2
+#define _GN_CONCAT2(a, b) a##b
+#define _GN_CONCAT(a, b)  _GN_CONCAT2(a, b)
+#endif
+#define CONNECTOR_PLUGIN(ClassName)                                            \
+    static ClassName _gn_connector_instance;                                   \
+    static int _gn_static_connector_init(host_api_t* api,                      \
+                                         connector_ops_t** out) {              \
+        _gn_connector_instance.init(api);                                      \
+        *out = _gn_connector_instance.to_c_ops();                              \
+        return 0;                                                              \
+    }                                                                          \
+    namespace { struct _GN_CONCAT(_gn_reg_c_, __LINE__) {                      \
+        _GN_CONCAT(_gn_reg_c_, __LINE__)() {                                   \
+            gn::static_plugin_registry().push_back(                            \
+                {#ClassName, nullptr, _gn_static_connector_init});             \
+        }                                                                      \
+    } _GN_CONCAT(_gn_reg_c_inst_, __LINE__); }
+#else
 #define CONNECTOR_PLUGIN(ClassName)                                            \
     static ClassName _gn_connector_instance;                                   \
     extern "C" GN_EXPORT                                                       \
@@ -136,3 +162,4 @@ protected:
         *out = _gn_connector_instance.to_c_ops();                              \
         return 0;                                                              \
     }
+#endif
