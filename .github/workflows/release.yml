@@ -1,0 +1,141 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  # ─── Linux (Nix + patchelf portable bundle) ─────────────────────────────────
+
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: Build with Nix
+        run: nix build --print-build-logs
+
+      - name: Bundle portable release
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+
+          mkdir -p release/bin release/lib release/plugins/connectors release/plugins/handlers
+
+          # Binary: use unwrapped if available (Nix wrapper), else plain
+          if [ -f result/bin/.goodnet-wrapped ]; then
+            cp result/bin/.goodnet-wrapped release/bin/goodnet
+          else
+            cp result/bin/goodnet release/bin/goodnet
+          fi
+          chmod +x release/bin/goodnet
+
+          # Plugins
+          if [ -d result/plugins ]; then
+            cp -r result/plugins/* release/plugins/ 2>/dev/null || true
+          fi
+
+          # Extract shared libraries from Nix store
+          ldd release/bin/goodnet | grep '/nix/store/' | awk '{print $3}' | sort -u | while read -r lib; do
+            [ -f "$lib" ] && cp "$lib" release/lib/
+          done
+
+          # Also grab plugin dependencies
+          find release/plugins -name '*.so' -exec ldd {} \; 2>/dev/null \
+            | grep '/nix/store/' | awk '{print $3}' | sort -u | while read -r lib; do
+            [ -f "$lib" ] && cp -n "$lib" release/lib/
+          done
+
+          # Patch RPATH using patchelf from nixpkgs
+          nix shell nixpkgs#patchelf -c bash -c '
+            set -euo pipefail
+
+            # Binary
+            patchelf --set-interpreter /lib64/ld-linux-x86-64.so.2 release/bin/goodnet
+            patchelf --set-rpath '"'"'$ORIGIN/../lib'"'"' release/bin/goodnet
+
+            # Shared libs
+            find release/lib -name "*.so*" -exec patchelf --set-rpath '"'"'$ORIGIN'"'"' {} \; 2>/dev/null || true
+
+            # Plugins
+            find release/plugins -name "*.so" -exec patchelf --set-rpath '"'"'$ORIGIN/../../lib'"'"' {} \; 2>/dev/null || true
+          '
+
+          # Create run.sh wrapper
+          printf '%s\n' '#!/usr/bin/env bash' \
+            'SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"' \
+            'export LD_LIBRARY_PATH="$SCRIPT_DIR/../lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"' \
+            'export GOODNET_PLUGINS_DIR="$SCRIPT_DIR/../plugins"' \
+            'exec "$SCRIPT_DIR/goodnet" "$@"' > release/bin/run.sh
+          chmod +x release/bin/run.sh
+
+          tar czf "goodnet-${TAG}-linux-x86_64.tar.gz" -C release .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-release
+          path: goodnet-*-linux-x86_64.tar.gz
+
+  # ─── Windows (MSVC + vcpkg, static build) ──────────────────────────────────
+
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgGitCommitId: 'dddca6fa87f177e0678e2545c4b4636a44aa05bd'
+
+      - name: Configure CMake
+        run: >
+          cmake -B build
+          -DCMAKE_TOOLCHAIN_FILE="${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake"
+          -DGOODNET_STATIC_CORE=ON
+          -DGOODNET_STATIC_PLUGINS=ON
+          -DGOODNET_DISABLE_PCH=ON
+          -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Bundle Windows release
+        shell: pwsh
+        run: |
+          $TAG = "${{ github.ref_name }}"
+          New-Item -ItemType Directory -Force -Path release/bin
+          Copy-Item build/Release/goodnet.exe release/bin/
+          Compress-Archive -Path release/* -DestinationPath "goodnet-${TAG}-windows-x86_64.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-release
+          path: goodnet-*-windows-x86_64.zip
+
+  # ─── GitHub Release ─────────────────────────────────────────────────────────
+
+  release:
+    needs: [build-linux, build-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-release
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-release
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            goodnet-*-linux-x86_64.tar.gz
+            goodnet-*-windows-x86_64.zip
+          generate_release_notes: true

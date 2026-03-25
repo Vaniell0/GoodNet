@@ -1,0 +1,91 @@
+name: CI
+
+on:
+  push:
+    branches: [dev, main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # ─── Linux (Nix) ──────────────────────────────────────────────────────────────
+
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: Build core + plugins (unit tests run in checkPhase)
+        run: nix build --print-build-logs
+
+      # ── Docker integration tests ──────────────────────────────────────────────
+
+      - name: Build & load Docker image
+        run: nix build .#docker --print-build-logs && docker load < result
+
+      - name: Docker smoke test
+        run: |
+          docker run -d --name gn-smoke \
+            goodnet-docker:latest --listen 9000 --exit-after 5 --no-color
+          sleep 3
+          RUNNING=$(docker inspect -f '{{.State.Running}}' gn-smoke)
+          [ "$RUNNING" = "true" ] || (docker logs gn-smoke; exit 1)
+          EXIT=$(docker wait gn-smoke)
+          docker logs gn-smoke
+          [ "$EXIT" = "0" ]
+          docker rm gn-smoke
+        timeout-minutes: 1
+
+      - name: Docker integration test (two-node handshake)
+        run: |
+          docker network create gn-net
+
+          docker run -d --name gn-srv --network gn-net \
+            goodnet-docker:latest \
+            --listen 9000 --exit-after 15 --no-color --exit-code
+          sleep 3
+
+          docker run --name gn-cli --network gn-net \
+            goodnet-docker:latest \
+            --target tcp://gn-srv:9000 --count 100 --size 1 --no-color --exit-code
+          CLIENT=$?
+
+          SERVER=$(docker wait gn-srv)
+          echo "Client exit: $CLIENT, Server exit: $SERVER"
+          docker logs gn-srv
+          docker logs gn-cli
+
+          [ "$CLIENT" = "0" ] && [ "$SERVER" = "0" ]
+
+          docker rm -f gn-cli gn-srv
+          docker network rm gn-net
+        timeout-minutes: 2
+
+  # ─── Windows (MSVC + vcpkg, static build) ──────────────────────────────────
+
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgGitCommitId: 'dddca6fa87f177e0678e2545c4b4636a44aa05bd'
+
+      - name: Configure CMake
+        run: >
+          cmake -B build
+          -DCMAKE_TOOLCHAIN_FILE="${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake"
+          -DGOODNET_STATIC_CORE=ON
+          -DGOODNET_STATIC_PLUGINS=ON
+          -DBUILD_TESTING=ON
+          -DGOODNET_DISABLE_PCH=ON
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Run tests
+        run: ctest --test-dir build -C Release --output-on-failure
