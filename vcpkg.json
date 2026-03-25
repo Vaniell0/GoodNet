@@ -1,0 +1,14 @@
+{
+  "name": "goodnet",
+  "version-string": "0.1.0-alpha",
+  "dependencies": [
+    "boost-asio",
+    "boost-program-options",
+    "spdlog",
+    "fmt",
+    "nlohmann-json",
+    "libsodium",
+    "zstd",
+    "gtest"
+  ]
+}
