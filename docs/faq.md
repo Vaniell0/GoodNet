@@ -54,4 +54,4 @@ GoodNet приветствует плагины на Rust через C ABI — S
 
 ---
 
-**См. также:** [Быстрый старт](data/projects/GoodNet/docs/quickstart.md) · [Обзор архитектуры](data/projects/GoodNet/docs/architecture.md) · [Roadmap](data/projects/GoodNet/docs/roadmap.md)
+**См. также:** [Быстрый старт](./quickstart.md) · [Обзор архитектуры](./architecture.md) · [Roadmap](./roadmap.md)

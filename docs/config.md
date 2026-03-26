@@ -2,7 +2,7 @@
 
 Typed struct конфигурация с JSON persistence и прямым доступом к полям.
 
-См. также: [Быстрый старт](data/projects/GoodNet/docs/quickstart.md) · [Сборка](data/projects/GoodNet/docs/build.md) · [Криптография](data/projects/GoodNet/docs/protocol/crypto.md) · **[Config recipes →](data/projects/GoodNet/docs/recipes/config-recipes.md)**
+См. также: [Быстрый старт](./quickstart.md) · [Сборка](./build.md) · [Криптография](./protocol/crypto.md) · **[Config recipes →](./recipes/config-recipes.md)**
 
 ## Config API
 
@@ -196,7 +196,7 @@ cfg.identity.dir = "/etc/goodnet/keys";
 cfg.identity.ssh_key_path = "~/.ssh/id_ed25519";
 ```
 
-Подробнее о ключах и identity: [Криптография →](data/projects/GoodNet/docs/protocol/crypto.md) · **[Identity migration →](data/projects/GoodNet/docs/recipes/identity-migration.md)**
+Подробнее о ключах и identity: [Криптография →](./protocol/crypto.md) · **[Identity migration →](./recipes/identity-migration.md)**
 
 ### Config::Ice
 
@@ -235,10 +235,10 @@ LOG_TRACE("trace");                 // zero-cost в Release (NDEBUG)
 | Переменная | Описание |
 |-----------|----------|
 | `GOODNET_PLUGINS_DIR` | Каталог плагинов (приоритет над `plugins.base_dir`) |
-| `GOODNET_STUN_SERVER` | STUN сервер для [ICE connector](data/projects/GoodNet/docs/guides/connector-guide.md) |
+| `GOODNET_STUN_SERVER` | STUN сервер для [ICE connector](./guides/connector-guide.md) |
 | `GOODNET_STUN_PORT` | STUN порт для ICE |
 | `HOME` | Для раскрытия `~` в путях |
 
 ---
 
-**См. также:** [Config recipes](data/projects/GoodNet/docs/recipes/config-recipes.md) · [Identity migration](data/projects/GoodNet/docs/recipes/identity-migration.md) · [Быстрый старт](data/projects/GoodNet/docs/quickstart.md) · [Сборка](data/projects/GoodNet/docs/build.md)
+**См. также:** [Config recipes](./recipes/config-recipes.md) · [Identity migration](./recipes/identity-migration.md) · [Быстрый старт](./quickstart.md) · [Сборка](./build.md)

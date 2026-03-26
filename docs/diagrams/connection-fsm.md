@@ -2,7 +2,7 @@
 
 Полная state machine для connection от TCP accept до cleanup.
 
-См. также: [ConnectionManager](../architecture/connection-manager.md) · [Noise FSM](data/projects/GoodNet/docs/diagrams/noise-fsm.md)
+См. также: [ConnectionManager](../architecture/connection-manager.md) · [Noise FSM](../diagrams/noise-fsm.md)
 
 ## Connection FSM
 

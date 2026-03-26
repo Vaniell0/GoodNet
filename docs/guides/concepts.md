@@ -2,7 +2,7 @@
 
 Ключевые концепции GoodNet: идентификация, routing, состояние соединений.
 
-См. также: [Обзор архитектуры](../architecture.md) · [Handler гайд](data/projects/GoodNet/docs/guides/handler-guide.md) · [Protocol: crypto](../protocol/crypto.md)
+См. также: [Обзор архитектуры](../architecture.md) · [Handler гайд](../guides/handler-guide.md) · [Protocol: crypto](../protocol/crypto.md)
 
 ## Connection identity
 
@@ -23,50 +23,40 @@ pubkey[32]    // Постоянный identity (Ed25519 user key)
 - Используется для low-level операций: `send_response()`, `disconnect()`
 
 **peer_id** (в `endpoint_t`):
-- Вычисляется из `user_pubkey || device_pubkey`
-- Один user может иметь N устройств → N разных peer_id
+- conn_id, назначенный ядром при `on_connect()` — используется для `send_response()`
 - Используется для routing внутри Core
 
-**user_pubkey** (`uint8_t[32]`):
+**pubkey** (`uint8_t[32]`):
 - Ed25519 public key (постоянный identity)
 - Один user key = один "аккаунт" в сети
 - Переносится между устройствами
+- Валиден после ESTABLISHED (заполняется ядром после Noise_XX handshake)
 - Используется для адресации: `send("0xAAA...", type, data)`
 
 **Пример:**
 ```
 User Alice имеет:
-  user_pubkey = 0xAAA...
+  pubkey = 0xAAA...
 
-Device 1 (laptop):
-  device_pubkey = 0x111...
-  peer_id = hash(0xAAA || 0x111) = 0xLAPTOP
-
-Device 2 (phone):
-  device_pubkey = 0x222...
-  peer_id = hash(0xAAA || 0x222) = 0xPHONE
-
-TCP session 1 к laptop:
+TCP session 1 к Alice:
   conn_id = 42
-  endpoint.peer_id = 0xLAPTOP
-  endpoint.user_pubkey = 0xAAA
+  endpoint.peer_id = 42  (== conn_id)
+  endpoint.pubkey = 0xAAA
 
-После disconnect laptop, новый connect:
+После disconnect, новый connect:
   conn_id = 43  (новый!)
-  peer_id = 0xLAPTOP  (тот же)
+  endpoint.pubkey = 0xAAA  (тот же)
 ```
 
 ## endpoint_t structure
 
 ```c
-typedef struct endpoint_t {
-    char     address[256];              // IP address (string)
-    uint16_t port;                      // TCP/UDP port
-    uint32_t flags;                     // EP_FLAG_* bitmask
-    conn_id_t peer_id;                  // Hash(user_pk || device_pk)
-    uint8_t  user_pubkey[32];           // Ed25519 user identity
-    uint8_t  device_pubkey[32];         // Ed25519 device identity
-    char     negotiated_scheme[16];     // "tcp", "ice", etc.
+typedef struct {
+    char     address[128];                       // NUL-terminated IP or hostname
+    uint16_t port;                               // Peer port (host order)
+    uint8_t  pubkey[GN_SIGN_PUBLICKEYBYTES];     // Ed25519 user pubkey (valid after ESTABLISHED)
+    uint64_t peer_id;                            // conn_id assigned by core on on_connect()
+    uint8_t  flags;                              // EP_FLAG_* bitmask
 } endpoint_t;
 ```
 
@@ -83,7 +73,7 @@ const endpoint_t* saved_ep_;  // use-after-free!
 // ✅ CORRECT: копирование данных
 struct PeerInfo {
     conn_id_t peer_id;
-    std::array<uint8_t, 32> user_pubkey;
+    std::array<uint8_t, 32> pubkey;
 };
 std::unordered_map<conn_id_t, PeerInfo> active_peers_;
 ```
@@ -218,4 +208,4 @@ int32_t timestamp = msg.get<int32_t>(1);
 
 ---
 
-**См. также:** [Handler гайд](data/projects/GoodNet/docs/guides/handler-guide.md) · [Connector гайд](data/projects/GoodNet/docs/guides/connector-guide.md) · [SDK data types](../architecture/plugin-system.md)
+**См. также:** [Handler гайд](../guides/handler-guide.md) · [Connector гайд](../guides/connector-guide.md) · [SDK data types](../architecture/plugin-system.md)

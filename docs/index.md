@@ -20,60 +20,60 @@
 
 | Задача | Куда смотреть |
 |--------|---------------|
-| **Собрать и запустить за 2 минуты** | → [Быстрый старт](data/projects/GoodNet/docs/quickstart.md) |
-| **Написать handler** | → [Handler: гайд](data/projects/GoodNet/docs/guides/handler-guide.md) |
-| **Написать connector** | → [Connector: гайд](data/projects/GoodNet/docs/guides/connector-guide.md) |
-| **Понять routing и propagation** | → [Core Concepts](data/projects/GoodNet/docs/guides/concepts.md) |
-| **Настроить для production** | → [Config recipes](data/projects/GoodNet/docs/recipes/config-recipes.md) |
-| **Troubleshoot crypto errors** | → [Криптография: Модель угроз](data/projects/GoodNet/docs/protocol/crypto.md#модель-угроз) |
-| **Troubleshoot build problems** | → [Build tips](data/projects/GoodNet/docs/recipes/build-tips.md) |
-| **Понять архитектуру** | → [Обзор архитектуры](data/projects/GoodNet/docs/architecture.md) |
-| **Увидеть flow диаграммы** | → [Packet flow diagrams](data/projects/GoodNet/docs/diagrams/packet-flow.md) |
+| **Собрать и запустить за 2 минуты** | → [Быстрый старт](./quickstart.md) |
+| **Написать handler** | → [Handler: гайд](./guides/handler-guide.md) |
+| **Написать connector** | → [Connector: гайд](./guides/connector-guide.md) |
+| **Понять routing и propagation** | → [Core Concepts](./guides/concepts.md) |
+| **Настроить для production** | → [Config recipes](./recipes/config-recipes.md) |
+| **Troubleshoot crypto errors** | → [Криптография: Модель угроз](./protocol/crypto.md#модель-угроз) |
+| **Troubleshoot build problems** | → [Build tips](./recipes/build-tips.md) |
+| **Понять архитектуру** | → [Обзор архитектуры](./architecture.md) |
+| **Увидеть flow диаграммы** | → [Packet flow diagrams](./diagrams/packet-flow.md) |
 
 ## Быстрый старт
 
-- **[Быстрый старт](data/projects/GoodNet/docs/quickstart.md)** — сборка и запуск за 2 минуты
-- [Сборка](data/projects/GoodNet/docs/build.md) — Nix, CMake, опции, Docker CI
-- [Конфигурация](data/projects/GoodNet/docs/config.md) — Config API (typed struct), JSON, все ключи
+- **[Быстрый старт](./quickstart.md)** — сборка и запуск за 2 минуты
+- [Сборка](./build.md) — Nix, CMake, опции, Docker CI
+- [Конфигурация](./config.md) — Config API (typed struct), JSON, все ключи
 
 ## Guides
 
 Практические руководства для разработчиков:
 
-- **[Core Concepts](data/projects/GoodNet/docs/guides/concepts.md)** — conn_id vs pubkey, endpoint_t, routing, propagation
-- **[Best Practices](data/projects/GoodNet/docs/guides/best-practices.md)** — performance, security, error handling, testing
-- **[Handler: гайд](data/projects/GoodNet/docs/guides/handler-guide.md)** — IHandler, dispatch chain, typed payload, real examples
-- **[Connector: гайд](data/projects/GoodNet/docs/guides/connector-guide.md)** — IConnector, контракт с core, TCP пример
+- **[Core Concepts](./guides/concepts.md)** — conn_id vs pubkey, endpoint_t, routing, propagation
+- **[Best Practices](./guides/best-practices.md)** — performance, security, error handling, testing
+- **[Handler: гайд](./guides/handler-guide.md)** — IHandler, dispatch chain, typed payload, real examples
+- **[Connector: гайд](./guides/connector-guide.md)** — IConnector, контракт с core, TCP пример
 
 ## Architecture
 
 Детали внутренней архитектуры:
 
-- [Обзор архитектуры](data/projects/GoodNet/docs/architecture.md) — Core, компоненты, concurrency model
-- [ConnectionManager](data/projects/GoodNet/docs/architecture/connection-manager.md) — RCU registry, FSM, dispatch/send path
-- [SignalBus](data/projects/GoodNet/docs/architecture/signal-bus.md) — PipelineSignal, EventSignal, stats
-- [Система плагинов](data/projects/GoodNet/docs/architecture/plugin-system.md) — PluginManager, SHA-256, lifecycle, C ABI
+- [Обзор архитектуры](./architecture.md) — Core, компоненты, concurrency model
+- [ConnectionManager](./architecture/connection-manager.md) — RCU registry, FSM, dispatch/send path
+- [SignalBus](./architecture/signal-bus.md) — PipelineSignal, EventSignal, stats
+- [Система плагинов](./architecture/plugin-system.md) — PluginManager, SHA-256, lifecycle, C ABI
 
 ## Protocol
 
 Протокол и криптография:
 
-- [Wire format](data/projects/GoodNet/docs/protocol/wire-format.md) — header_t v3, типы сообщений, framing
-- [Noise_XX handshake](data/projects/GoodNet/docs/protocol/noise-handshake.md) — 3-msg обмен, cross-verification, rekey
-- [Криптография](data/projects/GoodNet/docs/protocol/crypto.md) — ключи, AEAD, nonce, forward secrecy, модель угроз
+- [Wire format](./protocol/wire-format.md) — header_t v3, типы сообщений, framing
+- [Noise_XX handshake](./protocol/noise-handshake.md) — 3-msg обмен, cross-verification, rekey
+- [Криптография](./protocol/crypto.md) — ключи, AEAD, nonce, forward secrecy, модель угроз
 
 ## Recipes
 
 Практические примеры и советы:
 
-- [Config recipes](data/projects/GoodNet/docs/recipes/config-recipes.md) — настройки для high-throughput, low-latency, embedded, debug
-- [Build tips](data/projects/GoodNet/docs/recipes/build-tips.md) — troubleshooting, ccache, incremental builds
-- [Identity migration](data/projects/GoodNet/docs/recipes/identity-migration.md) — перенос ключей между машинами
+- [Config recipes](./recipes/config-recipes.md) — настройки для high-throughput, low-latency, embedded, debug
+- [Build tips](./recipes/build-tips.md) — troubleshooting, ccache, incremental builds
+- [Identity migration](./recipes/identity-migration.md) — перенос ключей между машинами
 
 ## Проект
 
-- [FAQ](data/projects/GoodNet/docs/faq.md) — зачем P2P, почему C++, отличия от libp2p, это не Web3
-- [Roadmap](data/projects/GoodNet/docs/roadmap.md) — статус alpha, планы Beta/v1.0, известные проблемы
+- [FAQ](./faq.md) — зачем P2P, почему C++, отличия от libp2p, это не Web3
+- [Roadmap](./roadmap.md) — статус alpha, планы Beta/v1.0, известные проблемы
 
 ---
 

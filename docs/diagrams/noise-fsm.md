@@ -65,4 +65,4 @@ Initiator (EP_FLAG_OUTBOUND)     Responder (!EP_FLAG_OUTBOUND)
 
 ---
 
-**См. также:** [Noise_XX: детали](../protocol/noise-handshake.md#3-message-exchange) · [Connection FSM](data/projects/GoodNet/docs/diagrams/connection-fsm.md)
+**См. также:** [Noise_XX: детали](../protocol/noise-handshake.md#3-message-exchange) · [Connection FSM](../diagrams/connection-fsm.md)

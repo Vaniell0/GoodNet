@@ -103,4 +103,4 @@ Compression добавляет ~30µs overhead (zstd compress + decompress).
 
 ---
 
-**См. также:** [Конфигурация](../config.md) · [Build tips](data/projects/GoodNet/docs/recipes/build-tips.md) · [Identity migration](data/projects/GoodNet/docs/recipes/identity-migration.md)
+**См. также:** [Конфигурация](../config.md) · [Build tips](../recipes/build-tips.md) · [Identity migration](../recipes/identity-migration.md)

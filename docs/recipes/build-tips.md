@@ -154,4 +154,4 @@ cmake --build build --target unit_tests
 
 ---
 
-**См. также:** [Сборка](../build.md) · [Config recipes](data/projects/GoodNet/docs/recipes/config-recipes.md)
+**См. также:** [Сборка](../build.md) · [Config recipes](../recipes/config-recipes.md)

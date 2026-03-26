@@ -2,21 +2,21 @@
 
 Текущий статус, планы и известные проблемы GoodNet.
 
-См. также: [Обзор архитектуры](data/projects/GoodNet/docs/architecture.md) · [Быстрый старт](data/projects/GoodNet/docs/quickstart.md)
+См. также: [Обзор архитектуры](./architecture.md) · [Быстрый старт](./quickstart.md)
 
 ## Alpha 0.1.0 (текущая)
 
 Что работает:
-- **Core**: multi-instance, Pimpl, [Config injection](data/projects/GoodNet/docs/config.md), heartbeat timer
-- **[ConnectionManager](data/projects/GoodNet/docs/architecture/connection-manager.md)**: RCU registry, [Noise_XX](data/projects/GoodNet/docs/protocol/noise-handshake.md) handshake, [ChaChaPoly-IETF AEAD](data/projects/GoodNet/docs/protocol/crypto.md), per-conn queue с backpressure, TCP reassembly (fast-path zero-copy), heartbeat PING/PONG, gossip relay с O(1) dedup
-- **[Плагины](data/projects/GoodNet/docs/architecture/plugin-system.md)**: SHA-256 verified dlopen, static plugins, C ABI + C++ SDK ([IHandler](data/projects/GoodNet/docs/guides/handler-guide.md), [IConnector](data/projects/GoodNet/docs/guides/connector-guide.md))
+- **Core**: multi-instance, Pimpl, [Config injection](./config.md), heartbeat timer
+- **[ConnectionManager](./architecture/connection-manager.md)**: RCU registry, [Noise_XX](./protocol/noise-handshake.md) handshake, [ChaChaPoly-IETF AEAD](./protocol/crypto.md), per-conn queue с backpressure, TCP reassembly (fast-path zero-copy), heartbeat PING/PONG, gossip relay с O(1) dedup
+- **[Плагины](./architecture/plugin-system.md)**: SHA-256 verified dlopen, static plugins, C ABI + C++ SDK ([IHandler](./guides/handler-guide.md), [IConnector](./guides/connector-guide.md))
 - **TCP connector**: Boost.Asio, scatter-gather IO (writev), async двухфазное чтение
 - **ICE/DTLS connector**: libnice, STUN/TURN, SDP signaling через TCP
-- **[SignalBus](data/projects/GoodNet/docs/architecture/signal-bus.md)**: per-type dispatch, wildcard, priority chain (0 = highest), session affinity, atomic stats
-- **[Wire protocol v3](data/projects/GoodNet/docs/protocol/wire-format.md)**: 20-byte header, packet_id as AEAD nonce
+- **[SignalBus](./architecture/signal-bus.md)**: per-type dispatch, wildcard, priority chain (0 = highest), session affinity, atomic stats
+- **[Wire protocol v3](./protocol/wire-format.md)**: 20-byte header, packet_id as AEAD nonce
 - **Benchmark binary**: live dashboard, histogram, structured exit codes
 - **Тесты**: GTest, mock-плагины
-- **[Nix build](data/projects/GoodNet/docs/build.md)** + Release CI (Linux)
+- **[Nix build](./build.md)** + Release CI (Linux)
 - **Docker CI** для ICE (coturn + 3-node mesh)
 
 ### Исправленные баги
@@ -85,7 +85,7 @@ class SystemServiceDispatcher {
 
 #### RouteTable: smart relay с decay GC
 
-Вместо [gossip broadcast](data/projects/GoodNet/docs/architecture/connection-manager.md#gossip-relay) всем peers, отправлять только на оптимальный path:
+Вместо [gossip broadcast](./architecture/connection-manager.md#gossip-relay) всем peers, отправлять только на оптимальный path:
 
 ```
 Текущая реализация (gossip):
@@ -134,7 +134,7 @@ auto val = host_api->store_get("my_plugin", "key");  // → "value"
 
 #### Hot-reload lifecycle
 
-Полная реализация [PREPARING → ACTIVE → DRAINING → ZOMBIE](data/projects/GoodNet/docs/architecture/plugin-system.md#plugin-lifecycle):
+Полная реализация [PREPARING → ACTIVE → DRAINING → ZOMBIE](./architecture/plugin-system.md#plugin-lifecycle):
 
 ```
 Old version:  ACTIVE → disable() → DRAINING (wait in-flight requests) → ZOMBIE → unload()
@@ -151,23 +151,23 @@ New version:  load() → PREPARING → enable() → ACTIVE
 
 ### Стабильность
 
-- **Стабильный [wire protocol](data/projects/GoodNet/docs/protocol/wire-format.md)**: Breaking changes → major version bump (v2.0, v3.0...)
+- **Стабильный [wire protocol](./protocol/wire-format.md)**: Breaking changes → major version bump (v2.0, v3.0...)
   - `proto_ver` field в header позволяет compatibility check
   - v1.0 nodes reject v2.0 packets (или negotiate fallback)
 
-- **Стабильный [C ABI](data/projects/GoodNet/docs/architecture/plugin-system.md#c-abi-для-не-c-плагинов)**: Backward-compatible extensions
+- **Стабильный [C ABI](./architecture/plugin-system.md#c-abi-для-не-c-плагинов)**: Backward-compatible extensions
   - vtable versioning: `host_api_t` v1 → v2 (add fields, не изменять offset старых)
   - Plugins compiled for v1.0 ABI работают с v1.x core (x = minor version)
 
 ### Production-ready DHT и service discovery
 
-- **DHT persistence**: Kademlia routing table сохраняется в [Store](data/projects/GoodNet/docs/roadmap.md#store-sqlite-persistent-storage)
+- **DHT persistence**: Kademlia routing table сохраняется в [Store](./roadmap.md#store-sqlite-persistent-storage)
 - **Service registry**: `announce("chat-service", my_pubkey)` → peers могут `find("chat-service")` → list of providers
 - **Use case:** Децентрализованный service mesh (как Consul, но без центральных серверов)
 
 ### Trust-on-first-use / PKI policy
 
-**Проблема:** [Текущая уязвимость](data/projects/GoodNet/docs/protocol/crypto.md#не-защищает-от) — MitM на **первом** handshake.
+**Проблема:** [Текущая уязвимость](./protocol/crypto.md#не-защищает-от) — MitM на **первом** handshake.
 
 **Решение (v1.0):**
 
@@ -205,7 +205,7 @@ Centralized trust anchor (или blockchain-based):
 ### Cross-platform
 
 - **Darwin (macOS)**: TCP + ICE connectors работают (boost::asio + libnice portable)
-- **Embedded Linux** (Raspberry Pi, OpenWrt): Minimal footprint config (см. [config recipes](data/projects/GoodNet/docs/config.md#embedded-low-power))
+- **Embedded Linux** (Raspberry Pi, OpenWrt): Minimal footprint config (см. [config recipes](./config.md#embedded-low-power))
 - **Windows**: TCP connector работает (boost::asio), ICE нужен (libnice + GLib на Windows)
 
 **v1.0 scope:** macOS + embedded Linux stable, Windows experimental.
@@ -224,7 +224,7 @@ goodnet plugin install chat-handler
 
 ### Traffic padding (anti correlation attack)
 
-**Проблема:** [Correlation attack](data/projects/GoodNet/docs/protocol/crypto.md#не-защищает-от) — observer видит payload_len в header → может вычислить что передаётся (даже если зашифровано).
+**Проблема:** [Correlation attack](./protocol/crypto.md#не-защищает-от) — observer видит payload_len в header → может вычислить что передаётся (даже если зашифровано).
 
 **Решение:**
 
@@ -268,4 +268,4 @@ Random intervals (Poisson distribution):
 
 ---
 
-**См. также:** [Обзор архитектуры](data/projects/GoodNet/docs/architecture.md) · [Быстрый старт](data/projects/GoodNet/docs/quickstart.md) · [Конфигурация](data/projects/GoodNet/docs/config.md)
+**См. также:** [Обзор архитектуры](./architecture.md) · [Быстрый старт](./quickstart.md) · [Конфигурация](./config.md)

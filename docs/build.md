@@ -2,7 +2,7 @@
 
 Подробности сборки GoodNet: Nix, CMake, опции, Docker CI.
 
-См. также: [Быстрый старт](data/projects/GoodNet/docs/quickstart.md) · [Система плагинов](data/projects/GoodNet/docs/architecture/plugin-system.md) · **[Build tips →](data/projects/GoodNet/docs/recipes/build-tips.md)**
+См. также: [Быстрый старт](./quickstart.md) · [Система плагинов](./architecture/plugin-system.md) · **[Build tips →](./recipes/build-tips.md)**
 
 ## Nix (рекомендуется)
 
@@ -35,7 +35,7 @@ cmake --build build -j$(nproc)
 - zstd
 - GTest (для тестов)
 
-**Установка зависимостей:** см. [Build tips: dependency installation →](data/projects/GoodNet/docs/recipes/build-tips.md#build-troubleshooting)
+**Установка зависимостей:** см. [Build tips: dependency installation →](./recipes/build-tips.md#build-troubleshooting)
 
 ### CMake опции
 
@@ -45,6 +45,8 @@ cmake --build build -j$(nproc)
 | `GOODNET_STATIC_CORE` | Статическая libgoodnet_core.a (default: SHARED) |
 | `GOODNET_STATIC_PLUGINS` | TCP и Logger вкомпилируются в бинарник |
 | `GOODNET_COVERAGE` | gcov/lcov инструментация |
+| `INSTALL_DEVELOPMENT` | Установить SDK headers и cmake config для сторонних проектов (default OFF) |
+| `BUILD_STORE` | Собрать Store — distributed registry сервис (`apps/store`). Требует SQLite3 (default OFF) |
 
 ### CMake пресеты
 
@@ -75,11 +77,11 @@ SHARED гарантирует одну копию Logger в процессе. Co
 
 Плагины ищутся в:
 1. `GOODNET_PLUGINS_DIR` (env var) — высший приоритет
-2. `plugins.base_dir` — из [конфига](data/projects/GoodNet/docs/config.md)
+2. `plugins.base_dir` — из [конфига](./config.md)
 3. `plugins.extra_dirs` — дополнительные каталоги через `;`
 
-Подробности: [Система плагинов](data/projects/GoodNet/docs/architecture/plugin-system.md).
+Подробности: [Система плагинов](./architecture/plugin-system.md).
 
 ---
 
-**См. также:** [Build tips & troubleshooting](data/projects/GoodNet/docs/recipes/build-tips.md) · [Быстрый старт](data/projects/GoodNet/docs/quickstart.md) · [Конфигурация](data/projects/GoodNet/docs/config.md)
+**См. также:** [Build tips & troubleshooting](./recipes/build-tips.md) · [Быстрый старт](./quickstart.md) · [Конфигурация](./config.md)

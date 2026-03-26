@@ -1,8 +1,8 @@
 # Система плагинов
 
-Плагины — единственный способ расширить GoodNet. Два типа: [handler](../guides/handler-guide.md) (обработчик сообщений) и [connector](../guides/connector-guide.md) (транспорт). Реализация: `core/pluginManager.hpp`, `core/pluginManager_core.cpp`, `core/pluginManager_query.cpp`.
+Плагины — единственный способ расширить GoodNet. Два типа: [handler](../guides/handler-guide.md) (обработчик сообщений) и [connector](../guides/connector-guide.md) (транспорт). Реализация: `core/pm/pluginManager.hpp`, `core/pm/core.cpp`, `core/pm/query.cpp`.
 
-См. также: [Handler: гайд](../guides/handler-guide.md) · [Connector: гайд](../guides/connector-guide.md) · [Обзор архитектуры](data/projects/GoodNet/docs/architecture.md) · [Сборка](data/projects/GoodNet/docs/build.md)
+См. также: [Handler: гайд](../guides/handler-guide.md) · [Connector: гайд](../guides/connector-guide.md) · [Обзор архитектуры](../architecture.md) · [Сборка](../build.md)
 
 ## Типы плагинов
 
@@ -119,6 +119,31 @@ target_compile_definitions(goodnet PRIVATE GOODNET_STATIC_PLUGINS)
 ```
 
 Макрос `HANDLER_PLUGIN(ClassName)` при `GOODNET_STATIC_PLUGINS` генерирует compile-time registration вместо dlsym entry point. Аналогично `CONNECTOR_PLUGIN(ClassName)`.
+
+#### Механизм статической регистрации
+
+Реализация: `sdk/static_registry.hpp`, `sdk/cpp/handler.hpp:215-244`.
+
+```cpp
+// sdk/static_registry.hpp
+struct StaticPluginEntry {
+    const char*      name;
+    handler_init_t   handler_init   = nullptr;  // для handler-плагинов
+    connector_init_t connector_init = nullptr;  // для connector-плагинов
+};
+
+inline std::vector<StaticPluginEntry>& static_plugin_registry() {
+    static std::vector<StaticPluginEntry> registry;
+    return registry;
+}
+```
+
+При `GOODNET_STATIC_PLUGINS` макрос `HANDLER_PLUGIN(ClassName)`:
+1. Создаёт `static ClassName _gn_plugin_instance`
+2. Генерирует `_gn_static_handler_init()` — вызывает `init(api)` + `to_c_handler()`
+3. Регистрирует entry в `static_plugin_registry()` через **anonymous namespace struct с конструктором** (выполняется до `main()`)
+
+`PluginManager::load_static_plugins()` итерирует реестр и инициализирует каждый entry идентично динамически загруженному плагину (через `handler_init(api, &result)`).
 
 ## Загрузка плагинов
 
@@ -272,6 +297,52 @@ Logger (`gn::Logger`) — singleton в `libgoodn_core.so`. Плагин може
 
 **НО:** Если плагин создаёт свой `spdlog::logger` (не через `gn::Logger::get()`), он будет unique per-instance → при reload v2 создаст новый logger → duplicate output.
 
+## Enable / Disable API
+
+Handlers можно включать и отключать без выгрузки плагина (`core/pm/pluginManager.hpp`):
+
+```cpp
+bool enable_handler (std::string_view name);  // включить отключённый handler
+bool disable_handler(std::string_view name);  // отключить (останавливает dispatch, не выгружает)
+```
+
+**Отличие от unload:** `disable_handler()` сохраняет плагин в памяти (dlopen handle остаётся открытым), но исключает его из dispatch chain. `enable_handler()` возвращает его обратно. Это позволяет быстро переключать обработчики без накладных расходов на `dlopen/dlclose`.
+
+Lifecycle при disable:
+```
+ACTIVE → disable_handler("my_handler") → PREPARING
+PREPARING → enable_handler("my_handler") → ACTIVE
+```
+
+## Query API
+
+`PluginManager` предоставляет набор query-методов для инспекции загруженных плагинов:
+
+```cpp
+// Поиск по имени/схеме
+std::optional<handler_t*>       find_handler_by_name    (std::string_view name)   const;
+std::optional<connector_ops_t*> find_connector_by_scheme(std::string_view scheme) const;
+
+// Списки активных (enabled) плагинов
+std::vector<handler_t*>       get_active_handlers()       const;
+std::vector<connector_ops_t*> get_active_connectors()     const;
+std::vector<std::string>      get_enabled_handler_names() const;
+
+// Счётчики
+size_t get_enabled_handler_count()   const;
+size_t get_enabled_connector_count() const;
+```
+
+**`find_handler_by_name()`** — возвращает `handler_t*` если handler найден **и** enabled, `nullopt` иначе.
+
+**`find_connector_by_scheme()`** — аналогично для connector по URI-схеме (напр. `"tcp"`, `"ice"`).
+
+**`get_enabled_handler_names()`** — список имён всех включённых handlers (для диагностики и CAPI).
+
+**`get_enabled_handler_count()` / `get_enabled_connector_count()`** — быстрые счётчики, доступны также через CAPI: `gn_core_handler_count()`, `gn_core_connector_count()`.
+
+Все query-методы thread-safe (internal shared_mutex).
+
 ## C ABI (для не-C++ плагинов)
 
 Если плагин написан на C, Rust, или другом языке — реализуйте `handler_init` / `connector_init` напрямую:
@@ -309,9 +380,9 @@ SDK C ABI headers: `sdk/types.h`, `sdk/plugin.h`, `sdk/handler.h`, `sdk/connecto
 
 Плагины ищутся в следующем порядке приоритета:
 1. `GOODNET_PLUGINS_DIR` (env var) — высший
-2. `plugins.base_dir` — из [конфига](data/projects/GoodNet/docs/config.md#pluginsconfig)
+2. `plugins.base_dir` — из [конфига](../config.md#pluginsconfig)
 3. `plugins.extra_dirs` — дополнительные каталоги через `;`
 
 ---
 
-**См. также:** [Handler: гайд](../guides/handler-guide.md) · [Connector: гайд](../guides/connector-guide.md) · [Обзор архитектуры](data/projects/GoodNet/docs/architecture.md) · [Сборка](data/projects/GoodNet/docs/build.md) · [Конфигурация](data/projects/GoodNet/docs/config.md)
+**См. также:** [Handler: гайд](../guides/handler-guide.md) · [Connector: гайд](../guides/connector-guide.md) · [Обзор архитектуры](../architecture.md) · [Сборка](../build.md) · [Конфигурация](../config.md)

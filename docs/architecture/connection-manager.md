@@ -1,8 +1,8 @@
 # ConnectionManager
 
-Самый большой компонент ядра (~2000 строк в `core/cm_*.cpp`). Управляет жизненным циклом соединений, шифрованием, framing, dispatch и relay.
+Самый большой компонент ядра (~2000 строк в `core/cm/*.cpp`). Управляет жизненным циклом соединений, шифрованием, framing, dispatch и relay.
 
-См. также: [Обзор архитектуры](data/projects/GoodNet/docs/architecture.md) · [Wire format](../protocol/wire-format.md) · [Noise_XX handshake](../protocol/noise-handshake.md) · [SignalBus](data/projects/GoodNet/docs/architecture/signal-bus.md)
+См. также: [Обзор архитектуры](../architecture.md) · [Wire format](../protocol/wire-format.md) · [Noise_XX handshake](../protocol/noise-handshake.md) · [SignalBus](../architecture/signal-bus.md)
 
 ## RCU registry
 
@@ -75,6 +75,22 @@ Reader thread:                 Writer thread:
 ```
 
 Reader не видит peer11 до следующего `load()`, но это OK — eventual consistency.
+
+### rcu_update() helper
+
+Для упрощения RCU-записи используется шаблонный helper `rcu_update()` в `core/cm/impl.hpp`:
+
+```cpp
+template<typename Fn>
+void rcu_update(Fn&& fn) {
+    auto old = records_rcu_.load(std::memory_order_acquire);
+    auto next = std::make_shared<RecordMap>(*old);   // полная копия
+    fn(*next);                                         // модификация копии
+    records_rcu_.store(std::move(next), std::memory_order_release);
+}
+```
+
+**Внимание:** `rcu_update()` сам **не берёт `records_write_mu_`** — вызывающий код должен захватить mutex перед вызовом. Это позволяет объединять несколько RCU-модификаций под одним lock.
 
 ## ConnectionRecord
 
@@ -287,9 +303,75 @@ handle_relay():
      b. Нет → gossip broadcast всем ESTABLISHED peers (кроме отправителя)
 ```
 
+## Transport index
+
+`transport_index_` — вторичное отображение `transport_conn_id → peer conn_id` (`core/cm/impl.hpp:154-157`). Защищён `transport_mu_` (shared_mutex).
+
+Для **первичного** транспорта `transport_conn_id == ConnectionRecord::id`. При добавлении вторичного транспорта (напр. ICE upgrade поверх TCP) `handle_add_transport()` создаёт маппинг нового transport_conn_id на существующий peer conn_id. Это позволяет `handle_data()` разрешать входящие данные от вторичного транспорта к правильному ConnectionRecord.
+
+```
+Пример: TCP → ICE upgrade
+  peer conn_id = 42 (TCP, первичный)
+  ICE transport conn_id = 87 (новый)
+  transport_index_[87] = 42  ← вторичный → первичный
+```
+
+## Scheme priority
+
+`scheme_priority_` — вектор предпочтений транспортных схем (`core/cm/impl.hpp:138`):
+
+```cpp
+std::vector<std::string> scheme_priority_{"tcp", "ice"};
+```
+
+Индекс в векторе определяет приоритет: **0 = лучший**, 255 = неизвестный. `scheme_priority_index(scheme)` возвращает позицию scheme в этом векторе (или 255, если scheme не найден).
+
+Используется при `negotiate_scheme()` — выбор лучшего общего транспорта между двумя peers. Можно переопределить через `ConnectionManager::set_scheme_priority()`.
+
+## Pending message queue
+
+Сообщения, отправленные до завершения handshake, буферизуются в `pending_messages_` (`core/cm/impl.hpp:168-169`):
+
+```cpp
+mutable std::shared_mutex pending_mu_;
+std::unordered_map<std::string, std::vector<PendingMessage>> pending_messages_;
+```
+
+**Параметры:**
+- `PENDING_TTL = 30s` — максимальное время жизни pending-сообщения
+- `PENDING_MAX_PER_URI = 100` — максимум сообщений в очереди на один URI
+
+**Жизненный цикл:**
+1. `send(uri, ...)` → соединение не ESTABLISHED → сообщение добавляется в `pending_messages_[uri]`
+2. Если очередь > `PENDING_MAX_PER_URI` → новое сообщение отбрасывается
+3. После `finalize_handshake()` → `flush_pending_messages(uri, conn_id)` — отправка всех накопленных сообщений
+4. `cleanup_stale_pending()` вызывается по heartbeat timer (каждые 30s) → удаляет сообщения старше `PENDING_TTL`
+
+**Защита:** `pending_mu_` (shared_mutex) для потокобезопасного доступа.
+
+## Backpressure мониторинг
+
+`get_pending_bytes(conn_id)` — API для мониторинга backpressure (`core/cm/connectionManager.hpp`):
+
+```cpp
+[[nodiscard]] size_t get_pending_bytes(conn_id_t id = CONN_ID_INVALID) const noexcept;
+```
+
+- **С `conn_id`**: возвращает `pending_bytes` для конкретного соединения (из `PerConnQueue`)
+- **Без аргумента** (`CONN_ID_INVALID`): суммирует `pending_bytes` по всем активным очередям
+
+Используется для принятия решений о rate limiting на стороне application:
+
+```cpp
+auto pending = core.cm().get_pending_bytes(conn_id);
+if (pending > 4 * 1024 * 1024) {  // > 4 MB в очереди
+    // замедлить отправку
+}
+```
+
 ---
 
-**См. также:** [Обзор архитектуры](data/projects/GoodNet/docs/architecture.md) · [Wire format](../protocol/wire-format.md) · [Noise_XX handshake](../protocol/noise-handshake.md) · [SignalBus](data/projects/GoodNet/docs/architecture/signal-bus.md) · [Криптография](../protocol/crypto.md)
+**См. также:** [Обзор архитектуры](../architecture.md) · [Wire format](../protocol/wire-format.md) · [Noise_XX handshake](../protocol/noise-handshake.md) · [SignalBus](../architecture/signal-bus.md) · [Криптография](../protocol/crypto.md)
 
 ## Performance optimizations
 

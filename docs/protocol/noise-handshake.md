@@ -1,8 +1,8 @@
 # Noise_XX Handshake
 
-GoodNet использует Noise_XX pattern (`Noise_XX_25519_ChaChaPoly_BLAKE2b`). Строго упорядоченный 3-message обмен с ролями Initiator и Responder. Реализация: `core/noise.hpp`, `core/noise.cpp`, `core/cm_handshake.cpp`.
+GoodNet использует Noise_XX pattern (`Noise_XX_25519_ChaChaPoly_BLAKE2b`). Строго упорядоченный 3-message обмен с ролями Initiator и Responder. Реализация: `core/crypto/noise.hpp`, `core/crypto/noise.cpp`, `core/cm/handshake.cpp`.
 
-См. также: [Криптография](data/projects/GoodNet/docs/protocol/crypto.md) · [Wire format](data/projects/GoodNet/docs/protocol/wire-format.md) · [ConnectionManager](../architecture/connection-manager.md)
+См. также: [Криптография](../protocol/crypto.md) · [Wire format](../protocol/wire-format.md) · [ConnectionManager](../architecture/connection-manager.md)
 
 ## Noise_XX pattern
 
@@ -21,7 +21,7 @@ XX означает: обе стороны передают свои static keys
 
 ## HandshakePayload
 
-265 bytes, передаётся внутри Noise handshake messages:
+265 bytes, передаётся внутри Noise msg2 (responder) и msg3 (initiator). В msg1 HandshakePayload **не отправляется** — только ephemeral key:
 
 ```
 struct HandshakePayload {
@@ -45,14 +45,16 @@ Initiator                           Responder
   │                                   │
   ├─── NOISE_INIT (type=1) ────────► │
   │    Noise msg1: →e                 │
-  │    + HandshakePayload (265 B)     │
+  │    (только ephemeral key, 32 B)   │
   │                                   │
   │ ◄──────── NOISE_RESP (type=2) ── ┤
   │    Noise msg2: ←e,ee,s,es        │
+  │    + HandshakePayload (265 B)     │
   │    (зашифровано Noise-ключами)    │
   │                                   │
   ├─── NOISE_FIN (type=3) ─────────► │
   │    Noise msg3: →s,se             │
+  │    + HandshakePayload (265 B)     │
   │    (зашифровано Noise-ключами)    │
   │                                   │
   │ ── ESTABLISHED ──────────────── ─┤
@@ -63,7 +65,9 @@ Initiator                           Responder
 
 ### Detailed message breakdown (field-level)
 
-#### msg1 (NOISE_INIT): → e + HandshakePayload
+#### msg1 (NOISE_INIT): → e (без payload)
+
+msg1 содержит **только** ephemeral key. HandshakePayload здесь не передаётся — он отправляется в msg2 и msg3. Код: `send_noise_init()` вызывает `write_message(nullptr, 0, ...)`.
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -73,21 +77,13 @@ Initiator                           Responder
 │ proto_ver: 3                                                │
 │ flags: 0x00                                                 │
 │ payload_type: 1 (MSG_TYPE_NOISE_INIT)                       │
-│ payload_len: 297 (32 + 265)                                 │
+│ payload_len: 32                                             │
 │ packet_id: 0                                                │
 └─────────────────────────────────────────────────────────────┘
 ┌─────────────────────────────────────────────────────────────┐
-│ Payload (297 bytes, plaintext)                              │
+│ Payload (32 bytes, plaintext)                               │
 ├─────────────────────────────────────────────────────────────┤
 │ ephemeral_pubkey [32]    ← initiator ephemeral X25519 pk   │
-├─────────────────────────────────────────────────────────────┤
-│ HandshakePayload [265]:                                     │
-│   user_pubkey    [32]    ← Ed25519 user pk                 │
-│   device_pubkey  [32]    ← Ed25519 device pk                │
-│   signature      [64]    ← Ed(user_sk, user_pk||device_pk) │
-│   schemes_count  [1]     ← число транспортов (1-8)         │
-│   schemes        [8*16]  ← ["tcp\0", "ice\0", ...]          │
-│   core_meta      [8]     ← version + caps_mask              │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -97,22 +93,28 @@ Initiator                           Responder
 
 #### msg2 (NOISE_RESP): ← e, ee, s, es + encrypted HandshakePayload
 
+Responder читает msg1, затем вызывает `write_message(hp_bytes)` с HandshakePayload.
+
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │ header_t (20 bytes)                                         │
 ├─────────────────────────────────────────────────────────────┤
 │ payload_type: 2 (MSG_TYPE_NOISE_RESP)                       │
-│ payload_len: ~330 (32 + 265 + padding + MAC)                │
+│ payload_len: ~377 bytes                                     │
 └─────────────────────────────────────────────────────────────┘
 ┌─────────────────────────────────────────────────────────────┐
-│ Payload (~330 bytes)                                        │
+│ Payload (~377 bytes)                                        │
 ├─────────────────────────────────────────────────────────────┤
-│ ephemeral_pubkey [32]    ← responder ephemeral X25519 pk   │
+│ ephemeral_pubkey [32]        ← responder ephemeral X25519   │
+│ + MAC            [16]        ← Poly1305 (после e token)     │
 ├─────────────────────────────────────────────────────────────┤
-│ Encrypted block (зашифровано после ee, es DH):              │
-│   static_pubkey  [32]    ← responder static X25519 pk       │
-│   HandshakePayload [265] ← responder identity               │
-│   MAC            [16]    ← Poly1305 authentication tag      │
+│ (ee DH, es DH → MixKey)                                    │
+├─────────────────────────────────────────────────────────────┤
+│ Encrypted static_pubkey [32] ← responder static X25519 pk   │
+│ + MAC            [16]        ← Poly1305 (после s token)     │
+├─────────────────────────────────────────────────────────────┤
+│ Encrypted HandshakePayload [265] ← responder identity       │
+│ + MAC            [16]        ← Poly1305 (payload)           │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -127,19 +129,25 @@ Initiator                           Responder
 
 #### msg3 (NOISE_FIN): → s, se + encrypted HandshakePayload
 
+Initiator читает msg2, обрабатывает HandshakePayload респондера, затем отправляет свой HandshakePayload.
+
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │ header_t (20 bytes)                                         │
 ├─────────────────────────────────────────────────────────────┤
 │ payload_type: 3 (MSG_TYPE_NOISE_FIN)                        │
-│ payload_len: ~330 (32 + 265 + padding + MAC)                │
+│ payload_len: ~329 bytes                                     │
 └─────────────────────────────────────────────────────────────┘
 ┌─────────────────────────────────────────────────────────────┐
-│ Payload (~330 bytes, зашифровано после ee, es, se DH)      │
+│ Payload (~329 bytes)                                        │
 ├─────────────────────────────────────────────────────────────┤
-│   static_pubkey  [32]    ← initiator static X25519 pk       │
-│   HandshakePayload [265] ← initiator identity               │
-│   MAC            [16]    ← Poly1305 authentication tag      │
+│ Encrypted static_pubkey [32] ← initiator static X25519 pk   │
+│ + MAC            [16]        ← Poly1305 (после s token)     │
+├─────────────────────────────────────────────────────────────┤
+│ (se DH → MixKey)                                            │
+├─────────────────────────────────────────────────────────────┤
+│ Encrypted HandshakePayload [265] ← initiator identity       │
+│ + MAC            [16]        ← Poly1305 (payload)           │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -168,7 +176,9 @@ process_handshake_payload(peer_payload, noise_remote_static_key):
        verify_detached(sig, user_pk || device_pk, peer_user_pubkey) → OK?
 ```
 
-Шаг 2 предотвращает атаку identity substitution: злоумышленник не может подменить device_pubkey в HandshakePayload — Noise static key привязан DH-операциями в [chaining key](data/projects/GoodNet/docs/protocol/crypto.md#noise-kdf-chain).
+**Важно:** Noise static key — это X25519 ключ (для DH-операций), а HandshakePayload содержит Ed25519 `device_pubkey` (для подписи). Это **разные** типы ключей. Cross-verification конвертирует Ed25519 `device_pubkey` в X25519 через `crypto_sign_ed25519_pk_to_curve25519()` и сравнивает результат с Noise `rs` (remote static). Если не совпадает — peer подменил `device_pubkey` в payload.
+
+Шаг 2 предотвращает атаку identity substitution: злоумышленник не может подменить device_pubkey в HandshakePayload — Noise static key привязан DH-операциями в [chaining key](../protocol/crypto.md#noise-kdf-chain).
 
 ### Identity hiding
 
@@ -249,7 +259,7 @@ Noise native rekey — без сообщений, без round-trip:
   packet_id продолжает расти (nonce уникальность сохраняется)
 ```
 
-Rekey детерминирован — обе стороны вычисляют одинаковый новый ключ. Подробнее: [Криптография → Rekey](data/projects/GoodNet/docs/protocol/crypto.md#rekey).
+Rekey детерминирован — обе стороны вычисляют одинаковый новый ключ. Подробнее: [Криптография → Rekey](../protocol/crypto.md#rekey).
 
 ## Connection state machine
 
@@ -263,4 +273,4 @@ Rekey детерминирован — обе стороны вычисляют 
 
 ---
 
-**См. также:** [Криптография](data/projects/GoodNet/docs/protocol/crypto.md) · [Wire format](data/projects/GoodNet/docs/protocol/wire-format.md) · [ConnectionManager](../architecture/connection-manager.md)
+**См. также:** [Криптография](../protocol/crypto.md) · [Wire format](../protocol/wire-format.md) · [ConnectionManager](../architecture/connection-manager.md)

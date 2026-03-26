@@ -2,7 +2,7 @@
 
 Connector — плагин-транспорт. Отвечает за сетевой ввод-вывод: TCP, ICE/DTLS, UDP — любой протокол. Core управляет handshake, шифрованием и dispatch; connector только доставляет байты.
 
-См. также: [Handler: гайд](data/projects/GoodNet/docs/guides/handler-guide.md) · [Система плагинов](../architecture/plugin-system.md) · [ConnectionManager](../architecture/connection-manager.md)
+См. также: [Handler: гайд](../guides/handler-guide.md) · [Система плагинов](../architecture/plugin-system.md) · [ConnectionManager](../architecture/connection-manager.md)
 
 ## Пошаговый гайд
 
@@ -65,14 +65,22 @@ CONNECTOR_PLUGIN(UdpConnector)
 
 Connector **вызывает** (через helpers):
 - `notify_connect(&ep)` → получает `conn_id_t` от ядра
-- `notify_data(id, raw_bytes)` → ядро делает [framing, decrypt, dispatch](data/projects/GoodNet/docs/architecture/connection-manager.md#dispatch-path)
+- `notify_data(id, raw_bytes)` → ядро делает [framing, decrypt, dispatch](../architecture/connection-manager.md#dispatch-path)
 - `notify_disconnect(id, error)` → ядро удаляет ConnectionRecord
 
 Ядро **вызывает** (через `connector_ops_t`):
+- `connect(ctx, uri)` → async outgoing connection
+- `listen(ctx, host, port)` → start accepting inbound connections
 - `send_to(ctx, id, data, size)` → connector отправляет bytes
-- `send_gather(ctx, id, iov, count)` → vectored send
-- `close(ctx, id)` / `close_now(ctx, id)` → graceful / hard close
+- `send_gather(ctx, id, iov, count)` → vectored send (опционально, NULL = fallback на send_to)
+- `close(ctx, id)` → graceful close (drain pending writes)
+- `close_now(ctx, id)` → hard close без drain (shutdown / error recovery)
+- `get_scheme(ctx, buf, size)` → URI scheme ("tcp", "udp", "ice", ...)
+- `get_name(ctx, buf, size)` → human-readable имя для логов
 - `shutdown(ctx)` → полная остановка
+
+Connector также может вызывать:
+- `add_transport(ctx, pubkey_hex, ep, scheme)` → зарегистрировать дополнительный транспорт для уже ESTABLISHED пира (multipath)
 
 ## EP_FLAG_TRUSTED
 
@@ -129,7 +137,7 @@ void handle_accept(boost::system::error_code ec, tcp::socket socket) {
 }
 ```
 
-Внутри Core callbacks используют lock/atomic для синхронизации с [RCU registry](data/projects/GoodNet/docs/architecture/connection-manager.md#rcu-registry).
+Внутри Core callbacks используют lock/atomic для синхронизации с [RCU registry](../architecture/connection-manager.md#rcu-registry).
 
 ### do_send() может вызываться из Core thread
 
@@ -226,7 +234,7 @@ void do_close(conn_id_t id, bool hard) override {
 
 ## Backpressure flow: Core → Connector
 
-Когда [PerConnQueue](data/projects/GoodNet/docs/architecture/connection-manager.md#send-path) достигает 8 MB limit, Core **перестаёт вызывать** `send_to()` для этого conn_id. Connector должен обработать ситуацию:
+Когда [PerConnQueue](../architecture/connection-manager.md#send-path) достигает 8 MB limit, Core **перестаёт вызывать** `send_to()` для этого conn_id. Connector должен обработать ситуацию:
 
 ### Connector recv buffer может переполниться
 
@@ -281,10 +289,10 @@ if (active_connections_.size() >= MAX_CONNECTIONS) {
 `plugins/connectors/tcp/tcp.cpp` (~430 строк) — полноценная реализация на Boost.Asio:
 
 - Свой `io_context` + пул потоков (не зависит от Core io_context)
-- [Двухфазное чтение](data/projects/GoodNet/docs/protocol/wire-format.md#tcp-framing): header(20) → payload(N) → zero-copy notify_data
+- [Двухфазное чтение](../protocol/wire-format.md#tcp-framing): header(20) → payload(N) → zero-copy notify_data
 - Write pipeline: deque → drain batch (64 frames) → async_write с ConstBufferSequence (→ writev)
 - Protocol error → close + notify_disconnect
 
 ---
 
-**См. также:** [Handler: гайд](data/projects/GoodNet/docs/guides/handler-guide.md) · [Система плагинов](../architecture/plugin-system.md) · [ConnectionManager](../architecture/connection-manager.md) · [Wire format](../protocol/wire-format.md)
+**См. также:** [Handler: гайд](../guides/handler-guide.md) · [Система плагинов](../architecture/plugin-system.md) · [ConnectionManager](../architecture/connection-manager.md) · [Wire format](../protocol/wire-format.md)

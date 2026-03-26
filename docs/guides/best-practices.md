@@ -2,7 +2,7 @@
 
 Проверенные практики разработки на GoodNet: производительность, безопасность, отказоустойчивость.
 
-См. также: [Core Concepts](data/projects/GoodNet/docs/guides/concepts.md) · [Handler гайд](data/projects/GoodNet/docs/guides/handler-guide.md) · [Architecture](../architecture.md)
+См. также: [Core Concepts](../guides/concepts.md) · [Handler гайд](../guides/handler-guide.md) · [Architecture](../architecture.md)
 
 ## Handler разработка
 
@@ -45,7 +45,7 @@ class ChatHandler : public IHandler {
 class ChatHandler : public IHandler {
     struct PeerInfo {
         conn_id_t peer_id;
-        std::array<uint8_t, 32> user_pubkey;
+        std::array<uint8_t, 32> pubkey;
         std::string address;
     };
     std::unordered_map<conn_id_t, PeerInfo> peers_;
@@ -53,7 +53,7 @@ class ChatHandler : public IHandler {
     void handle_message(..., const endpoint_t* ep, ...) override {
         PeerInfo info;
         info.peer_id = ep->peer_id;
-        std::memcpy(info.user_pubkey.data(), ep->user_pubkey, 32);
+        std::memcpy(info.pubkey.data(), ep->pubkey, 32);
         info.address = ep->address;
         peers_[ep->peer_id] = std::move(info);
     }
@@ -181,13 +181,13 @@ void handle_message(...) override {
 ```cpp
 void handle_message(..., const endpoint_t* ep, ...) override {
     // Проверить что peer authenticated
-    if (!ep || ep->user_pubkey[0] == 0) {
+    if (!ep || ep->pubkey[0] == 0) {
         LOG_WARN("Unauthenticated peer — reject");
         return PROPAGATION_REJECT;
     }
 
     // Whitelist проверка
-    if (!is_allowed_peer(ep->user_pubkey)) {
+    if (!is_allowed_peer(ep->pubkey)) {
         LOG_WARN("Peer not in whitelist");
         return PROPAGATION_REJECT;
     }
@@ -330,4 +330,4 @@ TEST(MyHandlerTest, HandlesBackpressure) {
 
 ---
 
-**См. также:** [Handler гайд](data/projects/GoodNet/docs/guides/handler-guide.md) · [Core Concepts](data/projects/GoodNet/docs/guides/concepts.md) · [Performance optimization](../architecture/connection-manager.md#performance-optimizations)
+**См. также:** [Handler гайд](../guides/handler-guide.md) · [Core Concepts](../guides/concepts.md) · [Performance optimization](../architecture/connection-manager.md#performance-optimizations)
