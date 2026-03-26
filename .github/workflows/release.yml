@@ -87,64 +87,18 @@ jobs:
           name: linux-release
           path: goodnet-*-linux-x86_64.tar.gz
 
-  # ─── Windows (MSVC + vcpkg, static build) ──────────────────────────────────
-
-  build-windows:
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup vcpkg
-        uses: lukka/run-vcpkg@v11
-        with:
-          vcpkgGitCommitId: 'c3867e714dd3a51c272826eea77267876517ed99'
-
-      - name: Configure CMake
-        run: >
-          cmake -B build -S .
-          -DCMAKE_TOOLCHAIN_FILE=${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake
-          -DCMAKE_BUILD_TYPE=Release
-          -DGOODNET_STATIC_CORE=ON
-          -DGOODNET_STATIC_PLUGINS=ON
-          -DBUILD_TESTING=ON
-
-      - name: Build
-        run: cmake --build build --config Release --parallel
-
-      - name: Test
-        run: ctest --test-dir build --build-config Release --output-on-failure
-
-      - name: Bundle Windows release
-        shell: pwsh
-        run: |
-          $tag = $env:GITHUB_REF_NAME
-          New-Item -ItemType Directory -Force -Path release/bin | Out-Null
-          Copy-Item build/Release/goodnet.exe release/bin/
-          Get-ChildItem build/Release/*.dll -ErrorAction SilentlyContinue | Copy-Item -Destination release/bin/
-          Compress-Archive -Path release/* -DestinationPath "goodnet-${tag}-windows-x86_64.zip"
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: windows-release
-          path: goodnet-*-windows-x86_64.zip
-
   # ─── GitHub Release ─────────────────────────────────────────────────────────
 
   release:
-    needs: [build-linux, build-windows]
+    needs: [build-linux]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
         with:
           name: linux-release
 
-      - uses: actions/download-artifact@v4
-        with:
-          name: windows-release
-
       - uses: softprops/action-gh-release@v2
         with:
           files: |
             goodnet-*-linux-x86_64.tar.gz
-            goodnet-*-windows-x86_64.zip
           generate_release_notes: true

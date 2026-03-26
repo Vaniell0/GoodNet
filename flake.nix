@@ -242,7 +242,7 @@
 
             # Copy Nix-built plugins with manifests
             if [ -d result/plugins ]; then
-              cp -vf result/plugins/handlers/*.so     "$BUILD_DIR/plugins/handlers/" 2>/dev/null || true
+              cp -vf result/plugins/handlers/*.so      "$BUILD_DIR/plugins/handlers/" 2>/dev/null || true
               cp -vf result/plugins/handlers/*.json    "$BUILD_DIR/plugins/handlers/" 2>/dev/null || true
               cp -vf result/plugins/connectors/*.so    "$BUILD_DIR/plugins/connectors/" 2>/dev/null || true
               cp -vf result/plugins/connectors/*.json  "$BUILD_DIR/plugins/connectors/" 2>/dev/null || true

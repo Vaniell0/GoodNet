@@ -159,17 +159,18 @@ void Logger::init_internal() {
             sinks.push_back(std::move(sink));
         }
 
-        // Консоль — только в Debug
-#ifndef NDEBUG
+        // Консоль: Debug — полный вывод, Release — только warn+
         {
             auto sink = std::make_shared<spdlog::sinks::stdout_color_sink_mt>();
             auto fmt  = std::make_unique<spdlog::pattern_formatter>();
             fmt->add_flag<custom_source_flag>('Q');
             fmt->set_pattern(console_pattern_);
             sink->set_formatter(std::move(fmt));
+#ifdef NDEBUG
+            sink->set_level(spdlog::level::warn);
+#endif
             sinks.push_back(std::move(sink));
         }
-#endif
 
         auto logger = std::make_shared<spdlog::logger>("goodnet",
                                                         sinks.begin(), sinks.end());
